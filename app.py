@@ -168,6 +168,7 @@ def queue_job(product_name: str, brand_name: str, model_name: str, badges: list[
 
 # ---------- Run now (calls runner immediately) ----------
 @_catch_and_report
+@_catch_and_report
 def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
     if err:
@@ -187,19 +188,39 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     )
 
     results = run_job_sync(payload)
+    rows = results.get("logit_table_rows") or []
+    mode = "remote URL" if payload.get("render_url") else "inline HTML"
 
-    effects = results.get("effects_all", []) or []
-    if not effects:
-        msg = f"Rendered via: {'remote URL' if payload['render_url'] else 'inline HTML'}\n\nNo badge effects computed."
-    else:
-        lines = [
-            f"- {e['lever']}: baseline={e['base_rate']:.3f} → with={e['rate_with_lever']:.3f} (uplift {e['uplift']:+.3f})"
-            for e in effects
+    def _fmt(x, nd=3):
+        try:
+            return f"{float(x):.{nd}f}"
+        except Exception:
+            return "—"
+
+    if rows:
+        # stable ordering by badge label
+        rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
+        header = f"Rendered via: {mode}\n\n"
+        table = [
+            "| Badge | β | p | Sign |",
+            "|---|---:|---:|:---:|",
         ]
-        msg = f"Rendered via: {'remote URL' if payload['render_url'] else 'inline HTML'}\n\n" \
-              "Effects summary (MC uplift vs. baseline):\n" + "\n".join(lines)
+        for r in rows_sorted:
+            table.append(
+                f"| {r.get('badge','')} | {_fmt(r.get('beta'))} | {_fmt(r.get('p'))} | {r.get('sign','0')} |"
+            )
+        msg = header + "\n".join(table)
+    else:
+        note = "No badge effects computed."
+        # If the CSV exists, mention it explicitly (useful when effects were filtered out)
+        art = results.get("artifacts", {}) or {}
+        csv_path = art.get("table_badges") or ""
+        if csv_path:
+            note += f" See {csv_path} for details."
+        msg = f"Rendered via: {mode}\n\n{note}"
 
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
 
 # ---------- Admin helpers ----------
 def _list_storefront_jobs(admin_key: str):
@@ -305,3 +326,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
