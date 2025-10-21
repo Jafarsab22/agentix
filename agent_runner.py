@@ -17,7 +17,7 @@ Payload shape (example):
   "price": 100,                             # ← from your UI
   "currency": "£",                          # ← from your UI
   "badges": ["social","voucher","bundle","Assurance","Strike-through"],
-  "n_iterations": 250,
+  "n_iterations": 50,
   "fresh": true,
   "catalog_seed": 777
 }
@@ -32,7 +32,52 @@ The inline page exposes <script id="groundtruth" type="application/json">…</sc
       "total_price": number
     }, ...
 ] }
+
+####
+Design principles for Agentix simulation runner
+-----------------------------------------------
+
+1. Within-screen variation (choice identifiability)
+   Each screen (case_id) must include multiple product cards differing in key levers 
+   (e.g., frame, assurance, scarcity, strike, timer). 
+   Variation within the same screen is essential: without it, the conditional-logit model 
+   cannot estimate how a given badge affects choice probability. 
+   Example: if all eight cards show frame=1 (all-in pricing), the effect of framing is 
+   unidentifiable.
+
+2. Between-screen rotation (balanced exposure)
+   Across many iterations, each badge should appear roughly 50/50 across screens to avoid 
+   systematic bias toward one condition. This ensures that observed effects come from 
+   model preferences, not from design imbalance.
+
+3. Controlled randomness
+   Badges are allocated pseudo-randomly under structural constraints:
+       - 'Frame' and 'Assurance' vary independently in each screen.
+       - Only one 'dark' lever (scarcity / strike / timer) is active per screen 
+         to maintain interpretability and prevent multi-collinearity.
+   The random seed (catalog_seed) ensures reproducibility.
+
+4. Dark levers logic
+   Because dark levers share a similar behavioural role (urgency cues), they are rotated 
+   mutually exclusively across screens. This keeps their effects separable and avoids 
+   confounding in the logit model.
+
+5. Estimation integrity
+   After simulation, the runner checks within-screen variation for each badge. 
+   Badges with zero variation across most screens yield unstable coefficients and are 
+   flagged in the summary. 
+
+6. Reproducibility and scalability
+   - `catalog_seed` controls deterministic randomness for repeatable experiments.
+   - Increasing `n_iterations` increases the diversity of badge combinations and 
+     stabilises coefficient estimates.
+
+In short:
+Each screen must contain diversity (within-screen variation),
+the full run must contain balance (between-screen rotation),
+and randomisation must be reproducible (seeded).
 """
+
 from __future__ import annotations
 import os, io, json, time, base64, pathlib, shutil
 from datetime import datetime
@@ -570,5 +615,6 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
