@@ -122,14 +122,18 @@ def _new_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-animations")
     opts.add_argument("--window-size=1200,800")
+    # Use the Chromium installed in the container
+    opts.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 
-    chrome_bin = _detect_chrome_binary()
-    if not chrome_bin:
-        raise RuntimeError("Chromium not found. Ensure apt.txt contains 'chromium' and rebuild.")
-    opts.binary_location = chrome_bin
-
-    driver_path = ChromeDriverManager().install()   # works for Chromium too
-    return webdriver.Chrome(service=Service(driver_path), options=opts)
+    # 1) Prefer Selenium Manager to auto-resolve a matching driver
+    try:
+        service = Service()  # no path -> Selenium Manager downloads/locates the right driver
+        return webdriver.Chrome(service=service, options=opts)
+    except Exception:
+        # 2) Fallback to webdriver-manager (also matches Chromium)
+        driver_path = ChromeDriverManager().install()
+        service = Service(driver_path)
+        return webdriver.Chrome(service=service, options=opts)
 
 
 def _jpeg_b64_from_driver(driver, quality=72) -> str:
@@ -427,4 +431,5 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
