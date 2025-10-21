@@ -269,9 +269,9 @@ def _list_stats_files(admin_key: str):
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     gr.Markdown(
         "# Agentix\n"
-        "Simulate how an AI agent is expected to react to selected e-commerce badges for a product.\n"
-        "Enter the product name, category, price, and number of iterations (default: 50). The current AI agent is set to OpenAI GPT-4.1-mini.\n"
-        "When ready, click **Run simulation now** to generate the results. A table showing the estimated effects of each badge will appear below.\n"
+        "Simulate how an AI agent is expected to react to selected e-commerce badges for a product.\n\n"
+        "Enter the product name, category, price, and number of iterations (default: 50). The current AI agent is set to OpenAI GPT-4.1-mini.\n\n"
+        "When ready, click **Run simulation now** to generate the results. A table showing the estimated effects of each badge will appear below.\n\n"
         "_Examples:_ **frame** (All-in vs. Partitioned pricing), **assurance** (e.g., Free returns), **scarcity tag** (e.g., Only 3 left in stock), **strike-through** (e.g., £120 → £89.99), **timer** (e.g., Deal ends in 2 hours), **social** (e.g., 2k bought this last month), **voucher** (e.g., 10% off code SAVE10), **bundle** (e.g., Buy 2 save 10%)."
 
     )
@@ -329,6 +329,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
