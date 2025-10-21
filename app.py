@@ -81,7 +81,7 @@ def _validate_inputs(product_name, price, currency, n_iterations):
     if currency not in CURRENCY_CHOICES:
         return "Please choose a currency."
     try:
-        n_iter_val = int(n_iterations) if n_iterations is not None else 250
+        n_iter_val = int(n_iterations) if n_iterations is not None else 50
         if n_iter_val <= 0:
             return "Iterations must be positive."
     except Exception:
@@ -326,5 +326,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
