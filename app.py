@@ -312,9 +312,15 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
             outputs=[stats_status, stats_choice, stats_long, stats_log],
         )
 
-
+try:
+    demo  # noqa: F821
+except NameError:
+    with gr.Blocks() as demo:
+        gr.Markdown("Agentix is running. Upload will appear here once UI is wired.")
+        
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
     # show_error=True is fine; the key change is binding to the service port/IP
     gr.close_all()  # safety in case of reloads
+
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
