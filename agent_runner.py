@@ -277,49 +277,91 @@ def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_
 
 # ---------------- inline renderer (Option B) ----------------
 def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price: float, currency: str) -> str:
-    # Build deterministic 2×4 grid; price is exactly the UI-entered value
-    import json as _json
+    """
+    Inline storefront renderer with Colab-style logic:
+    - For each selected badge, assign it to each of the 8 cards independently with p≈0.5.
+    - If a badge ends up with no variation on a screen (all 0s or all 1s), flip one card to enforce variation.
+    - For "dark" badges (scarcity/strike/timer), keep a single 'dark' field and randomly pick
+      ONE dark type to use on this screen, then assign it per card with p≈0.5.
+    - Price comes straight from the UI and is identical across cards (as in your previous setup).
+    Deterministic per screen via RNG seeding on catalog_seed ⊕ hash(set_id).
+    """
+    import json as _json, random as _random
 
-    # badge decoding (align with your downstream parsing)
-    frame = 1 if ("All-in pricing" in badges or "All-in pricing".casefold() in [b.casefold() for b in badges]) else 0
-    assurance = 1 if ("Assurance" in badges or "Assurance".casefold() in [b.casefold() for b in badges]) else 0
+    # deterministic RNG per screen
+    seed = (int(catalog_seed) & 0x7FFFFFFF) ^ (abs(hash(set_id)) & 0x7FFFFFFF)
+    rng = _random.Random(seed)
 
-    dark = "none"
-    if any(b.lower().startswith("scarcity") for b in badges): dark = "scarcity"
-    if any(b.lower().startswith("strike")   for b in badges): dark = "strike"
-    if any(b.lower().startswith("timer")    for b in badges): dark = "timer"
+    # helper: Bernoulli(p) vector of length 8
+    def bern_mask(p: float = 0.5):
+        return [1 if rng.random() < p else 0 for _ in range(8)]
 
-    social  = any(b.lower() == "social"  for b in badges)
-    voucher = any(b.lower() == "voucher" for b in badges)
-    bundle  = any(b.lower() == "bundle"  for b in badges)
+    # ensure at least one 1 and one 0 (so the logit has within-screen contrast)
+    def enforce_variation(mask: list[int]):
+        if all(v == 0 for v in mask):
+            mask[rng.randrange(8)] = 1
+        elif all(v == 1 for v in mask):
+            mask[rng.randrange(8)] = 0
+        return mask
 
-    products = []
-    titles = []
-    k = 0
+    # Which badges are ON in the UI?
+    sel = {b.lower(): True for b in badges or []}
+
+    # Position-independent binary masks per selected badge
+    frame_mask   = enforce_variation(bern_mask()) if sel.get("all-in pricing", False) else [0]*8
+    assur_mask   = enforce_variation(bern_mask()) if sel.get("assurance", False) else [0]*8
+    social_mask  = enforce_variation(bern_mask()) if sel.get("social", False) else [0]*8
+    voucher_mask = enforce_variation(bern_mask()) if sel.get("voucher", False) else [0]*8
+    bundle_mask  = enforce_variation(bern_mask()) if sel.get("bundle", False) else [0]*8
+
+    # Dark badges share one field 'dark' with values in {"none","scarcity","strike","timer"}
+    dark_candidates = []
+    if sel.get("scarcity tag", False): dark_candidates.append("scarcity")
+    if sel.get("strike-through", False): dark_candidates.append("strike")
+    if sel.get("timer", False): dark_candidates.append("timer")
+    if dark_candidates:
+        dark_type = rng.choice(dark_candidates)  # pick ONE dark mechanism for this screen (matches your prior contract)
+        dark_mask = enforce_variation(bern_mask())
+    else:
+        dark_type = "none"
+        dark_mask = [0]*8
+
+    # Build 2×4 grid
+    products, rows_html = [], []
+    idx = 0
     for r in range(2):
         for c in range(4):
-            k += 1
-            title = f"{category.title()} #{k}"
-            titles.append(title)
-            products.append({
+            title = f"{category.title()} #{idx+1}"
+            prod = {
                 "title": title,
                 "row": r, "col": c,
-                "frame": frame, "assurance": assurance,
-                "dark": dark,
-                "social": social, "voucher": voucher, "bundle": bundle,
-                "total_price": float(price)
-            })
+                "frame": int(frame_mask[idx]),
+                "assurance": int(assur_mask[idx]),
+                "dark": dark_type if dark_mask[idx] == 1 else "none",
+                "social": bool(social_mask[idx]),
+                "voucher": bool(voucher_mask[idx]),
+                "bundle": bool(bundle_mask[idx]),
+                "total_price": float(price),
+            }
+            products.append(prod)
 
-    # simple visual grid
-    rows = []
-    for i, p in enumerate(products, 1):
-        label = f"Card {i} — {currency}{p['total_price']:.2f}"
-        badge_txt = ", ".join(badges) if badges else "no badges"
-        rows.append(
-            f"<div class='card'><div class='title'>{label}</div>"
-            f"<div class='meta'>{category}</div>"
-            f"<div class='badges'>{badge_txt}</div></div>"
-        )
+            # visible labels (purely cosmetic)
+            label = f"Card {idx+1} — {currency}{price:.2f}"
+            tags = []
+            if prod["frame"] == 1: tags.append("All-in pricing")
+            if prod["assurance"] == 1: tags.append("Assurance")
+            if prod["dark"] != "none": tags.append(prod["dark"])
+            if prod["social"]:  tags.append("social")
+            if prod["voucher"]: tags.append("voucher")
+            if prod["bundle"]:  tags.append("bundle")
+            badge_txt = ", ".join(tags) if tags else "no badges"
+
+            rows_html.append(
+                f"<div class='card'><div class='title'>{label}</div>"
+                f"<div class='meta'>{category}</div>"
+                f"<div class='badges'>{badge_txt}</div></div>"
+            )
+            idx += 1
 
     gt = {"category": category, "set_id": set_id, "products": products}
 
@@ -339,10 +381,11 @@ def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: in
       </style>
     </head>
     <body>
-      <div class="grid">{''.join(rows)}</div>
+      <div class="grid">{''.join(rows_html)}</div>
       <script id="groundtruth" type="application/json">{_json.dumps(gt)}</script>
     </body></html>"""
     return html
+
 
 # ---------------- run one episode ----------------
 def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
@@ -527,4 +570,5 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
