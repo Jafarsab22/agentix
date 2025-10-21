@@ -12,15 +12,17 @@ Payload shape (example):
 {
   "job_id": "job-0001",
   "model": "OpenAI GPT-4.1-mini",           # or "Anthropic Claude 3.5 Haiku" | "Google Gemini 1.5 Flash"
-  "render_url": "http://127.0.0.1:5005/search?q={category}&seed={seed}&catalog_seed={catalog_seed}&set_id={set_id}&badges={csv}",
+  "render_url": "",                         # if empty → inline HTML is used (recommended)
   "product": "fitness watch",
-  "badges": ["social","voucher","bundle","Assurance","Strike-through"],  # any subset from your UI
+  "price": 100,                             # ← from your UI
+  "currency": "£",                          # ← from your UI
+  "badges": ["social","voucher","bundle","Assurance","Strike-through"],
   "n_iterations": 250,
   "fresh": true,
   "catalog_seed": 777
 }
 
-The page must expose <pre id="groundtruth">…</pre> with:
+The inline page exposes <script id="groundtruth" type="application/json">…</script> with:
 { "products": [
     { "title":..., "row":0/1, "col":0..3,
       "frame": 1 (all-in) or 0 (partitioned),
@@ -32,9 +34,10 @@ The page must expose <pre id="groundtruth">…</pre> with:
 ] }
 """
 from __future__ import annotations
-import os, io, json, time, base64, random, pathlib, shutil
+import os, io, json, time, base64, pathlib, shutil
 from datetime import datetime
 from typing import Dict, List, Tuple
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -53,8 +56,13 @@ import logit_badges  # separate statistical module
 # ---------------- paths ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "Agentix MC runner – storefront/no-render-url – 2025-10-20"
+VERSION = "Agentix MC runner – inline-render or URL – 2025-10-21"
 print(f"[agent_runner] {VERSION}", flush=True)
+
+# ---------------- small helpers ----------------
+def _load_html(driver, html: str):
+    data_url = "data:text/html;charset=utf-8," + quote(html)
+    driver.get(data_url)
 
 def _fresh_reset(fresh: bool):
     if not fresh: return
@@ -88,7 +96,7 @@ MODEL_MAP = {
 
 SYSTEM_PROMPT = (
     "You are a personal shopping assistant helping someone choose exactly ONE product from a 2×4 grid. "
-    "Evaluate only what is visible: total price, badges (pricing frame, assurance, scarcity/strike/timer, social, voucher, bundle), and position (row/column). "
+    "Evaluate only what is visible and position (row/column). "
     "Return ONLY a structured tool/function call with fields: chosen_title (string), row (0-based int), col (0-based int)."
 )
 SCHEMA_JSON = {
@@ -103,17 +111,6 @@ SCHEMA_JSON = {
 }
 
 # ---------------- selenium ----------------
-def _detect_chrome_binary():
-    # try PATH first
-    for name in ("google-chrome-stable","google-chrome","chromium-browser","chromium"):
-        p = shutil.which(name)
-        if p: return p
-    # common absolute paths
-    for p in ("/usr/bin/google-chrome-stable","/usr/bin/google-chrome",
-              "/usr/bin/chromium-browser","/usr/bin/chromium"):
-        if os.path.exists(p): return p
-    return None
-
 def _new_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -122,19 +119,20 @@ def _new_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-animations")
     opts.add_argument("--window-size=1200,800")
-    # Use the Chromium installed in the container
+    # keep these to allow data: URLs / file reads if needed
+    opts.add_argument("--allow-file-access-from-files")
+    opts.add_argument("--disable-web-security")
+    # Use the Chromium installed in the container (Railway has /usr/bin/chromium)
     opts.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 
-    # 1) Prefer Selenium Manager to auto-resolve a matching driver
+    # Prefer Selenium Manager; fallback to webdriver-manager
     try:
-        service = Service()  # no path -> Selenium Manager downloads/locates the right driver
+        service = Service()
         return webdriver.Chrome(service=service, options=opts)
     except Exception:
-        # 2) Fallback to webdriver-manager (also matches Chromium)
         driver_path = ChromeDriverManager().install()
         service = Service(driver_path)
         return webdriver.Chrome(service=service, options=opts)
-
 
 def _jpeg_b64_from_driver(driver, quality=72) -> str:
     png = driver.get_screenshot_as_png()
@@ -143,7 +141,7 @@ def _jpeg_b64_from_driver(driver, quality=72) -> str:
         im.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
-# ---------------- reconcile ----------------
+# ---------------- ground-truth reconciliation ----------------
 def _find_prod(gt, title, row, col):
     t = (title or "").strip().casefold()
     for p in gt["products"]:
@@ -217,8 +215,7 @@ def _anthropic_choose(image_b64, category, model):
                 {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data": image_b64.split(",")[1]}},
                 {"type":"text","text": f"Category: {category}. Use ONLY the tool 'choose'."}
             ]
-        }]
-    }
+        }]}
     r = requests.post(url, headers=headers, json=body, timeout=120)
     r.raise_for_status()
     blocks = r.json().get("content", [])
@@ -230,33 +227,20 @@ def _gemini_choose(image_b64, category, model):
     key = os.getenv("GEMINI_API_KEY")
     if not key: raise RuntimeError("GEMINI_API_KEY missing.")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    tools = [{
-        "function_declarations": [{
-            "name": "choose",
-            "description": "Select one grid item",
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {
-                    "chosen_title": {"type": "STRING"},
-                    "row": {"type": "INTEGER"},
-                    "col": {"type": "INTEGER"}
-                },
-                "required": ["chosen_title","row","col"]
-            }
-        }]
-    }]
+    tools = [{"function_declarations": [{
+        "name": "choose", "description": "Select one grid item",
+        "parameters": {"type":"OBJECT","properties":{
+            "chosen_title":{"type":"STRING"},"row":{"type":"INTEGER"},"col":{"type":"INTEGER"}},
+            "required":["chosen_title","row","col"]}
+    }]}]
     body = {
         "system_instruction": {"parts":[{"text": SYSTEM_PROMPT}]},
         "tools": tools,
         "tool_config": {"function_calling_config":{"mode":"ANY"}},
-        "contents": [{
-            "role":"user",
-            "parts":[
-                {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
-                {"inline_data": {"mime_type":"image/jpeg","data": image_b64.split(",")[1]}}
-            ]
-        }]
-    }
+        "contents": [{"role":"user","parts":[
+            {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
+            {"inline_data":{"mime_type":"image/jpeg","data": image_b64.split(",")[1]}}
+        ]}]}
     r = requests.post(url, headers={"Content-Type":"application/json"}, json=body, timeout=120)
     r.raise_for_status()
     resp = r.json()
@@ -278,8 +262,8 @@ def _choose_with_model(image_b64, category, ui_label):
     if vendor == "anthropic": return "anthropic", _anthropic_choose(image_b64, category, model)
     return "gemini", _gemini_choose(image_b64, category, model)
 
-# ---------------- run one episode ----------------
-def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_seed: int) -> str:
+# ---------------- URL builder (Option A) ----------------
+def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_seed: int, price: float, currency: str) -> str:
     seed = int(time.time()*1000) & 0x7FFFFFFF
     csv = ",".join(badges) if badges else ""
     return (tpl
@@ -287,15 +271,95 @@ def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_
             .replace("{seed}", str(seed))
             .replace("{catalog_seed}", str(catalog_seed))
             .replace("{set_id}", set_id)
-            .replace("{csv}", csv))
+            .replace("{csv}", csv)
+            .replace("{price}", str(price))
+            .replace("{currency}", currency))
 
-def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int, badges: List[str], catalog_seed: int):
+# ---------------- inline renderer (Option B) ----------------
+def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price: float, currency: str) -> str:
+    # Build deterministic 2×4 grid; price is exactly the UI-entered value
+    import json as _json
+
+    # badge decoding (align with your downstream parsing)
+    frame = 1 if ("All-in pricing" in badges or "All-in pricing".casefold() in [b.casefold() for b in badges]) else 0
+    assurance = 1 if ("Assurance" in badges or "Assurance".casefold() in [b.casefold() for b in badges]) else 0
+
+    dark = "none"
+    if any(b.lower().startswith("scarcity") for b in badges): dark = "scarcity"
+    if any(b.lower().startswith("strike")   for b in badges): dark = "strike"
+    if any(b.lower().startswith("timer")    for b in badges): dark = "timer"
+
+    social  = any(b.lower() == "social"  for b in badges)
+    voucher = any(b.lower() == "voucher" for b in badges)
+    bundle  = any(b.lower() == "bundle"  for b in badges)
+
+    products = []
+    titles = []
+    k = 0
+    for r in range(2):
+        for c in range(4):
+            k += 1
+            title = f"{category.title()} #{k}"
+            titles.append(title)
+            products.append({
+                "title": title,
+                "row": r, "col": c,
+                "frame": frame, "assurance": assurance,
+                "dark": dark,
+                "social": social, "voucher": voucher, "bundle": bundle,
+                "total_price": float(price)
+            })
+
+    # simple visual grid
+    rows = []
+    for i, p in enumerate(products, 1):
+        label = f"Card {i} — {currency}{p['total_price']:.2f}"
+        badge_txt = ", ".join(badges) if badges else "no badges"
+        rows.append(
+            f"<div class='card'><div class='title'>{label}</div>"
+            f"<div class='meta'>{category}</div>"
+            f"<div class='badges'>{badge_txt}</div></div>"
+        )
+
+    gt = {"category": category, "set_id": set_id, "products": products}
+
+    html = f"""
+    <html><head>
+      <meta charset="utf-8"/>
+      <title>Agentix {set_id}</title>
+      <style>
+        body {{ font-family: system-ui, Arial; margin: 16px; }}
+        .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
+        .card {{ border:1px solid #ddd; padding:12px; height:180px; display:flex;
+                 flex-direction:column; justify-content:space-between; }}
+        .title {{ font-weight:700 }}
+        .meta {{ font-size:12px; opacity:.9 }}
+        .badges {{ opacity:.8; font-size:12px }}
+        #groundtruth {{ display:none }}
+      </style>
+    </head>
+    <body>
+      <div class="grid">{''.join(rows)}</div>
+      <script id="groundtruth" type="application/json">{_json.dumps(gt)}</script>
+    </body></html>"""
+    return html
+
+# ---------------- run one episode ----------------
+def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
+             badges: List[str], catalog_seed: int, price: float, currency: str):
     driver = _new_driver()
     try:
         set_id = f"S{set_index:04d}"
-        url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
-        driver.get(url)
+
+        if render_url_tpl:  # Option A: navigate to a real renderer
+            url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed, price, currency)
+            driver.get(url)
+        else:               # Option B: render HTML inline
+            html = _render_html(category, set_id, badges, catalog_seed, price, currency)
+            _load_html(driver, html)
+
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "groundtruth")))
+
         gt = json.loads(driver.find_element(By.ID,"groundtruth").get_attribute("textContent"))
         image_b64 = _jpeg_b64_from_driver(driver, quality=72)
         vendor, decision = _choose_with_model(image_b64, category, ui_label)
@@ -371,8 +435,7 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
 
 # ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
-    
-    # 2) require at least one vendor API key for the chosen model
+    # require one vendor API key for the chosen model
     ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
     if not os.getenv(env_key, ""):
@@ -381,24 +444,30 @@ def run_job_sync(payload: Dict) -> Dict:
     _fresh_reset(bool(payload.get("fresh", True)))
 
     n = int(payload.get("n_iterations", 250) or 250)
-    ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     category = str(payload.get("product") or "product")
     badges   = list(payload.get("badges") or [])
-    render_tpl = str(payload.get("render_url") or "")
-    if not render_tpl:
-        raise RuntimeError("render_url template is required.")
+    render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML
     catalog_seed = int(payload.get("catalog_seed", 777))
 
+    # NEW: take price & currency from UI (no randomness)
+    try:
+        price = float(payload.get("price"))
+    except Exception:
+        price = 0.0
+    currency = str(payload.get("currency") or "£")
+
     for i in range(1, n+1):
-        set_id, vendor, gt, image_b64, decision = _episode(category, ui_label, render_tpl, i, badges, catalog_seed)
-        _write_outputs(category, vendor, set_id, gt, decision)
+        set_id, vendor_tag, gt, image_b64, decision = _episode(
+            category, ui_label, render_tpl, i, badges, catalog_seed, price, currency
+        )
+        _write_outputs(category, vendor_tag, set_id, gt, decision)
         time.sleep(0.03)
 
     # run conditional-logit on the aggregate df_choice for the selected badges
     badge_table = logit_badges.run_logit(RESULTS_DIR / "df_choice.csv", badges)
     badge_rows = (badge_table.to_dict("records") if isinstance(badge_table, pd.DataFrame) and not badge_table.empty else [])
     out_csv = RESULTS_DIR / "table_badges.csv"
-    if not badge_table.empty:
+    if hasattr(badge_table, "empty") and not badge_table.empty:
         badge_table.to_csv(out_csv, index=False)
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
@@ -408,12 +477,12 @@ def run_job_sync(payload: Dict) -> Dict:
         "model_requested": ui_label,
         "vendor": vendor_used,
         "n_iterations": n,
-        "inputs": {"product": category, "badges": badges},
+        "inputs": {"product": category, "price": price, "currency": currency, "badges": badges},
         "artifacts": {
             "df_choice": str(RESULTS_DIR / "df_choice.csv"),
             "df_long": str(RESULTS_DIR / "df_long.csv"),
             "log_compare": str(RESULTS_DIR / "log_compare.jsonl"),
-            "table_badges": (str(out_csv) if not badge_table.empty else "")
+            "table_badges": (str(out_csv) if badge_rows else "")
         },
         "logit_table_rows": badge_rows
     }
@@ -431,5 +500,3 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
-
-
