@@ -113,7 +113,7 @@ def _build_payload(*, job_id, product, brand, model, badges, price, currency, n_
         "badges": badges or [],
         "price": float(price) if price is not None else 0.0,
         "currency": currency,
-        "n_iterations": int(n_iterations) if n_iterations else 250,
+        "n_iterations": int(n_iterations) if n_iterations else 50,
         "fresh": bool(fresh),
         "catalog_seed": 777,
         "render_url": render_url,  # "" → inline HTML path in agent_runner._episode
@@ -279,7 +279,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     with gr.Row():
         price = gr.Number(label="Price", value=0.0, precision=2)
         currency = gr.Dropdown(choices=CURRENCY_CHOICES, value=CURRENCY_CHOICES[0], label="Currency")
-        n_iterations = gr.Number(label="Iterations", value=250, precision=0)
+        n_iterations = gr.Number(label="Iterations", value=50, precision=0)
     badges = gr.CheckboxGroup(choices=BADGE_CHOICES, label="Select badges (multi-select)")
 
     run_btn = gr.Button("Run simulation now", variant="primary")
@@ -326,6 +326,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
