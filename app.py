@@ -202,7 +202,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
         header = f"Rendered via: {mode}\n\n"
         table = [
-            "| Badge | β | p | Sign |",
+            "| Badge | β (effect size) | p (<0.05 is significant) | Effect (0=no effect; +=positive effect; -=negative effect) |",
             "|---|---:|---:|:---:|",
         ]
         for r in rows_sorted:
@@ -326,4 +326,5 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
