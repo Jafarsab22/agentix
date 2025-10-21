@@ -463,12 +463,39 @@ def run_job_sync(payload: Dict) -> Dict:
         _write_outputs(category, vendor_tag, set_id, gt, decision)
         time.sleep(0.03)
 
-    # run conditional-logit on the aggregate df_choice for the selected badges
-    badge_table = logit_badges.run_logit(RESULTS_DIR / "df_choice.csv", badges)
-    badge_rows = (badge_table.to_dict("records") if isinstance(badge_table, pd.DataFrame) and not badge_table.empty else [])
+    # ----- robust conditional-logit post-processing -----
     out_csv = RESULTS_DIR / "table_badges.csv"
-    if hasattr(badge_table, "empty") and not badge_table.empty:
-        badge_table.to_csv(out_csv, index=False)
+    badge_rows = []
+    badge_table = pd.DataFrame()
+
+    def _has_nonempty_file(p: pathlib.Path) -> bool:
+        try:
+            return p.exists() and p.stat().st_size > 0
+        except Exception:
+            return False
+
+    if badges and _has_nonempty_file(RESULTS_DIR / "df_choice.csv"):
+        try:
+            bt = logit_badges.run_logit(RESULTS_DIR / "df_choice.csv", badges)
+            if isinstance(bt, pd.DataFrame):
+                badge_table = bt
+            elif isinstance(bt, list):
+                badge_table = pd.DataFrame(bt)
+            else:
+                badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+
+            if "badge" in badge_table.columns and not badge_table.empty:
+                badge_rows = badge_table.to_dict("records")
+                badge_table.to_csv(out_csv, index=False)
+            else:
+                badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+        except Exception as e:
+            print(f"[logit] skipped due to error: {e}", flush=True)
+            badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+    else:
+        badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+        badge_rows = []
+    # ----- end robust block -----
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
     return {
@@ -500,3 +527,4 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
