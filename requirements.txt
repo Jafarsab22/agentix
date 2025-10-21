@@ -1,0 +1,9 @@
+gradio==4.*
+pandas
+numpy
+statsmodels
+patsy
+requests
+pillow
+selenium
+webdriver-manager
