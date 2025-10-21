@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 # System deps for headless Chromium + Selenium
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium chromium-driver \
+    chromium \
     fonts-liberation fonts-dejavu-core \
     libasound2 libglib2.0-0 libnss3 libgbm1 \
     libgdk-pixbuf-2.0-0 libgtk-3-0 \
@@ -22,3 +22,4 @@ COPY . /app
 
 EXPOSE 8080
 CMD ["python", "app.py"]
+
