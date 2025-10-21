@@ -200,7 +200,8 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     if rows:
         # stable ordering by badge label
         rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
-        header = f"Rendered via: {mode}\n\n"
+        #header = f"Rendered via: {mode}\n\n"
+        header = "Badges Effects"
         table = [
             "| Badge | β (effect size) | p (<0.05 is significant) | Effect (0=no effect; +=positive effect; -=negative effect) |",
             "|---|---:|---:|:---:|",
@@ -269,8 +270,10 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     gr.Markdown(
         "# Agentix\n"
         "Simulate how an AI agent is expected to react to selected e-commerce badges for a product.\n"
-        "**Step 1 (UI only)**: collect inputs and create a job. _Runner writes aggregates under_ results/.\n"
-        "_Examples:_ **social** (e.g., 2k bought this last month), **voucher** (10% off), **bundle** (buy 2 save 10%)."
+        "Enter the product name, category, price, and number of iterations (default: 50). The current AI agent is set to OpenAI GPT-4.1-mini.\n"
+        "When ready, click **Run simulation now** to generate the results. A table showing the estimated effects of each badge will appear below.\n"
+        "_Examples:_ **frame** (All-in vs. Partitioned pricing), **assurance** (e.g., Free returns), **scarcity tag** (e.g., Only 3 left in stock), **strike-through** (e.g., £120 → £89.99), **timer** (e.g., Deal ends in 2 hours), **social** (e.g., 2k bought this last month), **voucher** (e.g., 10% off code SAVE10), **bundle** (e.g., Buy 2 save 10%)."
+
     )
     with gr.Row():
         product = gr.Textbox(label="Product name", placeholder="e.g., smart phone, washing machine", scale=2)
@@ -326,6 +329,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
