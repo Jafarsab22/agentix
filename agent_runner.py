@@ -431,6 +431,24 @@ def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: in
     </body></html>"""
     return html
 
+# --- preview: render exactly one screen and return its image (no disk writes) ---
+def preview_one(payload: Dict) -> Dict:
+    ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
+    category = str(payload.get("product") or "product")
+    badges   = list(payload.get("badges") or [])
+    render_tpl = str(payload.get("render_url") or "")
+    catalog_seed = int(payload.get("catalog_seed", 777))
+    try:
+        price = float(payload.get("price"))
+    except Exception:
+        price = 0.0
+    currency = str(payload.get("currency") or "£")
+
+    # one deterministic screen (set_index=1)
+    set_id, _, gt, image_b64, _ = _episode(
+        category, ui_label, render_tpl, 1, badges, catalog_seed, price, currency
+    )
+    return {"set_id": set_id, "image_b64": image_b64}
 
 # ---------------- run one episode ----------------
 def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
@@ -615,6 +633,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
