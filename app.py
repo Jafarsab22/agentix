@@ -265,6 +265,32 @@ def _list_stats_files(admin_key: str):
             str(agg_long) if agg_long.exists() else None,
             str(agg_log) if agg_log.exists() else None)
 
+@_catch_and_report
+def preview_example(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str):
+    # Build a minimal payload (no need for n_iterations; we force 1 inside preview_one)
+    payload = _build_payload(
+        job_id=f"preview-{uuid.uuid4().hex[:8]}",
+        product=product_name,
+        brand=brand_name,
+        model=model_name,
+        badges=badges,
+        price=price,
+        currency=currency,
+        n_iterations=1,
+        fresh=False,
+    )
+    from agent_runner import preview_one
+    res = preview_one(payload)
+    # Render inline via data URL; no files saved
+    img_html = (
+        f'<div style="margin-top:8px">'
+        f'<div style="font-weight:600;margin-bottom:6px">Example screen ({res.get("set_id","S0001")})</div>'
+        f'<img alt="Agentix example screen" src="{res.get("image_b64","")}" '
+        f'style="max-width:100%;border:1px solid #ddd;border-radius:8px" />'
+        f"</div>"
+    )
+    return img_html
+
 # ---------- UI ----------
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     gr.Markdown(
@@ -287,12 +313,19 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
     run_btn = gr.Button("Run simulation now", variant="primary")
     queue_btn = gr.Button("Queue simulation job", variant="secondary")
+    preview_btn = gr.Button("Preview one example screen", variant="secondary")
+    preview_view = gr.HTML(label="Preview")
 
     results_md = gr.Markdown()
     results_json = gr.Code(label="Results JSON (debug)", language="json")
     out_md = gr.Markdown()
     out_json = gr.Code(label="Queued job payload (for debugging)", language="json")
 
+    preview_btn.click(
+        fn=preview_example,
+        inputs=[product, brand, model, badges, price, currency],
+        outputs=[preview_view],
+    )
     run_btn.click(
         fn=run_now,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
@@ -329,6 +362,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
