@@ -531,7 +531,7 @@ def run_job_sync(payload: Dict) -> Dict:
 
     _fresh_reset(bool(payload.get("fresh", True)))
 
-    n = int(payload.get("n_iterations", 250) or 250)
+    n = int(payload.get("n_iterations", 50) or 50)
     category = str(payload.get("product") or "product")
     badges   = list(payload.get("badges") or [])
     render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML
@@ -615,6 +615,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
