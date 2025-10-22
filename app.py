@@ -392,22 +392,45 @@ def _preview_effect_file(admin_key: str, path: str):
 
 def _list_stats_files(admin_key: str):
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
-        return ("Invalid or missing admin key.", None, None, None)
+        return ("Invalid or missing admin key.", None, None, None, None, None)
+
     res = pathlib.Path("results")
     if not res.exists():
-        return ("No results/ directory yet.", None, None, None)
+        return ("No results/ directory yet.", None, None, None, None, None)
+
+    # existing aggregate files
     agg_choice = res / "df_choice.csv"
     agg_long = res / "df_long.csv"
     agg_log = res / "log_compare.jsonl"
+
+    # new: latest badge-effects exports (CSV + HTML)
+    eff_dir = res / "effects"
+    latest_eff_csv = None
+    latest_eff_html = None
+    if eff_dir.exists():
+        csvs = sorted(eff_dir.glob("*.csv"))
+        htmls = sorted(eff_dir.glob("*.html"))
+        latest_eff_csv = str(csvs[-1]) if csvs else None
+        latest_eff_html = str(htmls[-1]) if htmls else None
+
     msg = []
     if agg_choice.exists(): msg.append(f"• Found {agg_choice}")
     if agg_long.exists(): msg.append(f"• Found {agg_long}")
     if agg_log.exists(): msg.append(f"• Found {agg_log}")
-    if not msg: msg = ["No aggregate files yet. Run a simulation first."]
-    return ("\n".join(msg),
-            str(agg_choice) if agg_choice.exists() else None,
-            str(agg_long) if agg_long.exists() else None,
-            str(agg_log) if agg_log.exists() else None)
+    if latest_eff_csv:   msg.append(f"• Found {latest_eff_csv}")
+    if latest_eff_html:  msg.append(f"• Found {latest_eff_html}")
+    if not msg:
+        msg = ["No aggregate files yet. Run a simulation first."]
+
+    return (
+        "\n".join(msg),
+        str(agg_choice) if agg_choice.exists() else None,
+        str(agg_long) if agg_long.exists() else None,
+        str(agg_log) if agg_log.exists() else None,
+        latest_eff_csv,
+        latest_eff_html,
+    )
+
 
 @_catch_and_report
 def preview_example(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str):
@@ -506,6 +529,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
