@@ -35,9 +35,18 @@ def _row_col(k: int) -> tuple[int,int]:
     return (0 if k < 4 else 1, k % 4)
 
 def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: int,
-                  price: float, currency: str) -> str:
+                  price: float, currency: str, brand: str | None = None) -> str:
+    """
+    Visual storefront renderer with 4-page rotation and balanced masks.
+    Displays BRAND + PRODUCT as the visible card title, while keeping internal
+    product titles distinct (Card 1..8) for modelling with C(title).
+    """
+    import json as _json, random as _random
+
     sel = {b.lower(): True for b in (badges or [])}
     layout = _rotation_index(set_id)
+    brand_text = (brand or "").strip()
+    display_name = f"{brand_text} {category}".strip()  # e.g., "Samsung TV" or "TV" if no brand
 
     # Balanced 4/8 masks (rotated) for independent levers
     frame_mask   = _mask(layout) if sel.get("all-in pricing", False) else [0]*8
@@ -64,7 +73,7 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
 
     # Deterministic RNG for small details
     seed = (int(catalog_seed) & 0x7FFFFFFF) ^ (abs(hash(set_id)) & 0x7FFFFFFF)
-    rng = random.Random(seed)
+    rng = _random.Random(seed)
 
     total = float(price)
     fees = round(total * 0.06, 2)
@@ -84,6 +93,7 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
         bun = bool(bundle_mask[k])
         dark = dark_type if dark_mask[k] == 1 else "none"
 
+        # Internal unique title for modelling (kept as Card N)
         title = f"Card {k+1}"
         products.append({
             "title": title, "row": r, "col": c,
@@ -94,6 +104,7 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
             "strike_price": strike_price, "scarcity_level": scarcity_level,
         })
 
+        # Visible price blocks
         if f == 1:
             price_block = f"<div class='price'>{currency}{total:,.2f} <span class='mut'>(all-in)</span></div>"
             part_block = ""
@@ -103,7 +114,9 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
                 f"<div class='pp'>+ Fees {currency}{fees:,.2f} · ship {currency}{shipping:,.2f} · "
                 f"tax {currency}{taxes:,.2f}<br>Total {currency}{total:,.2f}</div>"
             )
+
         assur_block = "<div class='badge'>Free returns · 30-day warranty</div>" if a else ""
+
         if dark == "scarcity":
             dark_block = f"<div class='pill warn'>Only {scarcity_level} left</div>"
         elif dark == "strike":
@@ -113,19 +126,21 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
             dark_block = f"<div class='pill warn'>Deal ends in {mm:02d}:{ss:02d}</div>"
         else:
             dark_block = ""
+
         social_block  = "<div class='chip'>👥 2k bought this month</div>" if soc else ""
         voucher_block = "<div class='chip good'>10% OFF · code SAVE10</div>" if vou else ""
         bundle_block  = "<div class='chip info'>Buy 2, save 10%</div>" if bun else ""
 
+        # Visible title uses brand + product; price sits below it
         cards.append(
             f"<div class='card' style='grid-row:{r+1};grid-column:{c+1}'>"
-            f"<div class='title'>{title} — {currency}{total:,.2f}</div>"
-            f"<div class='subcat'>{category}</div>"
-            f"{price_block}{part_block}{assur_block}{dark_block}{social_block}{voucher_block}{bundle_block}"
+            f"<div class='title'>{display_name}</div>"
+            f"{price_block}{part_block}"
+            f"{assur_block}{dark_block}{social_block}{voucher_block}{bundle_block}"
             f"</div>"
         )
 
-    gt = {"category": category, "set_id": set_id, "products": products}
+    gt = {"category": category, "brand": brand_text, "set_id": set_id, "products": products}
 
     html = f"""
     <!doctype html><html><head><meta charset="utf-8"><title>Balanced Storefront</title>
@@ -148,7 +163,6 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
       .chip {{ display:inline-block; border-radius:999px; padding:3px 8px; font-size:12px; margin:6px 6px 0 0; border:1px solid var(--bd); background:#f7f7f7; }}
       .chip.good {{ background:#f2fff6; color:#105d32; }}
       .chip.info {{ background:#f0f7ff; color:#0b4f9e; }}
-      .subcat {{ color:var(--muted); font-size:13px; margin:2px 0 6px 0; }}
       #groundtruth {{ display:none }}
     </style></head><body>
       <div class="wrap">
@@ -156,12 +170,12 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
         <div class="sub">2×4 grid; balanced masks; 4-page rotation; one dark cue per screen (rotated); promos optional.</div>
         <div class="grid" id="grid">{''.join(cards)}</div>
       </div>
-      <script id="groundtruth" type="application/json">{json.dumps(gt)}</script>
+      <script id="groundtruth" type="application/json">{_json.dumps(gt)}</script>
     </body></html>
     """
     return html
 
-def build_storefront_from_payload(payload: dict) -> Tuple[str, dict]:
+def build_storefront_from_payload(payload: dict):
     html = render_screen(
         category=str(payload.get("product") or "product"),
         set_id="S0001",
@@ -169,8 +183,9 @@ def build_storefront_from_payload(payload: dict) -> Tuple[str, dict]:
         catalog_seed=int(payload.get("catalog_seed", 777)),
         price=float(payload.get("price") or 0.0),
         currency=str(payload.get("currency") or "£"),
+        brand=str(payload.get("brand") or ""),
     )
-    meta = {"category": payload.get("product"), "badges": payload.get("badges", []), "set_id": "S0001"}
+    meta = {"category": payload.get("product"), "brand": payload.get("brand") or "", ...}
     return html, meta
 
 def save_storefront(job_id: str, html: str, meta: dict) -> Tuple[str, str]:
