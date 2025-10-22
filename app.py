@@ -1,10 +1,10 @@
 # app.py
-import json, uuid, os, time, pathlib
+import json, uuid, os, time, pathlib, csv
 from datetime import datetime
 import gradio as gr
 from agent_runner import run_job_sync
 import traceback, logging
-
+from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 
 def _catch_and_report(fn):
@@ -166,6 +166,9 @@ def queue_job(product_name: str, brand_name: str, model_name: str, badges: list[
     ]
     return "\n".join(msg), json.dumps(payload, ensure_ascii=False, indent=2)
 
+# create an export folder once
+EFFECTS_DIR = pathlib.Path("results") / "effects"
+EFFECTS_DIR.mkdir(parents=True, exist_ok=True)
 # ---------- Run now (calls runner immediately) ----------
 @_catch_and_report
 def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
@@ -213,7 +216,29 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
                 f"| {r.get('badge','')} | {_fmt(r.get('beta'))} | {_fmt(r.get('p'))} | {r.get('sign','0')} |"
             )
 
-        msg = f"Rendered via: {mode}\n\n" + header + "\n".join(table)
+        # export CSV + HTML with run metadata so we know which data belongs to what
+        csv_path, html_path = _export_badge_effects(rows_sorted, payload, job_id)
+
+        # stash paths into artifacts for the admin view
+        artifacts = results.setdefault("artifacts", {})
+        if csv_path:
+            artifacts["effects_csv"] = csv_path
+        if html_path:
+            artifacts["effects_html"] = html_path
+
+        meta = (
+            f"\n\nProduct: {product_name}"
+            f"\nType/Brand: {brand_name}"
+            f"\nModel: {model_name}"
+            f"\nPrice: {price} {currency}"
+            f"\nIterations: {n_iterations}"
+        )
+
+        saved = ""
+        if html_path or csv_path:
+            saved = "\n\nSaved badge-effects to:" + (f"\n• HTML: {html_path}" if html_path else "") + (f"\n• CSV: {csv_path}" if csv_path else "")
+
+        msg = f"Rendered via: {mode}{meta}\n\n" + header + "\n".join(table) + saved
 
     else:
         note = "No badge effects computed."
@@ -226,7 +251,94 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
 
+# --- helper to export effects with run metadata (append after your admin helpers) ---
+def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
+    """
+    Write CSV and HTML files for the badge-effects table, including:
+    product, brand/type, model, price, currency, n_iterations, job_id, timestamp.
+    Returns (csv_path, html_path) as strings (or (None, None) if nothing written).
+    """
+    if not rows_sorted:
+        return None, None
 
+    ts = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    base = f"{ts}_{job_id}_badge_effects"
+    csv_path = EFFECTS_DIR / f"{base}.csv"
+    html_path = EFFECTS_DIR / f"{base}.html"
+
+    # CSV with metadata per row
+    fieldnames = [
+        "job_id", "timestamp", "product", "brand", "model",
+        "price", "currency", "n_iterations", "badge", "beta", "p", "sign"
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows_sorted:
+            w.writerow({
+                "job_id": job_id,
+                "timestamp": payload.get("ts", ""),
+                "product": payload.get("product", ""),
+                "brand": payload.get("brand", ""),
+                "model": payload.get("model", ""),
+                "price": payload.get("price", ""),
+                "currency": payload.get("currency", ""),
+                "n_iterations": payload.get("n_iterations", ""),
+                "badge": r.get("badge", ""),
+                "beta": r.get("beta", ""),
+                "p": r.get("p", ""),
+                "sign": r.get("sign", "0"),
+            })
+
+    # Simple HTML (table like the screenshot + a metadata block)
+    def _fmt(x, nd=3):
+        try:
+            return f"{float(x):.{nd}f}"
+        except Exception:
+            return "—"
+
+    meta_rows = [
+        ("Product", payload.get("product", "")),
+        ("Brand / Type", payload.get("brand", "")),
+        ("Model", payload.get("model", "")),
+        ("Price", f"{payload.get('price','')} {payload.get('currency','')}".strip()),
+        ("Iterations", str(payload.get("n_iterations", ""))),
+        ("Job ID", job_id),
+        ("Timestamp", payload.get("ts", "")),
+    ]
+
+    parts = [
+        "<html><head><meta charset='utf-8'><title>Badge effects</title>",
+        "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;padding:16px}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{border:1px solid #ccc;padding:8px}"
+        "th{text-align:left;background:#f6f6f6}"
+        "td.num{text-align:right}</style>",
+        "</head><body>",
+        "<h2>Badge effects</h2>",
+        "<h3>Run metadata</h3><table>",
+    ]
+    for k, v in meta_rows:
+        parts.append(f"<tr><th>{k}</th><td>{v}</td></tr>")
+    parts.append("</table>")
+
+    parts.append("<h3 style='margin-top:18px'>Effects table</h3>")
+    parts.append("<table>")
+    parts.append("<tr><th>Badge</th><th>β (effect size)</th><th>p (&lt;0.05 is significant)</th>"
+                 "<th>Effect (0=no effect; +=positive effect; -=negative effect)</th></tr>")
+    for r in rows_sorted:
+        parts.append(
+            "<tr>"
+            f"<td>{r.get('badge','')}</td>"
+            f"<td class='num'>{_fmt(r.get('beta'))}</td>"
+            f"<td class='num'>{_fmt(r.get('p'))}</td>"
+            f"<td style='text-align:center'>{r.get('sign','0')}</td>"
+            "</tr>"
+        )
+    parts.append("</table></body></html>")
+
+    html_path.write_text("".join(parts), encoding="utf-8")
+    return str(csv_path), str(html_path)
 
 # ---------- Admin helpers ----------
 def _list_storefront_jobs(admin_key: str):
@@ -250,6 +362,33 @@ def _preview_storefront(admin_key: str, job_id: str):
         return gr.update(value=""), f"Not found: {html_path}"
     html = html_path.read_text(encoding="utf-8")
     return gr.update(value=html), f"Rendered {html_path}"
+
+# --- Admin helpers for the new exports (add below your existing admin helpers) ---
+def _list_effect_tables(admin_key: str):
+    if not ADMIN_KEY or admin_key != ADMIN_KEY:
+        return ("Invalid or missing admin key.", None, None)
+    if not EFFECTS_DIR.exists():
+        return ("No effects/ directory yet.", None, None)
+    csv_files = sorted(EFFECTS_DIR.glob("*.csv"))
+    html_files = sorted(EFFECTS_DIR.glob("*.html"))
+    latest_csv = str(csv_files[-1]) if csv_files else None
+    latest_html = str(html_files[-1]) if html_files else None
+    if not latest_csv and not latest_html:
+        return ("No badge-effects exports yet. Run a simulation first.", None, None)
+    msg = "Latest badge-effects exports:\n" + ("\n• " + latest_csv if latest_csv else "") + ("\n• " + latest_html if latest_html else "")
+    return (msg, latest_csv, latest_html)
+
+def _preview_effect_file(admin_key: str, path: str):
+    if not ADMIN_KEY or admin_key != ADMIN_KEY:
+        return gr.update(value=""), "Invalid or missing admin key."
+    if not path:
+        return gr.update(value=""), "Select an effects file first."
+    p = pathlib.Path(path)
+    if not p.exists():
+        return gr.update(value=""), f"Not found: {p}"
+    if p.suffix.lower() == ".html":
+        return gr.update(value=p.read_text(encoding="utf-8")), f"Rendered {p}"
+    return gr.update(value=""), f"Selected {p} (download via file path)."
 
 def _list_stats_files(admin_key: str):
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
@@ -367,6 +506,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
