@@ -456,17 +456,17 @@ def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
     driver = _new_driver()
     try:
         set_id = f"S{set_index:04d}"
-
-        if render_url_tpl:  # Option A: navigate to a real renderer
-            url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed, price, currency)
+        if render_url_tpl.strip():
+            url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
             driver.get(url)
-        else:               # Option B: render HTML inline
-            html = _render_html(category, set_id, badges, catalog_seed, price, currency)
+        else:
+            # use local storefront module
+            from storefront import render_screen
+            html = render_screen(category, set_id, badges, catalog_seed, price, currency)
             _load_html(driver, html)
 
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "groundtruth")))
-
-        gt = json.loads(driver.find_element(By.ID,"groundtruth").get_attribute("textContent"))
+        gt = json.loads(driver.find_element(By.ID, "groundtruth").get_attribute("textContent"))
         image_b64 = _jpeg_b64_from_driver(driver, quality=72)
         vendor, decision = _choose_with_model(image_b64, category, ui_label)
         decision = reconcile(decision, gt)
@@ -633,6 +633,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
