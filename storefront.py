@@ -175,7 +175,7 @@ def render_screen(category: str, set_id: str, badges: List[str], catalog_seed: i
     """
     return html
 
-def build_storefront_from_payload(payload: dict):
+def build_storefront_from_payload(payload: dict) -> tuple[str, dict]:
     html = render_screen(
         category=str(payload.get("product") or "product"),
         set_id="S0001",
@@ -185,11 +185,27 @@ def build_storefront_from_payload(payload: dict):
         currency=str(payload.get("currency") or "£"),
         brand=str(payload.get("brand") or ""),
     )
-    meta = {"category": payload.get("product"), "brand": payload.get("brand") or "", ...}
+    meta = {
+        "set_id": "S0001",
+        "category": str(payload.get("product") or "product"),
+        "brand": str(payload.get("brand") or ""),
+        "badges": list(payload.get("badges") or []),
+        "catalog_seed": int(payload.get("catalog_seed", 777)),
+        "price": float(payload.get("price") or 0.0),
+        "currency": str(payload.get("currency") or "£"),
+    }
     return html, meta
 
-def save_storefront(job_id: str, html: str, meta: dict) -> Tuple[str, str]:
-    out_dir = pathlib.Path("storefront"); out_dir.mkdir(parents=True, exist_ok=True)
-    html_path = out_dir / f"{job_id}.html"; html_path.write_text(html, encoding="utf-8")
-    meta_path = out_dir / f"{job_id}.json"; meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def save_storefront(job_id: str, html: str, meta: dict) -> tuple[str, str]:
+    import pathlib, json
+    out_dir = pathlib.Path("storefront")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    html_path = out_dir / f"{job_id}.html"
+    html_path.write_text(html, encoding="utf-8")
+
+    meta_path = out_dir / f"{job_id}.json"
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     return str(html_path), str(meta_path)
