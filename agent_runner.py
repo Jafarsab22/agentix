@@ -83,7 +83,6 @@ import os, io, json, time, base64, pathlib, shutil
 from datetime import datetime
 from typing import Dict, List, Tuple
 from urllib.parse import quote
-
 import requests
 import pandas as pd
 from PIL import Image
@@ -96,6 +95,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import logit_badges  # separate statistical module
 
 # ---------------- paths ----------------
@@ -468,24 +468,38 @@ def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
     driver = _new_driver()
     try:
         set_id = f"S{set_index:04d}"
+
+        used_inline = False
+
+        # Try external renderer first if provided
         if render_url_tpl.strip():
-            url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
-            driver.get(url)
+            try:
+                url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
+                driver.get(url)
+                # Quick probe: if the page doesn’t expose #groundtruth fast, we’ll fall back
+                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, "groundtruth")))
+            except (TimeoutException, WebDriverException):
+                used_inline = True
         else:
-            # use local storefront module
+            used_inline = True
+
+        if used_inline:
+            # Inline storefront renderer
             from storefront import render_screen
             html = render_screen(category, set_id, badges, catalog_seed, price, currency, brand=brand)
             _load_html(driver, html)
 
+        # Final wait (robust) for whichever mode we’re in
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "groundtruth")))
+
         gt = json.loads(driver.find_element(By.ID, "groundtruth").get_attribute("textContent"))
         image_b64 = _jpeg_b64_from_driver(driver, quality=72)
         vendor, decision = _choose_with_model(image_b64, category, ui_label)
         decision = reconcile(decision, gt)
         return set_id, vendor, gt, image_b64, decision
+
     finally:
         driver.quit()
-
 # ---------------- writers ----------------
 def _ensure_dir(p: pathlib.Path): p.mkdir(parents=True, exist_ok=True)
 
@@ -652,6 +666,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
