@@ -452,7 +452,7 @@ def preview_one(payload: Dict) -> Dict:
 
 # ---------------- run one episode ----------------
 def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
-             badges: List[str], catalog_seed: int, price: float, currency: str):
+             badges: List[str], catalog_seed: int, price: float, currency: str, brand: str):
     driver = _new_driver()
     try:
         set_id = f"S{set_index:04d}"
@@ -462,7 +462,7 @@ def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
         else:
             # use local storefront module
             from storefront import render_screen
-            html = render_screen(category, set_id, badges, catalog_seed, price, currency)
+            html = render_screen(category, set_id, badges, catalog_seed, price, currency, brand=brand)
             _load_html(driver, html)
 
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "groundtruth")))
@@ -551,20 +551,21 @@ def run_job_sync(payload: Dict) -> Dict:
 
     n = int(payload.get("n_iterations", 50) or 50)
     category = str(payload.get("product") or "product")
+    brand    = str(payload.get("brand") or "")
     badges   = list(payload.get("badges") or [])
-    render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML
+    render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML via storefront
     catalog_seed = int(payload.get("catalog_seed", 777))
 
-    # NEW: take price & currency from UI (no randomness)
+    # take price & currency from UI (no randomness)
     try:
         price = float(payload.get("price"))
     except Exception:
         price = 0.0
     currency = str(payload.get("currency") or "£")
 
-    for i in range(1, n+1):
+    for i in range(1, n + 1):
         set_id, vendor_tag, gt, image_b64, decision = _episode(
-            category, ui_label, render_tpl, i, badges, catalog_seed, price, currency
+            category, ui_label, render_tpl, i, badges, catalog_seed, price, currency, brand
         )
         _write_outputs(category, vendor_tag, set_id, gt, decision)
         time.sleep(0.03)
@@ -610,7 +611,13 @@ def run_job_sync(payload: Dict) -> Dict:
         "model_requested": ui_label,
         "vendor": vendor_used,
         "n_iterations": n,
-        "inputs": {"product": category, "price": price, "currency": currency, "badges": badges},
+        "inputs": {
+            "product": category,
+            "brand": brand,
+            "price": price,
+            "currency": currency,
+            "badges": badges
+        },
         "artifacts": {
             "df_choice": str(RESULTS_DIR / "df_choice.csv"),
             "df_long": str(RESULTS_DIR / "df_long.csv"),
@@ -633,6 +640,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
