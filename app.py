@@ -168,7 +168,6 @@ def queue_job(product_name: str, brand_name: str, model_name: str, badges: list[
 
 # ---------- Run now (calls runner immediately) ----------
 @_catch_and_report
-@_catch_and_report
 def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
     if err:
@@ -188,29 +187,34 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     )
 
     results = run_job_sync(payload)
-    rows = results.get("logit_table_rows") or []
-    mode = "remote URL" if payload.get("render_url") else "inline HTML"
 
-    def _fmt(x, nd=3):
-        try:
-            return f"{float(x):.{nd}f}"
-        except Exception:
-            return "—"
+    # Identify render mode for the status line
+    mode = "inline HTML" if not (payload.get("render_url") or "").strip() else "external URL"
+
+    # Build the badge-effects table from results["logit_table_rows"]
+    rows = results.get("logit_table_rows") or []
 
     if rows:
-        # stable ordering by badge label
         rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
-        #header = f"Rendered via: {mode}\n\n"
-        header = "Badges Effects"
+        header = "### Badge Effects\n\n"
         table = [
             "| Badge | β (effect size) | p (<0.05 is significant) | Effect (0=no effect; +=positive effect; -=negative effect) |",
             "|---|---:|---:|:---:|",
         ]
+
+        def _fmt(x, nd=3):
+            try:
+                return f"{float(x):.{nd}f}"
+            except Exception:
+                return "—"
+
         for r in rows_sorted:
             table.append(
                 f"| {r.get('badge','')} | {_fmt(r.get('beta'))} | {_fmt(r.get('p'))} | {r.get('sign','0')} |"
             )
-        msg = header + "\n".join(table)
+
+        msg = f"Rendered via: {mode}\n\n" + header + "\n".join(table)
+
     else:
         note = "No badge effects computed."
         # If the CSV exists, mention it explicitly (useful when effects were filtered out)
@@ -221,6 +225,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         msg = f"Rendered via: {mode}\n\n{note}"
 
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
 
 
 # ---------- Admin helpers ----------
@@ -362,6 +367,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
