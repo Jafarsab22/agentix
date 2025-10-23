@@ -163,19 +163,21 @@ def _partition_total_into_components(total: float, seeds: Seeds, set_id: str) ->
 # ------------------------------
 
 def _gt_row(i: int, set_id: str, masks: dict, dark_type: str, price_total: float) -> dict:
-    row_top = 1 if i < 4 else 0
+    row = 0 if i < 4 else 1
     col = i % 4
     return {
         "title": f"Card {i+1}",
-        "row_top": row_top,
+        "row": row,
+        "col": col,
+        "row_top": 1 if row == 0 else 0,
         "col1": 1 if col == 0 else 0,
         "col2": 1 if col == 1 else 0,
         "col3": 1 if col == 2 else 0,
         "frame": masks["frame"][i],
         "assurance": masks["assurance"][i],
         "scarcity": 1 if (dark_type == "scarcity" and masks["dark"][i]) else 0,
-        "strike": 1 if (dark_type == "strike" and masks["dark"][i]) else 0,
-        "timer": 1 if (dark_type == "timer" and masks["dark"][i]) else 0,
+        "strike":   1 if (dark_type == "strike"   and masks["dark"][i]) else 0,
+        "timer":    1 if (dark_type == "timer"    and masks["dark"][i]) else 0,
         "social_proof": masks.get("social", [0]*8)[i],
         "voucher": masks.get("voucher", [0]*8)[i],
         "bundle": masks.get("bundle", [0]*8)[i],
@@ -196,6 +198,18 @@ def _lever_mask(set_id: str, lever_key: str) -> list[int]:
     """
     li = _layout_index(set_id)              # 0..3 (screen-based rotation)
     off = abs(hash(lever_key)) % 4          # lever-specific offset 0..3
+    pat_idx = (li + off) % 4
+    return _PATTERNS[pat_idx][:]
+
+_LEVER_KEYS = ["frame","assurance","social","voucher","bundle","dark"]
+
+def _lever_mask(set_id: str, lever_key: str) -> list[int]:
+    """
+    Return a balanced 4/8 mask for this lever that is orthogonal to others.
+    We rotate the base pattern by a lever-specific offset, deterministically.
+    """
+    li = _layout_index(set_id)      # 0..3 rotation by screen
+    off = abs(hash(lever_key)) % 4  # lever-specific offset 0..3
     pat_idx = (li + off) % 4
     return _PATTERNS[pat_idx][:]
 
@@ -223,6 +237,7 @@ def render_screen(
     "voucher":   _lever_mask(set_id, "voucher")   if sel.get("voucher", False) else [0]*8,
     "bundle":    _lever_mask(set_id, "bundle")    if sel.get("bundle", False) else [0]*8,
 }
+
 
     # Choose exactly one dark mechanism per screen (blocked & seed-randomised)
     dark_candidates = []
