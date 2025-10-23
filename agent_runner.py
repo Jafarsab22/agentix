@@ -461,45 +461,94 @@ def preview_one(payload: Dict) -> Dict:
         brand=brand
     )
     return {"set_id": set_id, "image_b64": image_b64}
+  
+# Harden driver timeouts (add right after driver is created)
+driver.set_page_load_timeout(45)   # bound slow navigations
+driver.set_script_timeout(45)      # bound JS execution waits (if any)
+driver.implicitly_wait(2)          # small implicit wait for minor DOM races
 
 # ---------------- run one episode ----------------
-def _episode(category: str, ui_label: str, render_url_tpl: str, set_index: int,
-             badges: List[str], catalog_seed: int, price: float, currency: str, brand: str):
+def _episode(
+    category: str,
+    ui_label: str,
+    render_url_tpl: str,
+    set_index: int,
+    badges: List[str],
+    catalog_seed: int,
+    price: float,
+    currency: str,
+    brand: str,
+):
     driver = _new_driver()
+
+    # Harden driver timeouts for large runs
+    try:
+        driver.set_page_load_timeout(45)
+        driver.set_script_timeout(45)
+        driver.implicitly_wait(2)
+    except Exception:
+        pass  # older drivers may not support all setters
+
     try:
         set_id = f"S{set_index:04d}"
 
-        used_inline = False
-
-        # Try external renderer first if provided
-        if render_url_tpl.strip():
+        # --- one whole-episode retry (optional but recommended) ---
+        for attempt in range(2):
             try:
-                url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
-                driver.get(url)
-                # Quick probe: if the page doesn’t expose #groundtruth fast, we’ll fall back
-                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, "groundtruth")))
-            except (TimeoutException, WebDriverException):
-                used_inline = True
-        else:
-            used_inline = True
+                used_inline = False
 
-        if used_inline:
-            # Inline storefront renderer
-            from storefront import render_screen
-            html = render_screen(category, set_id, badges, catalog_seed, price, currency, brand=brand)
-            _load_html(driver, html)
+                # Try external renderer first if provided
+                if render_url_tpl.strip():
+                    try:
+                        url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
+                        driver.get(url)
+                        # Quick probe to decide whether to fall back
+                        WebDriverWait(driver, 7).until(
+                            EC.presence_of_element_located((By.ID, "groundtruth"))
+                        )
+                    except (TimeoutException, WebDriverException):
+                        used_inline = True
+                else:
+                    used_inline = True
 
-        # Final wait (robust) for whichever mode we’re in
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "groundtruth")))
+                if used_inline:
+                    # Inline storefront renderer
+                    from storefront import render_screen
+                    html = render_screen(
+                        category, set_id, badges, catalog_seed, price, currency, brand=brand
+                    )
+                    _load_html(driver, html)
 
-        gt = json.loads(driver.find_element(By.ID, "groundtruth").get_attribute("textContent"))
-        image_b64 = _jpeg_b64_from_driver(driver, quality=72)
-        vendor, decision = _choose_with_model(image_b64, category, ui_label)
-        decision = reconcile(decision, gt)
-        return set_id, vendor, gt, image_b64, decision
+                # Final wait (robust) for whichever mode we’re in
+                locator = (By.ID, "groundtruth")
+                try:
+                    WebDriverWait(driver, 45, poll_frequency=0.25).until(
+                        EC.presence_of_element_located(locator)
+                    )
+                except TimeoutException:
+                    # One retry: refresh and wait again
+                    driver.refresh()
+                    WebDriverWait(driver, 25, poll_frequency=0.25).until(
+                        EC.presence_of_element_located(locator)
+                    )
+
+                gt = json.loads(
+                    driver.find_element(By.ID, "groundtruth").get_attribute("textContent")
+                )
+                image_b64 = _jpeg_b64_from_driver(driver, quality=72)
+                vendor, decision = _choose_with_model(image_b64, category, ui_label)
+                decision = reconcile(decision, gt)
+                return set_id, vendor, gt, image_b64, decision
+
+            except TimeoutException:
+                if attempt == 0:
+                    # try the whole episode once more
+                    continue
+                raise
 
     finally:
         driver.quit()
+
 # ---------------- writers ----------------
 def _ensure_dir(p: pathlib.Path): p.mkdir(parents=True, exist_ok=True)
 
@@ -666,6 +715,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
