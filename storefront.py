@@ -219,50 +219,130 @@ def _lever_mask(set_id: str, lever_key: str) -> list[int]:
 def render_screen(
     category: str,
     set_id: str,
-    badges: List[str],
+    badges: list[str],
     catalog_seed: int,
     price_anchor: float,
     currency: str,
     brand: str = "",
 ) -> str:
-    seeds = Seeds(catalog_seed=catalog_seed, brand=(brand or ""), category=(category or ""))
+    """
+    Storefront v1.6 — balanced masks, 1 dark type / screen, Latin-square prices.
+    Outputs a hidden #groundtruth with row/col, levers, price, ln_price per card.
+    """
 
-    # Normalise selected badges
-    sel = {b.lower().strip(): True for b in (badges or [])}
+    import json, math, random, hashlib
 
-    # Balanced masks
-    base_mask = _balanced_mask(set_id)
+    # ---------------- helpers ----------------
+    def _layout_index(sid: str) -> int:
+        # 0..3 repeating per screen
+        try:
+            n = int(str(sid).strip().lstrip("S"))
+        except Exception:
+            n = 1
+        return (n - 1) % 4
+
+    # Four balanced 4/8 patterns (any 4 orthogonal-ish patterns are fine)
+    _PATTERNS = [
+        [1,1,1,1,0,0,0,0],
+        [1,1,0,0,1,1,0,0],
+        [1,0,1,0,1,0,1,0],
+        [1,0,0,1,0,1,0,1],
+    ]
+
+    # Guaranteed distinct offsets for the main levers
+    _LEVER_OFFSET = {
+        "frame": 0,
+        "assurance": 1,
+        "dark": 2,
+        "social": 3,
+        "voucher": 1,   # OK to reuse if those levers aren’t co-estimated
+        "bundle": 2,
+    }
+
+    def _lever_mask(sid: str, lever_key: str) -> list[int]:
+        li  = _layout_index(sid)               # screen-based rotation 0..3
+        off = _LEVER_OFFSET.get(lever_key, 0)  # lever-specific offset
+        return _PATTERNS[(li + off) % 4][:]
+
+    def _dark_type_for_screen(sid: str) -> str:
+        # Blocked rotation across 4 screens: scarcity → strike → timer → none (seeded order)
+        base_order = ["scarcity", "strike", "timer", "none"]
+        # deterministic shuffle by catalog_seed
+        rnd = random.Random((int(catalog_seed) & 0x7fffffff) ^ 0x9e3779b9)
+        order = base_order[:]
+        rnd.shuffle(order)
+        return order[_layout_index(sid)]
+
+    def _format_currency(x: float, cur: str) -> str:
+        try:
+            return f"{cur}{x:,.2f}"
+        except Exception:
+            return f"{cur}{x:.2f}"
+
+    def _partition_total_into_components(total: float) -> tuple[float,float,float,float]:
+        # deterministic, tiny variation that sums exactly to total
+        fees = round(total * 0.05, 2)
+        ship = round(total * 0.03, 2)
+        tax  = round(total * 0.02, 2)
+        base = round(total - (fees + ship + tax), 2)
+        # repair rounding if needed
+        delta = round(total - (base + fees + ship + tax), 2)
+        base = round(base + delta, 2)
+        return base, fees, ship, tax
+
+    def _price_levels(p0: float) -> list[float]:
+        # 8 log-symmetric factors around p0, ≈±30%
+        a = math.log(1.30)
+        factors = [math.exp(t) for t in [ -a, -2*a/3, -a/3, -a/6, a/6, a/3,  2*a/3,  a ]]
+        return [round(max(p0 * f, 0.01), 2) for f in factors]
+
+    def _latin_assign(levels: list[float], sid: str) -> list[float]:
+        # 8×8 Latin-ish: rotate by screen index across blocks of 8 screens
+        try:
+            n = int(str(sid).strip().lstrip("S"))
+        except Exception:
+            n = 1
+        k = (n - 1) % 8
+        idx = list(range(8))
+        # rotate by k
+        return [levels[(i + k) % 8] for i in idx]
+
+    # ---------------- derive UI selections ----------------
+    sel = { (b or "").strip().lower(): True for b in (badges or []) }
+
+    # Lever masks (distinct patterns by construction)
     masks = {
-    "frame":     _lever_mask(set_id, "frame")     if sel.get("all-in pricing", False) else [0]*8,
-    "assurance": _lever_mask(set_id, "assurance") if sel.get("assurance", False) else [0]*8,
-    "dark":      _lever_mask(set_id, "dark"),   # applied only to whichever dark type is active
-    "social":    _lever_mask(set_id, "social")    if sel.get("social", False) else [0]*8,
-    "voucher":   _lever_mask(set_id, "voucher")   if sel.get("voucher", False) else [0]*8,
-    "bundle":    _lever_mask(set_id, "bundle")    if sel.get("bundle", False) else [0]*8,
-}
-if masks["frame"] == masks["assurance"]:
-    raise RuntimeError("Design error: frame and assurance masks are identical; check _LEVER_OFFSET.")
+        "frame":     _lever_mask(set_id, "frame")     if sel.get("all-in pricing", False) else [0]*8,
+        "assurance": _lever_mask(set_id, "assurance") if sel.get("assurance", False) else [0]*8,
+        "dark":      _lever_mask(set_id, "dark"),   # applied only to whichever dark type is active
+        "social":    _lever_mask(set_id, "social")    if sel.get("social", False) else [0]*8,
+        "voucher":   _lever_mask(set_id, "voucher")   if sel.get("voucher", False) else [0]*8,
+        "bundle":    _lever_mask(set_id, "bundle")    if sel.get("bundle", False) else [0]*8,
+    }
+    # Guardrail: frame and assurance must not be identical
+    if masks["frame"] == masks["assurance"] and any(masks["frame"]):
+        raise RuntimeError("Design error: frame and assurance masks are identical; adjust _LEVER_OFFSET.")
 
-
-    # Choose exactly one dark mechanism per screen (blocked & seed-randomised)
+    # Choose exactly one dark mechanism for this screen (blocked + seeded)
     dark_candidates = []
     if sel.get("scarcity tag", False):   dark_candidates.append("scarcity")
     if sel.get("strike-through", False): dark_candidates.append("strike")
     if sel.get("timer", False):          dark_candidates.append("timer")
-    dark_type = _dark_type_for_screen(set_id, seeds) if dark_candidates else "none"
+    dark_type = _dark_type_for_screen(set_id) if dark_candidates else "none"
     if dark_type not in dark_candidates and dark_candidates:
-        # If seeded pick not available, fall back deterministically
         dark_type = sorted(dark_candidates)[0]
 
-    # Compute price for each of the 8 cards via Latin-square assignment
-    prices = [_price_for_card(price_anchor, set_id, i, seeds) for i in range(8)]
+    # Prices: 8 levels via Latin schedule anchored on user price
+    base_price = float(price_anchor or 0.0)
+    levels = _price_levels(base_price)
+    prices = _latin_assign(levels, set_id)
 
-    # Precompute UI strings and ground truth rows
+    # ---------------- build cards + ground truth ----------------
+    cards_html: list[str] = []
+    gt_rows: list[dict] = []
+
     brand_text = (brand or "").strip()
-    display_name = f"{brand_text} {category}".strip()
-
-    cards_html = []
-    gt_rows = []
+    display_name = (f"{brand_text} {category}".strip()) or str(category)
 
     for i in range(8):
         r, c = (0 if i < 4 else 1), (i % 4)
@@ -271,16 +351,17 @@ if masks["frame"] == masks["assurance"]:
         d = masks["dark"][i]
         price_total = prices[i]
 
-        # Price presentation
-        if f == 1:  # all-in frame
+        # visual price block
+        if f == 1:  # all-in
             price_block = f"<div class='price'>{_format_currency(price_total, currency)}</div>"
             part_block = ""
-        else:       # partitioned frame (sum equals price_total)
-            base, fees, ship, tax = _partition_total_into_components(price_total, seeds, set_id)
+        else:       # partitioned
+            base, fees, ship, tax = _partition_total_into_components(price_total)
             price_block = f"<div class='price'>{_format_currency(base, currency)} + charges</div>"
             part_block = (
-                f"<div class='pp'>+ Fees {_format_currency(fees, currency)} · ship {_format_currency(ship, currency)} · "
-                f"tax {_format_currency(tax, currency)}<br>Total {_format_currency(price_total, currency)}</div>"
+                f"<div class='pp'>+ Fees {_format_currency(fees, currency)} · "
+                f"ship {_format_currency(ship, currency)} · tax {_format_currency(tax, currency)}"
+                f"<br>Total {_format_currency(price_total, currency)}</div>"
             )
 
         assur_block = "<div class='badge'>Free returns · 30-day warranty</div>" if a else ""
@@ -289,8 +370,7 @@ if masks["frame"] == masks["assurance"]:
             scarcity_level = max(2, int(round(price_total % 7)) + 2)
             dark_block = f"<div class='pill warn'>Only {scarcity_level} left</div>"
         elif dark_type == "strike" and d:
-            strike_mult = 1.10 + (0.20 * ((i*37) % 100) / 100.0)
-            strike_price = round(price_total * strike_mult, 2)
+            strike_price = round(price_total * 1.20, 2)
             dark_block = f"<div class='pill'><s>{_format_currency(strike_price, currency)}</s></div>"
         elif dark_type == "timer" and d:
             mm = 1 + ((i*7) % 15); ss = 5 + ((i*13) % 55)
@@ -305,21 +385,32 @@ if masks["frame"] == masks["assurance"]:
         cards_html.append(
             f"<div class='card' style='grid-row:{r+1};grid-column:{c+1}'>"
             f"<div class='title'>{display_name}</div>"
-            f"{price_block}{part_block}"
-            f"{assur_block}{dark_block}{social_block}{voucher_block}{bundle_block}"
+            f"{price_block}{part_block}{assur_block}{dark_block}{social_block}{voucher_block}{bundle_block}"
             f"</div>"
         )
 
-      
-    # ... inside render_screen, after the for-loop that builds cards_html and gt_rows ...
-    # end of for i in range(8)
+        # ground truth row for this card
+        gt_rows.append({
+            "title": f"{display_name} #{i+1}",
+            "row": r, "col": c,
+            "row_top": 1 if r == 0 else 0,
+            "col1": 1 if c == 0 else 0,
+            "col2": 1 if c == 1 else 0,
+            "col3": 1 if c == 2 else 0,
+            "frame": f,
+            "assurance": a,
+            "scarcity": 1 if (dark_type == "scarcity" and d) else 0,
+            "strike":   1 if (dark_type == "strike"   and d) else 0,
+            "timer":    1 if (dark_type == "timer"    and d) else 0,
+            "price": round(price_total, 2),
+            "ln_price": math.log(max(price_total, 1e-8)),
+        })
 
-    # Join grid and serialize ground truth
+    # ---------------- assemble HTML ----------------
     grid = "".join(cards_html)
     gt_json = json.dumps(gt_rows)
 
-    # Not an f-string; we call .format(grid=..., gt=...) below.
-    # CSS braces are doubled {{ }} so .format doesn't treat them as placeholders.
+    # Plain triple-quoted string (NOT an f-string); CSS braces are doubled {{ }}
     html = """<!doctype html>
 <html><head><meta charset='utf-8'>
 <style>
@@ -348,6 +439,7 @@ body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; m
 </body></html>"""
 
     return html.format(grid=grid, gt=gt_json)
+
 
 
 # Convenience wrappers used by the runner
