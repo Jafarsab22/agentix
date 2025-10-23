@@ -599,6 +599,7 @@ def run_job_sync(payload: Dict) -> Dict:
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
     badges   = list(payload.get("badges") or [])
+    badges = [b for b in badges if b.strip().lower() != "partitioned pricing"]
     render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML via storefront
     catalog_seed = int(payload.get("catalog_seed", 777))
 
@@ -701,3 +702,4 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
