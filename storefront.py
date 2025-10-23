@@ -310,12 +310,17 @@ if masks["frame"] == masks["assurance"]:
             f"</div>"
         )
 
-        gt_rows.append(_gt_row(i, set_id, masks, dark_type, price_total))
+      
+    # ... inside render_screen, after the for-loop that builds cards_html and gt_rows ...
+    # end of for i in range(8)
 
+    # Join grid and serialize ground truth
     grid = "".join(cards_html)
+    gt_json = json.dumps(gt_rows)
 
-    # NOTE: not an f-string — we’ll .format(grid=..., gt=...) below
-     html = """<!doctype html>
+    # Not an f-string; we call .format(grid=..., gt=...) below.
+    # CSS braces are doubled {{ }} so .format doesn't treat them as placeholders.
+    html = """<!doctype html>
 <html><head><meta charset='utf-8'>
 <style>
 body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 24px; }}
@@ -341,7 +346,7 @@ body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; m
 {gt}
 </div>
 </body></html>"""
-    gt_json = json.dumps(gt_rows)
+
     return html.format(grid=grid, gt=gt_json)
 
 
