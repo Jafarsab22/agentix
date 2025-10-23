@@ -593,7 +593,7 @@ def run_job_sync(payload: Dict) -> Dict:
         set_id, vendor_tag, gt, image_b64, decision = _episode(
             category, ui_label, render_tpl, i, badges, catalog_seed, price, currency, brand
         )
-        _write_outputs(category, vendor_tag, set_id, gt, decision)
+        _write_outputs(category, ui_label, set_id, gt, decision)
         time.sleep(0.03)
 
     # ----- robust conditional-logit post-processing -----
@@ -666,6 +666,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
