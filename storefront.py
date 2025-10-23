@@ -187,6 +187,18 @@ def _gt_row(i: int, set_id: str, masks: dict, dark_type: str, price_total: float
 # Public API: render_screen + helpers
 # ------------------------------
 
+_LEVER_KEYS = ["frame","assurance","social","voucher","bundle","dark"]
+
+def _lever_mask(set_id: str, lever_key: str) -> list[int]:
+    """
+    Return a balanced 4/8 mask for this lever that is orthogonal to others.
+    We deterministically rotate the base layout by a lever-specific offset.
+    """
+    li = _layout_index(set_id)              # 0..3 (screen-based rotation)
+    off = abs(hash(lever_key)) % 4          # lever-specific offset 0..3
+    pat_idx = (li + off) % 4
+    return _PATTERNS[pat_idx][:]
+
 def render_screen(
     category: str,
     set_id: str,
@@ -204,13 +216,13 @@ def render_screen(
     # Balanced masks
     base_mask = _balanced_mask(set_id)
     masks = {
-        "frame":   base_mask[:] if sel.get("all-in pricing", False) else [0]*8,
-        "assurance": base_mask[:] if sel.get("assurance", False) else [0]*8,
-        "dark":    base_mask[:],  # applied only to the chosen dark type
-        "social":  base_mask[:] if sel.get("social", False) else [0]*8,
-        "voucher": base_mask[:] if sel.get("voucher", False) else [0]*8,
-        "bundle":  base_mask[:] if sel.get("bundle", False) else [0]*8,
-    }
+    "frame":     _lever_mask(set_id, "frame")     if sel.get("all-in pricing", False) else [0]*8,
+    "assurance": _lever_mask(set_id, "assurance") if sel.get("assurance", False) else [0]*8,
+    "dark":      _lever_mask(set_id, "dark"),   # applied only to the chosen dark type
+    "social":    _lever_mask(set_id, "social")    if sel.get("social", False) else [0]*8,
+    "voucher":   _lever_mask(set_id, "voucher")   if sel.get("voucher", False) else [0]*8,
+    "bundle":    _lever_mask(set_id, "bundle")    if sel.get("bundle", False) else [0]*8,
+}
 
     # Choose exactly one dark mechanism per screen (blocked & seed-randomised)
     dark_candidates = []
