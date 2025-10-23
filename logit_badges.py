@@ -113,7 +113,6 @@ def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.Da
     Returns a DataFrame with columns: badge, beta, p, sign.
     Writes results/table_badges.csv if non-empty.
     """
-    # If toolchain not present, exit gracefully
     if not _HAVE_SM:
         return _empty_table()
 
@@ -125,78 +124,64 @@ def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.Da
     if df.empty:
         return _empty_table()
 
-    # Ensure required columns exist
+    # Require complete 8-alternative screens and the standard controls
     required = {"case_id", "title", "chosen", "row_top", "col1", "col2", "col3"}
-    if not required.issubset(set(df.columns)):
+    if not required.issubset(df.columns):
         return _empty_table()
 
-    # Keep only complete 8-alternative screens
     sizes = df.groupby("case_id").size()
-    keep = sizes[sizes == 8].index
-    df = df[df["case_id"].isin(keep)].copy()
+    keep_cases = sizes[sizes == 8].index
+    df = df[df["case_id"].isin(keep_cases)].copy()
     if df.empty:
         return _empty_table()
 
-    # Translate selected badges to df columns, drop unknowns/None
+    # Map UI badges to dataframe columns
     cols = []
     for b in (selected_badges or []):
         k = _BADGE_MAP.get(b)
         if k and k in df.columns:
             cols.append(k)
 
-    # Nothing to estimate → empty table
-    if not cols:
+    # Optional covariates (ACES-style): ln(price) if available
+    covars = []
+    if "ln_price" in df.columns and df["ln_price"].notna().any():
+        covars.append("ln_price")
+
+    # Nothing to estimate
+    if not cols and not covars:
         return _empty_table()
 
-    # Build design: position controls + selected badges + case FE + product (title) FE
+    # Build RHS: position controls + selected badges + covariates + FE
     base_cols = ["row_top", "col1", "col2", "col3"]
-    rhs_terms = base_cols + cols + ["C(case_id)", "C(title)"]
-
-    # Ensure there is variance in each column referenced
-    # (patsy will also drop zero-variance columns, but we add a guard)
     for c in base_cols:
         if c not in df.columns:
             return _empty_table()
 
-    # Build matrices
+    rhs_terms = base_cols + cols + covars + ["C(case_id)", "C(title)"]
+    formula = "chosen ~ -1 + " + " + ".join(rhs_terms)
+
     try:
-        formula = "chosen ~ -1 + " + " + ".join(rhs_terms)
         y, X = pt.dmatrices(formula, df, return_type="dataframe")
 
-        # Drop zero-variance columns to avoid singularities
-        if X.shape[1] == 0:
-            return _empty_table()
-        X = X.loc[:, X.std(axis=0) > 0]
+        # Drop zero-variance columns (defensive against perfect separation/collinearity)
+        nunique = (X != 0).sum()
+        keep = [c for c in X.columns if X[c].std(ddof=0) > 0 and nunique.get(c, 1) > 0]
+        X = X[keep]
         if X.shape[1] == 0:
             return _empty_table()
 
-        # Fit
         params, pvals = _fit_with_fallback(y, X)
 
-        # Collect per-badge stats (skip any badge whose column got dropped)
-        rows = []
-        for b in selected_badges:
-            k = _BADGE_MAP.get(b)
-            if not k:
-                continue
-            if k not in params.index:
-                # Column may have been dropped (no variance / collinear) — skip
-                continue
-            beta = float(params[k])
-            p = float(pvals[k]) if k in pvals.index else float("nan")
-            rows.append({"badge": b, "beta": beta, "p": p, "sign": _sign(beta, p)})
-
-        # If nothing ended up estimable, return empty schema
-        if not rows:
-            return _empty_table()
-
-        out = pd.DataFrame(rows, columns=_EMPTY_SCHEMA).sort_values("badge").reset_index(drop=True)
-
-        # Persist
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        out.to_csv(RESULTS_DIR / "table_badges.csv", index=False)
-        return out
-
+        # Keep only rows for the reported levers (badges) in the output table
+        out = []
+        for ui_label in (selected_badges or []):
+            col = _BADGE_MAP.get(ui_label)
+            if col and col in X.columns and col in params.index:
+                beta = float(params[col])
+                p = float(pvals[col])
+                out.append({"badge": ui_label, "beta": beta, "p": p, "sign": _sign(beta, p)})
+        return pd.DataFrame(out, columns=_EMPTY_SCHEMA) if out else _empty_table()
     except Exception:
-        # Any modelling failure should not crash the pipeline
         return _empty_table()
+
+
