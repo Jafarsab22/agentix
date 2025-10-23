@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Agentix — Vision runner (jpeg_b64) for ALL badges + per-screen choice logs.
+Version: v1.6 (2025-10-23)
 
 • Headless Chrome → JPEG base64 → VLM tool/function call → reconcile to 2×4 grid.
-• Uses only what is rendered: total price + badges + position.
+• Uses only what is rendered: prices (varied within-screen) + badges + position.
 • Fresh-run clearing via payload["fresh"]=True.
 • After finishing, calls logit_badges.run_logit(...) with the user-selected badges.
 • Produces results/table_badges.csv and includes logit_table_rows in the returned JSON.
@@ -14,72 +15,74 @@ Payload shape (example):
   "model": "OpenAI GPT-4.1-mini",           # or "Anthropic Claude 3.5 Haiku" | "Google Gemini 1.5 Flash"
   "render_url": "",                         # if empty → inline HTML is used (recommended)
   "product": "fitness watch",
-  "price": 100,                             # ← from your UI
-  "currency": "£",                          # ← from your UI
+  "brand": "",                              # optional brand label for display
+  "price": 100,                             # ← anchor from UI (we vary around this)
+  "currency": "£",                          # ← from UI
   "badges": ["social","voucher","bundle","Assurance","Strike-through"],
   "n_iterations": 50,
   "fresh": true,
   "catalog_seed": 777
 }
 
-The inline page exposes <script id="groundtruth" type="application/json">…</script> with:
-{ "products": [
-    { "title":..., "row":0/1, "col":0..3,
-      "frame": 1 (all-in) or 0 (partitioned),
-      "assurance": 0/1,
-      "dark": "none"|"scarcity"|"strike"|"timer",
-      "social": true/false, "voucher": true/false, "bundle": true/false,
-      "total_price": number
-    }, ...
-] }
+The inline page exposes <div id="groundtruth">…</div> or
+<script id="groundtruth" type="application/json">…</script> with either:
+  • {"products": [ ... ]}   or   • [ ... ]   (runner handles both).
+
+Each product row contains:
+  title, row, col, frame, assurance,
+  scarcity/strike/timer (either as booleans or a single “dark” string),
+  social_proof/voucher/bundle flags,
+  price and ln_price (preferred) or total_price (legacy).
 
 ####
 Design principles for Agentix simulation runner
 -----------------------------------------------
 
 1. Within-screen variation (choice identifiability)
-   Each screen (case_id) must include multiple product cards differing in key levers 
-   (e.g., frame, assurance, scarcity, strike, timer). 
-   Variation within the same screen is essential: without it, the conditional-logit model 
-   cannot estimate how a given badge affects choice probability. 
-   Example: if all eight cards show frame=1 (all-in pricing), the effect of framing is 
-   unidentifiable.
+   Each screen (case_id) must include multiple product cards differing in key levers
+   (e.g., frame, assurance, scarcity, strike, timer) and in price. Variation within the
+   same screen is essential: without it, the conditional-logit model cannot estimate how
+   a given badge or price affects choice probability.
 
 2. Between-screen rotation (balanced exposure)
-   Across many iterations, each badge should appear roughly 50/50 across screens to avoid 
-   systematic bias toward one condition. This ensures that observed effects come from 
-   model preferences, not from design imbalance.
+   Across iterations, badges use orthogonal 4/8 masks with a 4-screen rotation.
+   Exactly one dark lever is active per screen. Dark types {scarcity, strike, timer, none}
+   are seed-randomised and blocked so each appears exactly once per 4-screen block
+   (order varies by seed).
 
-3. Controlled randomness
-   Badges are allocated pseudo-randomly under structural constraints:
-       - 'Frame' and 'Assurance' vary independently in each screen.
-       - Only one 'dark' lever (scarcity / strike / timer) is active per screen 
-         to maintain interpretability and prevent multi-collinearity.
-   The random seed (catalog_seed) ensures reproducibility.
+3. Controlled randomness with reproducibility
+   Badges and price levels are allocated pseudo-randomly under structural constraints,
+   keyed by catalog_seed, brand, category, and screen index (set_id). This yields
+   reproducible yet randomised runs.
 
-4. Dark levers logic
-   Because dark levers share a similar behavioural role (urgency cues), they are rotated 
-   mutually exclusively across screens. This keeps their effects separable and avoids 
-   confounding in the logit model.
+4. Price variation anchored on user input (external validity + identification)
+   The UI price acts as an anchor P₀. We generate eight within-screen price levels by
+   multiplying P₀ by log-symmetric factors spanning ≈ ±30%. Assignment follows an 8×8
+   Latin-square schedule across 8-screen blocks so that ln(price) is orthogonal to
+   row/column and to other levers. We include ln(price) in the ground truth to identify
+   price sensitivity and to purge badge effects of residual correlation.
 
-5. Estimation integrity
-   After simulation, the runner checks within-screen variation for each badge. 
-   Badges with zero variation across most screens yield unstable coefficients and are 
-   flagged in the summary. 
+5. Frame integrity
+   For partitioned pricing, base+fees+shipping+tax equals the varied total price exactly.
+   Framing is a pure presentation change; the true total price does not differ by frame.
 
-6. Reproducibility and scalability
-   - `catalog_seed` controls deterministic randomness for repeatable experiments.
-   - Increasing `n_iterations` increases the diversity of badge combinations and 
-     stabilises coefficient estimates.
+6. Estimation integrity
+   After simulation, within-screen variation is checked implicitly by the estimator;
+   columns with zero variance are dropped to avoid singularities. With this design,
+   levers and ln(price) have identifying variation by construction.
+
+7. Scalability
+   Increasing n_iterations increases design coverage and tightens standard errors; seed
+   control allows A/B reruns.
 
 In short:
-Each screen must contain diversity (within-screen variation),
-the full run must contain balance (between-screen rotation),
-and randomisation must be reproducible (seeded).
+Each screen contains diversity (within-screen variation in badges and prices),
+blocks enforce balance (between-screen rotation and Latin-square price scheduling),
+and randomisation is reproducible (seeded).
 """
 
 from __future__ import annotations
-import os, io, json, time, base64, pathlib, shutil
+import os, io, json, time, base64, pathlib, shutil, math
 from datetime import datetime
 from typing import Dict, List, Tuple
 from urllib.parse import quote
@@ -91,18 +94,21 @@ from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
+from selenium.webdriver.common.By import By  # noqa: N812 (selenium API)
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from urllib3.exceptions import ReadTimeoutError
+
 import logit_badges  # separate statistical module
-from urllib3.exceptions import ReadTimeoutError   
 
 # ---------------- paths ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "Agentix MC runner – inline-render or URL – 2025-10-21"
+HTML_DIR    = pathlib.Path("pages");   HTML_DIR.mkdir(parents=True, exist_ok=True)
+
+VERSION = "Agentix MC runner – inline-render or URL – 2025-10-23"
 print(f"[agent_runner] {VERSION}", flush=True)
 
 # ---------------- small helpers ----------------
@@ -145,6 +151,7 @@ SYSTEM_PROMPT = (
     "Evaluate only what is visible and position (row/column). "
     "Return ONLY a structured tool/function call with fields: chosen_title (string), row (0-based int), col (0-based int)."
 )
+
 SCHEMA_JSON = {
     "type": "object",
     "properties": {
@@ -165,19 +172,15 @@ def _new_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-animations")
     opts.add_argument("--window-size=1200,800")
-    # keep these to allow data: URLs / file reads if needed
     opts.add_argument("--allow-file-access-from-files")
     opts.add_argument("--disable-web-security")
-    # Make page loads non-blocking; we'll wait explicitly for #groundtruth
     try:
         opts.page_load_strategy = "none"
     except Exception:
         pass
 
-    # Use the Chromium installed in the container (Railway has /usr/bin/chromium)
     opts.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 
-    # Prefer Selenium Manager; fallback to webdriver-manager
     try:
         service = Service()
         driver = webdriver.Chrome(service=service, options=opts)
@@ -186,18 +189,12 @@ def _new_driver():
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=opts)
 
-    # ---- timeouts AFTER driver exists ----
     try:
-        # Browser-level caps (keep explicit waits in _episode)
         driver.set_page_load_timeout(45)
         driver.set_script_timeout(45)
         driver.implicitly_wait(2)
-
-        # Critical: raise the ChromeDriver HTTP client timeout to 5000s
-        # Selenium 4+
         if hasattr(driver, "command_executor") and hasattr(driver.command_executor, "_client_config"):
             driver.command_executor._client_config.timeout = 5000
-        # Older bindings fallback
         if hasattr(driver, "command_executor") and hasattr(driver.command_executor, "set_timeout"):
             try:
                 driver.command_executor.set_timeout(5000)
@@ -217,35 +214,72 @@ def _jpeg_b64_from_driver(driver, quality=72) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 # ---------------- ground-truth reconciliation ----------------
+def _products_from_gt(gt) -> List[dict]:
+    """
+    Accept either {"products":[...]} or plain list [...] from the storefront.
+    """
+    if isinstance(gt, dict) and "products" in gt:
+        return list(gt.get("products") or [])
+    if isinstance(gt, list):
+        return gt
+    return []
+
 def _find_prod(gt, title, row, col):
+    products = _products_from_gt(gt)
     t = (title or "").strip().casefold()
-    for p in gt["products"]:
-        if p["title"].strip().casefold() == t: return p
-    for p in gt["products"]:
-        if int(p["row"]) == int(row) and int(p["col"]) == int(col): return p
+    for p in products:
+        if str(p.get("title", "")).strip().casefold() == t: 
+            return p
+    for p in products:
+        if int(p.get("row", -9)) == int(row) and int(p.get("col", -9)) == int(col):
+            return p
     return None
 
 def reconcile(decision: dict, groundtruth: dict) -> dict:
+    """
+    Align the model's decision to the ground truth schema; propagate lever flags and price fields.
+    Works with either:
+      • 'dark' string + 'social' bool (legacy)  OR
+      • separate scarcity/strike/timer ints + 'social_proof' int (storefront v1.6).
+    """
     r = int(decision.get("row", 0)); c = int(decision.get("col", 0))
     r = 0 if r < 0 else (1 if r > 1 else r)
     c = 0 if c < 0 else (3 if c > 3 else c)
     prod = _find_prod(groundtruth, decision.get("chosen_title"), r, c)
+
     if prod:
-        decision["row"], decision["col"] = int(prod["row"]), int(prod["col"])
-        dark = (prod.get("dark") or "none").strip().lower()
-        decision.update({
-            "frame": int(prod.get("frame", 1)),
-            "assurance": int(prod.get("assurance", 0)),
-            "scarcity": 1 if dark == "scarcity" else 0,
-            "strike":   1 if dark == "strike"   else 0,
-            "timer":    1 if dark == "timer"    else 0,
-            "social_proof": 1 if prod.get("social")  else 0,
-            "voucher":      1 if prod.get("voucher") else 0,
-            "bundle":       1 if prod.get("bundle")  else 0,
-        })
+        decision["row"], decision["col"] = int(prod.get("row", r)), int(prod.get("col", c))
+        # Frame & assurance
+        decision["frame"] = int(prod.get("frame", 1)) if prod.get("frame") is not None else None
+        decision["assurance"] = int(prod.get("assurance", 0)) if prod.get("assurance") is not None else None
+
+        # Dark flags: accept either 'dark' string or individual booleans
+        dark_str = (str(prod.get("dark", "")).strip().lower()) if "dark" in prod else None
+        if dark_str is not None:
+            decision["scarcity"] = 1 if dark_str == "scarcity" else 0
+            decision["strike"]   = 1 if dark_str == "strike"   else 0
+            decision["timer"]    = 1 if dark_str == "timer"    else 0
+        else:
+            decision["scarcity"] = int(prod.get("scarcity", 0))
+            decision["strike"]   = int(prod.get("strike", 0))
+            decision["timer"]    = int(prod.get("timer", 0))
+
+        # Social/voucher/bundle keys: accept both schemas
+        decision["social_proof"] = int(prod.get("social_proof", 1 if prod.get("social") else 0)) if ("social_proof" in prod or "social" in prod) else None
+        decision["voucher"]      = int(prod.get("voucher", 0)) if ("voucher" in prod) else None
+        decision["bundle"]       = int(prod.get("bundle", 0)) if ("bundle" in prod) else None
+
+        # Price fields
+        price_val = prod.get("price", prod.get("total_price", None))
+        if price_val is not None:
+            decision["price"] = float(price_val)
+            decision["ln_price"] = float(prod.get("ln_price", math.log(max(float(price_val), 1e-8))))
+        else:
+            decision["price"] = None
+            decision["ln_price"] = None
     else:
         decision.update({"frame":None,"assurance":None,"scarcity":None,"strike":None,"timer":None,
-                         "social_proof":None,"voucher":None,"bundle":None})
+                         "social_proof":None,"voucher":None,"bundle":None,"price":None,"ln_price":None})
     return decision
 
 # ---------------- vendor calls ----------------
@@ -351,114 +385,27 @@ def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_
             .replace("{currency}", currency))
 
 # ---------------- inline renderer (Option B) ----------------
-def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price: float, currency: str) -> str:
+def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price_anchor: float, currency: str, brand: str = "") -> str:
     """
-    Inline storefront renderer with Colab-style logic:
-    - For each selected badge, assign it to each of the 8 cards independently with p≈0.5.
-    - If a badge ends up with no variation on a screen (all 0s or all 1s), flip one card to enforce variation.
-    - For "dark" badges (scarcity/strike/timer), keep a single 'dark' field and randomly pick
-      ONE dark type to use on this screen, then assign it per card with p≈0.5.
-    - Price comes straight from the UI and is identical across cards (as in your previous setup).
-    Deterministic per screen via RNG seeding on catalog_seed ⊕ hash(set_id).
+    Inline storefront renderer (v1.6):
+    Delegates to storefront.render_screen(...) which enforces:
+      • Balanced 4/8 masks for frame/assurance and any independent cues.
+      • Seed-randomised, 4-screen blocked rotation across {scarcity, strike, timer, none}.
+      • Within-screen price variation anchored on the UI price using eight log-symmetric levels
+        (≈±30%) assigned via an 8×8 Latin-square across 8-screen blocks.
+      • Ground truth includes price and ln_price per card; in partitioned frames, components
+        sum exactly to the varied total.
     """
-    import json as _json, random as _random
-
-    # deterministic RNG per screen
-    seed = (int(catalog_seed) & 0x7FFFFFFF) ^ (abs(hash(set_id)) & 0x7FFFFFFF)
-    rng = _random.Random(seed)
-
-    # helper: Bernoulli(p) vector of length 8
-    def bern_mask(p: float = 0.5):
-        return [1 if rng.random() < p else 0 for _ in range(8)]
-
-    # ensure at least one 1 and one 0 (so the logit has within-screen contrast)
-    def enforce_variation(mask: list[int]):
-        if all(v == 0 for v in mask):
-            mask[rng.randrange(8)] = 1
-        elif all(v == 1 for v in mask):
-            mask[rng.randrange(8)] = 0
-        return mask
-
-    # Which badges are ON in the UI?
-    sel = {b.lower(): True for b in badges or []}
-
-    # Position-independent binary masks per selected badge
-    frame_mask   = enforce_variation(bern_mask()) if sel.get("all-in pricing", False) else [0]*8
-    assur_mask   = enforce_variation(bern_mask()) if sel.get("assurance", False) else [0]*8
-    social_mask  = enforce_variation(bern_mask()) if sel.get("social", False) else [0]*8
-    voucher_mask = enforce_variation(bern_mask()) if sel.get("voucher", False) else [0]*8
-    bundle_mask  = enforce_variation(bern_mask()) if sel.get("bundle", False) else [0]*8
-
-    # Dark badges share one field 'dark' with values in {"none","scarcity","strike","timer"}
-    dark_candidates = []
-    if sel.get("scarcity tag", False): dark_candidates.append("scarcity")
-    if sel.get("strike-through", False): dark_candidates.append("strike")
-    if sel.get("timer", False): dark_candidates.append("timer")
-    if dark_candidates:
-        dark_type = rng.choice(dark_candidates)  # pick ONE dark mechanism for this screen (matches your prior contract)
-        dark_mask = enforce_variation(bern_mask())
-    else:
-        dark_type = "none"
-        dark_mask = [0]*8
-
-    # Build 2×4 grid
-    products, rows_html = [], []
-    idx = 0
-    for r in range(2):
-        for c in range(4):
-            title = f"{category.title()} #{idx+1}"
-            prod = {
-                "title": title,
-                "row": r, "col": c,
-                "frame": int(frame_mask[idx]),
-                "assurance": int(assur_mask[idx]),
-                "dark": dark_type if dark_mask[idx] == 1 else "none",
-                "social": bool(social_mask[idx]),
-                "voucher": bool(voucher_mask[idx]),
-                "bundle": bool(bundle_mask[idx]),
-                "total_price": float(price),
-            }
-            products.append(prod)
-
-            # visible labels (purely cosmetic)
-            label = f"Card {idx+1} — {currency}{price:.2f}"
-            tags = []
-            if prod["frame"] == 1: tags.append("All-in pricing")
-            if prod["assurance"] == 1: tags.append("Assurance")
-            if prod["dark"] != "none": tags.append(prod["dark"])
-            if prod["social"]:  tags.append("social")
-            if prod["voucher"]: tags.append("voucher")
-            if prod["bundle"]:  tags.append("bundle")
-            badge_txt = ", ".join(tags) if tags else "no badges"
-
-            rows_html.append(
-                f"<div class='card'><div class='title'>{label}</div>"
-                f"<div class='meta'>{category}</div>"
-                f"<div class='badges'>{badge_txt}</div></div>"
-            )
-            idx += 1
-
-    gt = {"category": category, "set_id": set_id, "products": products}
-
-    html = f"""
-    <html><head>
-      <meta charset="utf-8"/>
-      <title>Agentix {set_id}</title>
-      <style>
-        body {{ font-family: system-ui, Arial; margin: 16px; }}
-        .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
-        .card {{ border:1px solid #ddd; padding:12px; height:180px; display:flex;
-                 flex-direction:column; justify-content:space-between; }}
-        .title {{ font-weight:700 }}
-        .meta {{ font-size:12px; opacity:.9 }}
-        .badges {{ opacity:.8; font-size:12px }}
-        #groundtruth {{ display:none }}
-      </style>
-    </head>
-    <body>
-      <div class="grid">{''.join(rows_html)}</div>
-      <script id="groundtruth" type="application/json">{_json.dumps(gt)}</script>
-    </body></html>"""
+    from storefront import render_screen
+    html = render_screen(
+        category=category,
+        set_id=set_id,
+        badges=badges,
+        catalog_seed=catalog_seed,
+        price_anchor=float(price_anchor),
+        currency=currency,
+        brand=brand,
+    )
     return html
 
 # --- preview: render exactly one screen and return its image (no disk writes) ---
@@ -479,21 +426,26 @@ def preview_one(payload: Dict) -> Dict:
         price = 0.0
     currency = str(payload.get("currency") or "£")
 
-    set_id, _, gt, image_b64, _ = _episode(
-        category=category,
-        ui_label=ui_label,
-        render_url_tpl=render_tpl,
-        set_index=1,
-        badges=badges,
-        catalog_seed=catalog_seed,
-        price=price,
-        currency=currency,
-        brand=brand
-    )
-    return {"set_id": set_id, "image_b64": image_b64}
-  
-# ---------------- run one episode ----------------
+    driver = _new_driver()
+    try:
+        set_id, _, gt, image_b64, _ = _episode(
+            driver=driver,
+            category=category,
+            ui_label=ui_label,
+            render_url_tpl=render_tpl,
+            set_index=1,
+            badges=badges,
+            catalog_seed=catalog_seed,
+            price=price,
+            currency=currency,
+            brand=brand
+        )
+        return {"set_id": set_id, "image_b64": image_b64}
+    finally:
+        try: driver.quit()
+        except Exception: pass
 
+# ---------------- run one episode ----------------
 def _episode(
     driver,                                # <-- driver is passed in
     category: str,
@@ -513,7 +465,7 @@ def _episode(
             used_inline = False
             if render_url_tpl.strip():
                 try:
-                    url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
+                    url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed, price, currency)
                     driver.get(url)
                     WebDriverWait(driver, 7, poll_frequency=0.5).until(
                         EC.presence_of_element_located((By.ID, "groundtruth"))
@@ -524,8 +476,7 @@ def _episode(
                 used_inline = True
 
             if used_inline:
-                from storefront import render_screen
-                html = render_screen(category, set_id, badges, catalog_seed, price, currency, brand=brand)
+                html = _render_html(category, set_id, badges, catalog_seed, price, currency, brand=brand)
                 _load_html(driver, html)
 
             locator = (By.ID, "groundtruth")
@@ -539,7 +490,9 @@ def _episode(
                     EC.presence_of_element_located(locator)
                 )
 
-            gt = json.loads(driver.find_element(By.ID, "groundtruth").get_attribute("textContent"))
+            gt_text = driver.find_element(By.ID, "groundtruth").get_attribute("textContent")
+            gt = json.loads(gt_text)
+
             image_b64 = _jpeg_b64_from_driver(driver, quality=72)
             model_label, decision = _choose_with_model(image_b64, category, ui_label)
             decision = reconcile(decision, gt)
@@ -555,16 +508,27 @@ def _ensure_dir(p: pathlib.Path): p.mkdir(parents=True, exist_ok=True)
 
 def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: dict):
     rows_choice, rows_long = [], []
+    products = _products_from_gt(gt)
+
     # df_choice (8 rows per screen)
-    for p in gt.get("products", []):
-        dark = (p.get("dark") or "none").strip().lower()
+    for p in products:
+        # Handle either schema
+        dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
         row_top = 1 if int(p.get("row",0)) == 0 else 0
         col1 = 1 if int(p.get("col",0)) == 0 else 0
         col2 = 1 if int(p.get("col",0)) == 1 else 0
         col3 = 1 if int(p.get("col",0)) == 2 else 0
         chosen = 1 if (int(p.get("row",9)) == int(decision.get("row", -1))
                        and int(p.get("col",9)) == int(decision.get("col", -1))) else 0
-        rows_choice.append({
+
+        scarcity = 1 if dark == "scarcity" else int(p.get("scarcity", 0)) if dark is None else 0
+        strike   = 1 if dark == "strike"   else int(p.get("strike", 0))   if dark is None else 0
+        timer    = 1 if dark == "timer"    else int(p.get("timer", 0))    if dark is None else 0
+
+        price_val = p.get("price", p.get("total_price", None))
+        ln_price  = p.get("ln_price", math.log(max(float(price_val), 1e-8))) if price_val is not None else None
+
+        rec = {
             "case_id": f"{RUN_ID}|{set_id}|{vendor}",
             "run_id": RUN_ID, "set_id": set_id, "model": vendor, "category": category,
             "title": p.get("title"),
@@ -572,15 +536,19 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
             "row_top": row_top, "col1": col1, "col2": col2, "col3": col3,
             "frame": int(p.get("frame", 1)),
             "assurance": int(p.get("assurance", 0)),
-            "scarcity": 1 if dark == "scarcity" else 0,
-            "strike":   1 if dark == "strike"   else 0,
-            "timer":    1 if dark == "timer"    else 0,
-            "social_proof": 1 if p.get("social")  else 0,
-            "voucher":      1 if p.get("voucher") else 0,
-            "bundle":       1 if p.get("bundle")  else 0,
-            "total_price": float(p.get("total_price", 0.0)),
+            "scarcity": int(scarcity),
+            "strike":   int(strike),
+            "timer":    int(timer),
+            "social_proof": int(p.get("social_proof", 1 if p.get("social") else 0)) if ("social_proof" in p or "social" in p) else 0,
+            "voucher": int(p.get("voucher", 0)),
+            "bundle":  int(p.get("bundle", 0)),
             "chosen": chosen
-        })
+        }
+        if price_val is not None:
+            rec["price"] = float(price_val)
+            rec["ln_price"] = float(ln_price)
+        rows_choice.append(rec)
+
     df_choice = pd.DataFrame(rows_choice)
     for c in ("row","col","row_top","col1","col2","col3","frame","assurance",
               "scarcity","strike","timer","social_proof","voucher","bundle","chosen"):
@@ -601,6 +569,8 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
         "social_proof": int(decision.get("social_proof", 0)) if decision.get("social_proof") is not None else None,
         "voucher": int(decision.get("voucher", 0)) if decision.get("voucher") is not None else None,
         "bundle": int(decision.get("bundle", 0)) if decision.get("bundle") is not None else None,
+        "price": float(decision.get("price")) if decision.get("price") is not None else None,
+        "ln_price": float(decision.get("ln_price")) if decision.get("ln_price") is not None else None,
     })
     df_long = pd.DataFrame(rows_long)
     agg_long = RESULTS_DIR / "df_long.csv"
@@ -632,29 +602,26 @@ def run_job_sync(payload: Dict) -> Dict:
     render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML via storefront
     catalog_seed = int(payload.get("catalog_seed", 777))
 
-    # take price & currency from UI (no randomness)
     try:
         price = float(payload.get("price"))
     except Exception:
         price = 0.0
     currency = str(payload.get("currency") or "£")
 
-    # --- create ONE shared driver for all iterations ---
     driver = _new_driver()
     try:
         for i in range(1, n + 1):
-            # _episode now takes the driver as its first arg and returns (set_id, model_label, gt, image_b64, decision)
             set_id, _model_label, gt, image_b64, decision = _episode(
-                driver,
-                category,
-                ui_label,
-                render_tpl,
-                i,
-                badges,
-                catalog_seed,
-                price,
-                currency,
-                brand,
+                driver=driver,
+                category=category,
+                ui_label=ui_label,
+                render_url_tpl=render_tpl,
+                set_index=i,
+                badges=badges,
+                catalog_seed=catalog_seed,
+                price=price,
+                currency=currency,
+                brand=brand,
             )
             _write_outputs(category, ui_label, set_id, gt, decision)
             time.sleep(0.03)
@@ -734,18 +701,3 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
