@@ -494,7 +494,11 @@ def preview_one(payload: Dict) -> Dict:
   
 # ---------------- run one episode ----------------
 
+# add once near other imports if you use the robust waits
+from urllib3.exceptions import ReadTimeoutError
+
 def _episode(
+    driver,                                # <-- pass driver in
     category: str,
     ui_label: str,
     render_url_tpl: str,
@@ -505,61 +509,49 @@ def _episode(
     currency: str,
     brand: str,
 ):
-    driver = _new_driver()
+    set_id = f"S{set_index:04d}"
 
-    try:
-        set_id = f"S{set_index:04d}"
-
-        for attempt in range(2):
-            try:
-                used_inline = False
-
-                # Try external renderer first if provided
-                if render_url_tpl.strip():
-                    try:
-                        url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
-                        driver.get(url)
-                        # quick probe to decide on fallback
-                        WebDriverWait(driver, 7, poll_frequency=0.5).until(
-                            EC.presence_of_element_located((By.ID, "groundtruth"))
-                        )
-                    except (TimeoutException, WebDriverException, ReadTimeoutError):
-                        used_inline = True
-                else:
-                    used_inline = True
-
-                if used_inline:
-                    from storefront import render_screen
-                    html = render_screen(
-                        category, set_id, badges, catalog_seed, price, currency, brand=brand
-                    )
-                    _load_html(driver, html)
-
-                # Final wait (robust) for whichever mode we’re in
-                locator = (By.ID, "groundtruth")
+    for attempt in range(2):
+        try:
+            used_inline = False
+            if render_url_tpl.strip():
                 try:
-                    WebDriverWait(driver, 45, poll_frequency=0.5).until(
-                        EC.presence_of_element_located(locator)
+                    url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
+                    driver.get(url)
+                    WebDriverWait(driver, 7, poll_frequency=0.5).until(
+                        EC.presence_of_element_located((By.ID, "groundtruth"))
                     )
-                except (TimeoutException, ReadTimeoutError):
-                    # One retry: refresh and wait again
-                    driver.refresh()
-                    WebDriverWait(driver, 25, poll_frequency=0.5).until(
-                        EC.presence_of_element_located(locator)
-                    )
+                except (TimeoutException, WebDriverException, ReadTimeoutError):
+                    used_inline = True
+            else:
+                used_inline = True
 
-                gt = json.loads(
-                    driver.find_element(By.ID, "groundtruth").get_attribute("textContent")
+            if used_inline:
+                from storefront import render_screen
+                html = render_screen(category, set_id, badges, catalog_seed, price, currency, brand=brand)
+                _load_html(driver, html)
+
+            locator = (By.ID, "groundtruth")
+            try:
+                WebDriverWait(driver, 45, poll_frequency=0.5).until(
+                    EC.presence_of_element_located(locator)
                 )
-                image_b64 = _jpeg_b64_from_driver(driver, quality=72)
-                model_label, decision = _choose_with_model(image_b64, category, ui_label)
-                decision = reconcile(decision, gt)
-                return set_id, model_label, gt, image_b64, decision
-
             except (TimeoutException, ReadTimeoutError):
-                if attempt == 0:
-                    continue  # retry the whole episode once
-                raise
+                driver.refresh()
+                WebDriverWait(driver, 25, poll_frequency=0.5).until(
+                    EC.presence_of_element_located(locator)
+                )
+
+            gt = json.loads(driver.find_element(By.ID, "groundtruth").get_attribute("textContent"))
+            image_b64 = _jpeg_b64_from_driver(driver, quality=72)
+            model_label, decision = _choose_with_model(image_b64, category, ui_label)
+            decision = reconcile(decision, gt)
+            return set_id, model_label, gt, image_b64, decision
+
+        except (TimeoutException, ReadTimeoutError):
+            if attempt == 0:
+                continue
+            raise
     finally:
         driver.quit()
 
@@ -654,12 +646,30 @@ def run_job_sync(payload: Dict) -> Dict:
         price = 0.0
     currency = str(payload.get("currency") or "£")
 
-    for i in range(1, n + 1):
-        set_id, vendor_tag, gt, image_b64, decision = _episode(
-            category, ui_label, render_tpl, i, badges, catalog_seed, price, currency, brand
-        )
-        _write_outputs(category, ui_label, set_id, gt, decision)
-        time.sleep(0.03)
+    # --- create ONE shared driver for all iterations ---
+    driver = _new_driver()
+    try:
+        for i in range(1, n + 1):
+            # _episode now takes the driver as its first arg and returns (set_id, model_label, gt, image_b64, decision)
+            set_id, _model_label, gt, image_b64, decision = _episode(
+                driver,
+                category,
+                ui_label,
+                render_tpl,
+                i,
+                badges,
+                catalog_seed,
+                price,
+                currency,
+                brand,
+            )
+            _write_outputs(category, ui_label, set_id, gt, decision)
+            time.sleep(0.03)
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     # ----- robust conditional-logit post-processing -----
     out_csv = RESULTS_DIR / "table_badges.csv"
@@ -731,6 +741,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
