@@ -65,11 +65,11 @@ class Seeds:
 # Balanced 4/8 masks with 4-screen rotation
 # ------------------------------
 _PATTERNS = [
-    [1,1,1,1,0,0,0,0],  # 4 ones, 4 zeros (example patterns; use yours if different)
+    [1,1,1,1,0,0,0,0],
     [1,1,0,0,1,1,0,0],
     [1,0,1,0,1,0,1,0],
     [1,0,0,1,0,1,0,1],
-]
+]]
 
 
 def _layout_index(set_id: str) -> int:
@@ -80,6 +80,15 @@ def _layout_index(set_id: str) -> int:
         n = 1
     return (n - 1) % 4
 
+# GUARANTEED distinct offsets for the main levers
+_LEVER_OFFSET = {
+    "frame": 0,
+    "assurance": 1,
+    "dark": 2,
+    "social": 3,
+    "voucher": 1,   # secondary group; can reuse if not estimated together
+    "bundle": 2,
+}
 
 def _balanced_mask(set_id: str) -> list[int]:
     return _PATTERNS[_layout_index(set_id)][:]
@@ -191,10 +200,9 @@ def _lever_mask(set_id: str, lever_key: str) -> list[int]:
     Return a balanced 4/8 mask for this lever that is orthogonal to others.
     We deterministically rotate the base layout by a lever-specific offset.
     """
-    li = _layout_index(set_id)              # 0..3 (screen-based rotation)
-    off = abs(hash(lever_key)) % 4          # lever-specific offset 0..3
-    pat_idx = (li + off) % 4
-    return _PATTERNS[pat_idx][:]
+    li  = _layout_index(set_id)              # 0..3 rotation by screen index
+    off = _LEVER_OFFSET.get(lever_key, 0)    # guaranteed mapping
+    return _PATTERNS[(li + off) % 4][:]
 
 _LEVER_KEYS = ["frame","assurance","social","voucher","bundle","dark"]
 
@@ -227,11 +235,13 @@ def render_screen(
     masks = {
     "frame":     _lever_mask(set_id, "frame")     if sel.get("all-in pricing", False) else [0]*8,
     "assurance": _lever_mask(set_id, "assurance") if sel.get("assurance", False) else [0]*8,
-    "dark":      _lever_mask(set_id, "dark"),   # applied only to the chosen dark type
+    "dark":      _lever_mask(set_id, "dark"),   # applied only to whichever dark type is active
     "social":    _lever_mask(set_id, "social")    if sel.get("social", False) else [0]*8,
     "voucher":   _lever_mask(set_id, "voucher")   if sel.get("voucher", False) else [0]*8,
     "bundle":    _lever_mask(set_id, "bundle")    if sel.get("bundle", False) else [0]*8,
 }
+if masks["frame"] == masks["assurance"]:
+    raise RuntimeError("Design error: frame and assurance masks are identical; check _LEVER_OFFSET.")
 
 
     # Choose exactly one dark mechanism per screen (blocked & seed-randomised)
