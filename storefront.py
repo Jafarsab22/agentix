@@ -182,6 +182,7 @@ def _gt_row(i: int, set_id: str, masks: dict, dark_type: str, price_total: float
         "price": round(price_total, 2),
         "ln_price": math.log(max(price_total, 1e-8)),
     }
+
 # ------------------------------
 # Public API: render_screen + helpers
 # ------------------------------
@@ -203,12 +204,12 @@ def render_screen(
     # Balanced masks
     base_mask = _balanced_mask(set_id)
     masks = {
-        "frame": base_mask[:] if sel.get("all-in pricing", False) else [0]*8,
+        "frame":   base_mask[:] if sel.get("all-in pricing", False) else [0]*8,
         "assurance": base_mask[:] if sel.get("assurance", False) else [0]*8,
-        "dark": base_mask[:],  # applied only to the chosen dark type
-        "social": base_mask[:] if sel.get("social", False) else [0]*8,
+        "dark":    base_mask[:],  # applied only to the chosen dark type
+        "social":  base_mask[:] if sel.get("social", False) else [0]*8,
         "voucher": base_mask[:] if sel.get("voucher", False) else [0]*8,
-        "bundle": base_mask[:] if sel.get("bundle", False) else [0]*8,
+        "bundle":  base_mask[:] if sel.get("bundle", False) else [0]*8,
     }
 
     # Choose exactly one dark mechanism per screen (blocked & seed-randomised)
@@ -256,7 +257,7 @@ def render_screen(
             scarcity_level = max(2, int(round(price_total % 7)) + 2)
             dark_block = f"<div class='pill warn'>Only {scarcity_level} left</div>"
         elif dark_type == "strike" and d:
-            strike_mult = 1.10 + (0.20 * ( (i*37) % 100 ) / 100.0)
+            strike_mult = 1.10 + (0.20 * ((i*37) % 100) / 100.0)
             strike_price = round(price_total * strike_mult, 2)
             dark_block = f"<div class='pill'><s>{_format_currency(strike_price, currency)}</s></div>"
         elif dark_type == "timer" and d:
@@ -281,7 +282,8 @@ def render_screen(
 
     grid = "".join(cards_html)
 
-    html = f"""
+    # NOTE: not an f-string — we’ll .format(grid=..., gt=...) below
+    html = """
 <!doctype html>
 <html><head><meta charset='utf-8'>
 <style>
