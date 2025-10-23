@@ -65,19 +65,20 @@ class Seeds:
 # Balanced 4/8 masks with 4-screen rotation
 # ------------------------------
 _PATTERNS = [
-    [1,0,1,0, 1,0,1,0],
-    [0,1,0,1, 0,1,0,1],
-    [1,1,0,0, 0,0,1,1],
-    [0,0,1,1, 1,1,0,0],
+    [1,1,1,1,0,0,0,0],  # 4 ones, 4 zeros (example patterns; use yours if different)
+    [1,1,0,0,1,1,0,0],
+    [1,0,1,0,1,0,1,0],
+    [1,0,0,1,0,1,0,1],
 ]
 
+
 def _layout_index(set_id: str) -> int:
-    """Cycle layouts every 4 screens: S0001→0, S0002→1, etc."""
+    # 0..3 depending on screen number; you likely already have something like this
     try:
-        idx = int("".join(ch for ch in set_id if ch.isdigit()))
+        n = int(str(set_id).strip().lstrip("S"))
     except Exception:
-        idx = 1
-    return (idx - 1) % 4
+        n = 1
+    return (n - 1) % 4
 
 
 def _balanced_mask(set_id: str) -> list[int]:
@@ -167,20 +168,14 @@ def _gt_row(i: int, set_id: str, masks: dict, dark_type: str, price_total: float
     col = i % 4
     return {
         "title": f"Card {i+1}",
-        "row": row,
-        "col": col,
+        "row": row, "col": col,
         "row_top": 1 if row == 0 else 0,
-        "col1": 1 if col == 0 else 0,
-        "col2": 1 if col == 1 else 0,
-        "col3": 1 if col == 2 else 0,
+        "col1": 1 if col == 0 else 0, "col2": 1 if col == 1 else 0, "col3": 1 if col == 2 else 0,
         "frame": masks["frame"][i],
         "assurance": masks["assurance"][i],
         "scarcity": 1 if (dark_type == "scarcity" and masks["dark"][i]) else 0,
         "strike":   1 if (dark_type == "strike"   and masks["dark"][i]) else 0,
         "timer":    1 if (dark_type == "timer"    and masks["dark"][i]) else 0,
-        "social_proof": masks.get("social", [0]*8)[i],
-        "voucher": masks.get("voucher", [0]*8)[i],
-        "bundle": masks.get("bundle", [0]*8)[i],
         "price": round(price_total, 2),
         "ln_price": math.log(max(price_total, 1e-8)),
     }
