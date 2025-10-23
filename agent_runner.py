@@ -94,7 +94,7 @@ from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.By import By  # noqa: N812 (selenium API)
+from selenium.webdriver.common.by import By   # <-- FIXED: lowercase module 'by'
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
@@ -228,7 +228,7 @@ def _find_prod(gt, title, row, col):
     products = _products_from_gt(gt)
     t = (title or "").strip().casefold()
     for p in products:
-        if str(p.get("title", "")).strip().casefold() == t: 
+        if str(p.get("title", "")).strip().casefold() == t:
             return p
     for p in products:
         if int(p.get("row", -9)) == int(row) and int(p.get("col", -9)) == int(col):
