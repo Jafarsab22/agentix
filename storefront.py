@@ -315,8 +315,7 @@ if masks["frame"] == masks["assurance"]:
     grid = "".join(cards_html)
 
     # NOTE: not an f-string — we’ll .format(grid=..., gt=...) below
-    html = """
-<!doctype html>
+     html = """<!doctype html>
 <html><head><meta charset='utf-8'>
 <style>
 body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 24px; }}
@@ -341,9 +340,7 @@ body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; m
 <div id='groundtruth' style='display:none'>
 {gt}
 </div>
-</body></html>
-"""
-
+</body></html>"""
     gt_json = json.dumps(gt_rows)
     return html.format(grid=grid, gt=gt_json)
 
