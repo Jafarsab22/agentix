@@ -462,11 +462,6 @@ def preview_one(payload: Dict) -> Dict:
     )
     return {"set_id": set_id, "image_b64": image_b64}
   
-# Harden driver timeouts (add right after driver is created)
-driver.set_page_load_timeout(45)   # bound slow navigations
-driver.set_script_timeout(45)      # bound JS execution waits (if any)
-driver.implicitly_wait(2)          # small implicit wait for minor DOM races
-
 # ---------------- run one episode ----------------
 def _episode(
     category: str,
@@ -481,7 +476,7 @@ def _episode(
 ):
     driver = _new_driver()
 
-    # Harden driver timeouts for large runs
+    # Harden driver timeouts for large runs (safe: driver exists now)
     try:
         driver.set_page_load_timeout(45)
         driver.set_script_timeout(45)
@@ -492,7 +487,6 @@ def _episode(
     try:
         set_id = f"S{set_index:04d}"
 
-        # --- one whole-episode retry (optional but recommended) ---
         for attempt in range(2):
             try:
                 used_inline = False
@@ -502,7 +496,6 @@ def _episode(
                     try:
                         url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
                         driver.get(url)
-                        # Quick probe to decide whether to fall back
                         WebDriverWait(driver, 7).until(
                             EC.presence_of_element_located((By.ID, "groundtruth"))
                         )
@@ -512,21 +505,19 @@ def _episode(
                     used_inline = True
 
                 if used_inline:
-                    # Inline storefront renderer
                     from storefront import render_screen
                     html = render_screen(
                         category, set_id, badges, catalog_seed, price, currency, brand=brand
                     )
                     _load_html(driver, html)
 
-                # Final wait (robust) for whichever mode we’re in
+                # Final wait (robust)
                 locator = (By.ID, "groundtruth")
                 try:
                     WebDriverWait(driver, 45, poll_frequency=0.25).until(
                         EC.presence_of_element_located(locator)
                     )
                 except TimeoutException:
-                    # One retry: refresh and wait again
                     driver.refresh()
                     WebDriverWait(driver, 25, poll_frequency=0.25).until(
                         EC.presence_of_element_located(locator)
@@ -542,12 +533,11 @@ def _episode(
 
             except TimeoutException:
                 if attempt == 0:
-                    # try the whole episode once more
                     continue
                 raise
-
     finally:
         driver.quit()
+
 
 # ---------------- writers ----------------
 def _ensure_dir(p: pathlib.Path): p.mkdir(parents=True, exist_ok=True)
@@ -715,6 +705,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
