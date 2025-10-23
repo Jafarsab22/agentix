@@ -494,11 +494,8 @@ def preview_one(payload: Dict) -> Dict:
   
 # ---------------- run one episode ----------------
 
-# add once near other imports if you use the robust waits
-from urllib3.exceptions import ReadTimeoutError
-
 def _episode(
-    driver,                                # <-- pass driver in
+    driver,                                # <-- driver is passed in
     category: str,
     ui_label: str,
     render_url_tpl: str,
@@ -552,10 +549,6 @@ def _episode(
             if attempt == 0:
                 continue
             raise
-    finally:
-        driver.quit()
-
-
 
 # ---------------- writers ----------------
 def _ensure_dir(p: pathlib.Path): p.mkdir(parents=True, exist_ok=True)
@@ -741,6 +734,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
