@@ -97,6 +97,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, WebDriverException
 import logit_badges  # separate statistical module
+from urllib3.exceptions import ReadTimeoutError   
 
 # ---------------- paths ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -167,17 +168,46 @@ def _new_driver():
     # keep these to allow data: URLs / file reads if needed
     opts.add_argument("--allow-file-access-from-files")
     opts.add_argument("--disable-web-security")
+    # Make page loads non-blocking; we'll wait explicitly for #groundtruth
+    try:
+        opts.page_load_strategy = "none"
+    except Exception:
+        pass
+
     # Use the Chromium installed in the container (Railway has /usr/bin/chromium)
     opts.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 
     # Prefer Selenium Manager; fallback to webdriver-manager
     try:
         service = Service()
-        return webdriver.Chrome(service=service, options=opts)
+        driver = webdriver.Chrome(service=service, options=opts)
     except Exception:
         driver_path = ChromeDriverManager().install()
         service = Service(driver_path)
-        return webdriver.Chrome(service=service, options=opts)
+        driver = webdriver.Chrome(service=service, options=opts)
+
+    # ---- timeouts AFTER driver exists ----
+    try:
+        # Browser-level caps (keep explicit waits in _episode)
+        driver.set_page_load_timeout(45)
+        driver.set_script_timeout(45)
+        driver.implicitly_wait(2)
+
+        # Critical: raise the ChromeDriver HTTP client timeout to 5000s
+        # Selenium 4+
+        if hasattr(driver, "command_executor") and hasattr(driver.command_executor, "_client_config"):
+            driver.command_executor._client_config.timeout = 5000
+        # Older bindings fallback
+        if hasattr(driver, "command_executor") and hasattr(driver.command_executor, "set_timeout"):
+            try:
+                driver.command_executor.set_timeout(5000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return driver
+
 
 def _jpeg_b64_from_driver(driver, quality=72) -> str:
     png = driver.get_screenshot_as_png()
@@ -463,6 +493,7 @@ def preview_one(payload: Dict) -> Dict:
     return {"set_id": set_id, "image_b64": image_b64}
   
 # ---------------- run one episode ----------------
+
 def _episode(
     category: str,
     ui_label: str,
@@ -476,14 +507,6 @@ def _episode(
 ):
     driver = _new_driver()
 
-    # Harden driver timeouts for large runs (safe: driver exists now)
-    try:
-        driver.set_page_load_timeout(45)
-        driver.set_script_timeout(45)
-        driver.implicitly_wait(2)
-    except Exception:
-        pass  # older drivers may not support all setters
-
     try:
         set_id = f"S{set_index:04d}"
 
@@ -496,10 +519,11 @@ def _episode(
                     try:
                         url = _build_url(render_url_tpl, category, set_id, badges, catalog_seed)
                         driver.get(url)
-                        WebDriverWait(driver, 7).until(
+                        # quick probe to decide on fallback
+                        WebDriverWait(driver, 7, poll_frequency=0.5).until(
                             EC.presence_of_element_located((By.ID, "groundtruth"))
                         )
-                    except (TimeoutException, WebDriverException):
+                    except (TimeoutException, WebDriverException, ReadTimeoutError):
                         used_inline = True
                 else:
                     used_inline = True
@@ -511,15 +535,16 @@ def _episode(
                     )
                     _load_html(driver, html)
 
-                # Final wait (robust)
+                # Final wait (robust) for whichever mode we’re in
                 locator = (By.ID, "groundtruth")
                 try:
-                    WebDriverWait(driver, 45, poll_frequency=0.25).until(
+                    WebDriverWait(driver, 45, poll_frequency=0.5).until(
                         EC.presence_of_element_located(locator)
                     )
-                except TimeoutException:
+                except (TimeoutException, ReadTimeoutError):
+                    # One retry: refresh and wait again
                     driver.refresh()
-                    WebDriverWait(driver, 25, poll_frequency=0.25).until(
+                    WebDriverWait(driver, 25, poll_frequency=0.5).until(
                         EC.presence_of_element_located(locator)
                     )
 
@@ -527,16 +552,17 @@ def _episode(
                     driver.find_element(By.ID, "groundtruth").get_attribute("textContent")
                 )
                 image_b64 = _jpeg_b64_from_driver(driver, quality=72)
-                vendor, decision = _choose_with_model(image_b64, category, ui_label)
+                model_label, decision = _choose_with_model(image_b64, category, ui_label)
                 decision = reconcile(decision, gt)
-                return set_id, vendor, gt, image_b64, decision
+                return set_id, model_label, gt, image_b64, decision
 
-            except TimeoutException:
+            except (TimeoutException, ReadTimeoutError):
                 if attempt == 0:
-                    continue
+                    continue  # retry the whole episode once
                 raise
     finally:
         driver.quit()
+
 
 
 # ---------------- writers ----------------
@@ -705,6 +731,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
