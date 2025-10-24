@@ -5,6 +5,7 @@ import gradio as gr
 from agent_runner import run_job_sync
 import traceback, logging
 from html import escape
+from urllib.parse import quote   
 
 logging.basicConfig(level=logging.INFO)
 
@@ -255,64 +256,43 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
 @_catch_and_report
 def search_database(product_name: str):
-    """Query Agentix DB for badge effects. Returns (markdown_table, pretty_json)."""
+    """Query Agentix DB and return (HTML table, pretty_json)."""
     product = (product_name or "").strip()
     if not product:
-        return "Enter a product name to search.", "{}"
+        return "<p>Enter a product name to search.</p>", "{}"
 
     base_url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
 
-    def _parse_json(resp):
-        ct = (resp.headers.get("content-type") or "").lower()
-        # normal path
-        if "application/json" in ct:
-            try:
-                return resp.json()
-            except Exception:
-                pass
-        # some hosts mislabel JSON; last-chance parse
-        try:
-            return json.loads(resp.text)
-        except Exception:
-            return {"ok": False, "message": f"Non-JSON (CT={ct})", "body": resp.text[:200]}
-
-    # 1) Try POST JSON first
+    # --- Call the browser-proven GET path ---
     try:
-        r = requests.post(base_url, json={"product": product, "limit": 50}, timeout=12)
-        data = _parse_json(r)
+        r = requests.get(base_url, params={"product": product, "limit": 50}, timeout=12)
+        ct = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            data = r.json()
+        else:
+            # last-chance parse in case the server mislabeled
+            data = json.loads(r.text)
     except Exception as e:
-        data = {"ok": False, "message": f"POST failed: {e}"}
-
-    # 2) Fallback: GET (browser path you confirmed works)
-    if not data.get("ok") or (not data.get("runs") and not data.get("rows")):
-        try:
-            g = requests.get(base_url, params={"product": product, "limit": 50}, timeout=12)
-            gdata = _parse_json(g)
-            if gdata.get("ok"):
-                data = gdata
-        except Exception as e:
-            if not data.get("ok"):
-                data = {"ok": False, "message": f"{data.get('message','')} | GET failed: {e}"}
+        msg = f"Could not reach the database API ({e})."
+        return f"<p>{msg}</p>", "{}"
 
     if not data.get("ok"):
-        return data.get("message", "No relevant results found."), json.dumps(data, ensure_ascii=False, indent=2)
+        return f"<p>{data.get('message','No relevant results found.')}</p>", json.dumps(data, ensure_ascii=False, indent=2)
 
-    # 3) Normalize payload to rows for a single top run
     runs = data.get("runs") or []
-    rows = data.get("rows") or []
-    if not rows:
-        if not runs:
-            return "No relevant results found.", json.dumps(data, ensure_ascii=False, indent=2)
-        run = runs[0]
-        rid = run.get("run_id")
-        rows = [e for e in (data.get("effects") or []) if e.get("run_id") == rid]
-    else:
-        run = runs[0] if runs else {}
+    effects = data.get("effects") or []
+    if not runs:
+        return "<p>No relevant results found.</p>", json.dumps(data, ensure_ascii=False, indent=2)
+
+    # Pick the most recent run and its effects
+    run = runs[0]
+    rid = run.get("run_id")
+    rows = [e for e in effects if e.get("run_id") == rid]
 
     if not rows:
-        return "No relevant results found.", json.dumps(data, ensure_ascii=False, indent=2)
+        return "<p>No relevant results found.</p>", json.dumps(data, ensure_ascii=False, indent=2)
 
-    # 4) Render compact table + CSV download link
+    # Shared run-level fields
     product_out = run.get("product", product)
     brand_out   = run.get("brand_type", "")
     model_out   = run.get("model_name", "")
@@ -320,21 +300,45 @@ def search_database(product_name: str):
     curr_out    = run.get("price_currency", "")
     n_iter_out  = run.get("n_iterations", "")
 
-    lines = [
-        "| product | brand | model | price | currency | n_iterations | badge | beta | p | sign |",
-        "|---|---|---|---:|:---:|---:|---|---:|---:|:---:|",
-    ]
-    for r in rows:
-        lines.append(
-            f"| {product_out} | {brand_out} | {model_out} | {price_out} | {curr_out} | {n_iter_out} | "
-            f"{r.get('badge','')} | {r.get('beta','')} | {r.get('p_value', r.get('p',''))} | {r.get('sign','0')} |"
+    # Build HTML table (renders in Gradio Markdown/HTML)
+    header = (
+        "<table style='border-collapse:collapse;width:100%'>"
+        "<thead><tr>"
+        "<th style='text-align:left'>product</th>"
+        "<th style='text-align:left'>brand</th>"
+        "<th style='text-align:left'>model</th>"
+        "<th style='text-align:right'>price</th>"
+        "<th style='text-align:center'>currency</th>"
+        "<th style='text-align:right'>n_iterations</th>"
+        "<th style='text-align:left'>badge</th>"
+        "<th style='text-align:right'>beta</th>"
+        "<th style='text-align:right'>p</th>"
+        "<th style='text-align:center'>sign</th>"
+        "</tr></thead><tbody>"
+    )
+    body = []
+    for e in rows:
+        body.append(
+            "<tr>"
+            f"<td>{product_out}</td>"
+            f"<td>{brand_out}</td>"
+            f"<td>{model_out}</td>"
+            f"<td style='text-align:right'>{price_out}</td>"
+            f"<td style='text-align:center'>{curr_out}</td>"
+            f"<td style='text-align:right'>{n_iter_out}</td>"
+            f"<td>{e.get('badge','')}</td>"
+            f"<td style='text-align:right'>{e.get('beta','')}</td>"
+            f"<td style='text-align:right'>{e.get('p_value', e.get('p',''))}</td>"
+            f"<td style='text-align:center'>{e.get('sign','0')}</td>"
+            "</tr>"
         )
+    table_html = header + "".join(body) + "</tbody></table>"
 
-    # CSV download (served by PHP with format=csv)
-    dl_url = f"{base_url}?product={_u.quote(product)}&limit=50&format=csv"
-    lines.append(f"\n[⬇️ Download CSV]({dl_url})")
+    # CSV download (Option A): served by the PHP endpoint
+    dl_url = f"{base_url}?product={quote(product)}&limit=50&format=csv"
+    html = f"{table_html}<p style='margin-top:8px'><a href='{dl_url}'>⬇️ Download CSV</a></p>"
 
-    return "\n".join(lines), json.dumps(data, ensure_ascii=False, indent=2)
+    return html, json.dumps(data, ensure_ascii=False, indent=2)
 
 # --- Admin helpers --- (continued from Part 1)
 
@@ -502,6 +506,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
