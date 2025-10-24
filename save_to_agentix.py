@@ -92,7 +92,9 @@ def persist_results_if_qualify(
     else:
         ts_utc = _now_sql_utc()
 
-    run_id = payload.get("job_id") or f"run-{uuid.uuid4()}"
+    base = (payload.get("job_id") or "run")[:40]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    run_id = f"{base}-n{int(payload.get('n_iterations') or 0)}-{stamp}"
 
     product = payload.get("product") or ""
     brand_type = payload.get("brand") or ""
