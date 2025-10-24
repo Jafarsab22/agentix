@@ -260,70 +260,79 @@ def search_database(product_name: str):
     if not product:
         return "Enter a product name to search.", "{}"
 
-    url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
+    base_url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
 
-    def _parse_payload(text, ct):
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"ok": False, "message": f"Non-JSON response (CT={ct}): {text[:160]}"}
-
-    # --- 1) Primary: POST JSON ---
-    try:
-        resp = requests.post(url, json={"product": product}, timeout=12)
+    def _parse_json(resp):
         ct = (resp.headers.get("content-type") or "").lower()
-        data = _parse_payload(resp.text, ct) if "application/json" in ct else {"ok": False, "message": f"CT={ct} body={resp.text[:160]}"}
+        # normal path
+        if "application/json" in ct:
+            try:
+                return resp.json()
+            except Exception:
+                pass
+        # some hosts mislabel JSON; last-chance parse
+        try:
+            return json.loads(resp.text)
+        except Exception:
+            return {"ok": False, "message": f"Non-JSON (CT={ct})", "body": resp.text[:200]}
+
+    # 1) Try POST JSON first
+    try:
+        r = requests.post(base_url, json={"product": product, "limit": 50}, timeout=12)
+        data = _parse_json(r)
     except Exception as e:
         data = {"ok": False, "message": f"POST failed: {e}"}
 
-    # --- 2) Fallbacks if needed ---
-    need_fallback = (not data.get("ok")) or (len(data.get("runs", [])) == 0 and len(data.get("rows", [])) == 0)
-    if need_fallback:
+    # 2) Fallback: GET (browser path you confirmed works)
+    if not data.get("ok") or (not data.get("runs") and not data.get("rows")):
         try:
-            # Fallback GET (works in your browser)
-            resp2 = requests.get(url, params={"product": product, "limit": 50}, timeout=12)
-            ct2 = (resp2.headers.get("content-type") or "").lower()
-            data2 = _parse_payload(resp2.text, ct2) if "application/json" in ct2 else {"ok": False, "message": f"CT={ct2} body={resp2.text[:160]}"}
-            # Prefer the successful payload
-            if data2.get("ok") and (len(data2.get("runs", [])) or len(data2.get("rows", []))):
-                data = data2
+            g = requests.get(base_url, params={"product": product, "limit": 50}, timeout=12)
+            gdata = _parse_json(g)
+            if gdata.get("ok"):
+                data = gdata
         except Exception as e:
-            # keep original data; we’ll surface the better message below
             if not data.get("ok"):
                 data = {"ok": False, "message": f"{data.get('message','')} | GET failed: {e}"}
 
-    # --- 3) Normalize shapes (rows vs runs+effects) ---
-    rows = []
-    if "rows" in data and data["rows"]:
-        # Some versions return a flat list of rows
-        rows = data["rows"]
-    else:
-        runs = data.get("runs", [])
-        effects = data.get("effects", [])
-        if runs:
-            top_run_id = runs[0].get("run_id")
-            rows = [r for r in effects if r.get("run_id") == top_run_id]
-
     if not data.get("ok"):
-        # server-level error
         return data.get("message", "No relevant results found."), json.dumps(data, ensure_ascii=False, indent=2)
 
+    # 3) Normalize payload to rows for a single top run
+    runs = data.get("runs") or []
+    rows = data.get("rows") or []
     if not rows:
-        # ok==True but no matching rows
+        if not runs:
+            return "No relevant results found.", json.dumps(data, ensure_ascii=False, indent=2)
+        run = runs[0]
+        rid = run.get("run_id")
+        rows = [e for e in (data.get("effects") or []) if e.get("run_id") == rid]
+    else:
+        run = runs[0] if runs else {}
+
+    if not rows:
         return "No relevant results found.", json.dumps(data, ensure_ascii=False, indent=2)
 
-    # --- 4) Render Markdown table for the UI ---
+    # 4) Render compact table + CSV download link
+    product_out = run.get("product", product)
+    brand_out   = run.get("brand_type", "")
+    model_out   = run.get("model_name", "")
+    price_out   = run.get("price_value", "")
+    curr_out    = run.get("price_currency", "")
+    n_iter_out  = run.get("n_iterations", "")
+
     lines = [
-        "### Badge Effects (from database)\n",
-        "| Badge | β (effect size) | p (<0.05 significant) | Effect |",
-        "|---|---:|---:|:---:|",
+        "| product | brand | model | price | currency | n_iterations | badge | beta | p | sign |",
+        "|---|---|---|---:|:---:|---:|---|---:|---:|:---:|",
     ]
     for r in rows:
-        badge = r.get("badge", "")
-        beta  = r.get("beta", "")
-        pval  = r.get("p_value", r.get("p", ""))
-        sign  = r.get("sign", "0")
-        lines.append(f"| {badge} | {beta} | {pval} | {sign} |")
+        lines.append(
+            f"| {product_out} | {brand_out} | {model_out} | {price_out} | {curr_out} | {n_iter_out} | "
+            f"{r.get('badge','')} | {r.get('beta','')} | {r.get('p_value', r.get('p',''))} | {r.get('sign','0')} |"
+        )
+
+    # CSV download (served by PHP with format=csv)
+    dl_url = f"{base_url}?product={_u.quote(product)}&limit=50&format=csv"
+    lines.append(f"\n[⬇️ Download CSV]({dl_url})")
 
     return "\n".join(lines), json.dumps(data, ensure_ascii=False, indent=2)
 
@@ -493,5 +502,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
