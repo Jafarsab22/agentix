@@ -4,6 +4,7 @@ from datetime import datetime
 import gradio as gr
 from agent_runner import run_job_sync
 import traceback, logging
+from html import escape
 
 logging.basicConfig(level=logging.INFO)
 
@@ -254,41 +255,78 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
 @_catch_and_report
 def search_database(product_name: str):
-    """Return table for the main results area if found, else a polite 'not found'. Also write a CSV for download in Stats."""
-    if not product_name or not product_name.strip():
+    """Query Agentix DB for badge effects. Returns (markdown_table, pretty_json)."""
+    product = (product_name or "").strip()
+    if not product:
         return "Enter a product name to search.", "{}"
 
     url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
+
+    def _parse_payload(text, ct):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {"ok": False, "message": f"Non-JSON response (CT={ct}): {text[:160]}"}
+
+    # --- 1) Primary: POST JSON ---
     try:
-        resp = requests.post(url, json={"product": product_name.strip()}, timeout=12)
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        resp = requests.post(url, json={"product": product}, timeout=12)
+        ct = (resp.headers.get("content-type") or "").lower()
+        data = _parse_payload(resp.text, ct) if "application/json" in ct else {"ok": False, "message": f"CT={ct} body={resp.text[:160]}"}
     except Exception as e:
-        return f"Could not reach the database API ({e}).", "{}"
+        data = {"ok": False, "message": f"POST failed: {e}"}
+
+    # --- 2) Fallbacks if needed ---
+    need_fallback = (not data.get("ok")) or (len(data.get("runs", [])) == 0 and len(data.get("rows", [])) == 0)
+    if need_fallback:
+        try:
+            # Fallback GET (works in your browser)
+            resp2 = requests.get(url, params={"product": product, "limit": 50}, timeout=12)
+            ct2 = (resp2.headers.get("content-type") or "").lower()
+            data2 = _parse_payload(resp2.text, ct2) if "application/json" in ct2 else {"ok": False, "message": f"CT={ct2} body={resp2.text[:160]}"}
+            # Prefer the successful payload
+            if data2.get("ok") and (len(data2.get("runs", [])) or len(data2.get("rows", []))):
+                data = data2
+        except Exception as e:
+            # keep original data; we’ll surface the better message below
+            if not data.get("ok"):
+                data = {"ok": False, "message": f"{data.get('message','')} | GET failed: {e}"}
+
+    # --- 3) Normalize shapes (rows vs runs+effects) ---
+    rows = []
+    if "rows" in data and data["rows"]:
+        # Some versions return a flat list of rows
+        rows = data["rows"]
+    else:
+        runs = data.get("runs", [])
+        effects = data.get("effects", [])
+        if runs:
+            top_run_id = runs[0].get("run_id")
+            rows = [r for r in effects if r.get("run_id") == top_run_id]
 
     if not data.get("ok"):
+        # server-level error
         return data.get("message", "No relevant results found."), json.dumps(data, ensure_ascii=False, indent=2)
 
-    runs = data.get("runs", [])
-    effects = data.get("effects", [])
-    if not runs:
+    if not rows:
+        # ok==True but no matching rows
         return "No relevant results found.", json.dumps(data, ensure_ascii=False, indent=2)
 
-    top = runs[0]
+    # --- 4) Render Markdown table for the UI ---
     lines = [
         "### Badge Effects (from database)\n",
-        "| Badge | β (effect size) | p (<0.05 is significant) | Effect (0=no effect; +=positive effect; -=negative effect) |",
+        "| Badge | β (effect size) | p (<0.05 significant) | Effect |",
         "|---|---:|---:|:---:|",
     ]
-    for r in effects:
-        if r.get("run_id") == top.get("run_id"):
-            b = r.get("badge", ""); beta = r.get("beta", ""); p = r.get("p_value", ""); s = r.get("sign", "0")
-            lines.append(f"| {b} | {beta} | {p} | {s} |")
+    for r in rows:
+        badge = r.get("badge", "")
+        beta  = r.get("beta", "")
+        pval  = r.get("p_value", r.get("p", ""))
+        sign  = r.get("sign", "0")
+        lines.append(f"| {badge} | {beta} | {pval} | {sign} |")
 
-    if len(lines) <= 3:
-        return "No relevant results found.", json.dumps(data, ensure_ascii=False, indent=2)
     return "\n".join(lines), json.dumps(data, ensure_ascii=False, indent=2)
 
-# Part 2 continues… (UI, admin helpers, stats)
 # --- Admin helpers --- (continued from Part 1)
 
 @_catch_and_report
@@ -455,4 +493,5 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
