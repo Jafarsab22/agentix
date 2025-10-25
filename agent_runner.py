@@ -548,7 +548,6 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
 
 # ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
-    # require one vendor API key for the chosen model
     ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
     if not os.getenv(env_key, ""):
@@ -559,10 +558,8 @@ def run_job_sync(payload: Dict) -> Dict:
     n = int(payload.get("n_iterations", 100) or 100)
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
-    badges   = list(payload.get("badges") or [])
-    # IMPORTANT (v1.7): keep the badges list as-is; storefront handles the two-stage design,
-    # interpreting the single toggle "All-in v. partitioned pricing" to enable 50/50 frame.
-    render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML via storefront
+    badges   = [str(b) for b in (payload.get("badges") or [])]  # pass-through; storefront handles frame logic
+    render_tpl = str(payload.get("render_url") or "")
     catalog_seed = int(payload.get("catalog_seed", 777))
 
     try:
@@ -570,6 +567,9 @@ def run_job_sync(payload: Dict) -> Dict:
     except Exception:
         price = 0.0
     currency = str(payload.get("currency") or "£")
+
+    # Optional: quick visibility to ensure the pricing toggle is present
+    print(f"[runner] badges from UI: {badges}", flush=True)
 
     driver = _new_driver()
     try:
@@ -580,7 +580,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 ui_label=ui_label,
                 render_url_tpl=render_tpl,
                 set_index=i,
-                badges=badges,
+                badges=badges,                 # <- unchanged; storefront will map the toggle to both frames
                 catalog_seed=catalog_seed,
                 price=price,
                 currency=currency,
@@ -667,3 +667,4 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
