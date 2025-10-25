@@ -299,7 +299,7 @@ body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; ma
 </div>
 </body></html>"""
 
-    return html.format(grid=grid, gt=gt_json)
+    return html.replace("{grid}", grid).replace("{gt}", gt_json)
 
 
 # Convenience wrappers used by the runner
