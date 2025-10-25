@@ -76,12 +76,8 @@ def _ceil_to_8(n: int) -> int:
     return int(((int(n) + 7) // 8) * 8)
 
 def _auto_iterations_from_badges(badges: list[str]) -> int:
-    b = 0
-    for badge in badges or []:
-        if str(badge).strip() in SEPARATE_BADGES:
-            b += 1
-    base = max(100, 30 * b)
-    return _ceil_to_8(base)
+    b = len(badges or [])
+    return _ceil_to_8(max(100, 30 * b))
 
 def _validate_inputs(product_name, price, currency, n_iterations):
     if not product_name or not product_name.strip():
@@ -581,3 +577,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
