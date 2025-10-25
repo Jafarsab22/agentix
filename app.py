@@ -1,4 +1,4 @@
-# app.py — Part 1/2
+# app.py 
 import json, uuid, os, time, pathlib, csv, requests
 from datetime import datetime
 import gradio as gr
@@ -56,6 +56,14 @@ BADGE_CHOICES = [
 ]
 CURRENCY_CHOICES = ["£", "$", "EUR"]
 
+# Subset of badges estimated separately in the logit (used to compute B)
+SEPARATE_BADGES = {
+    "All-in pricing",   # “All-in”
+    "Assurance",
+    "Strike-through",   # “Strike”
+    "Timer",
+}
+
 # Admin secret (set in platform env)
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 
@@ -63,6 +71,17 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 RENDER_URL_TPL = os.environ.get("RENDER_URL_TPL", "")  # empty → inline HTML in agent_runner
 
 # ---------- helpers ----------
+
+def _ceil_to_8(n: int) -> int:
+    return int(((int(n) + 7) // 8) * 8)
+
+def _auto_iterations_from_badges(badges: list[str]) -> int:
+    b = 0
+    for badge in badges or []:
+        if str(badge).strip() in SEPARATE_BADGES:
+            b += 1
+    base = max(100, 30 * b)
+    return _ceil_to_8(base)
 
 def _validate_inputs(product_name, price, currency, n_iterations):
     if not product_name or not product_name.strip():
@@ -433,6 +452,36 @@ def preview_example(product_name: str, brand_name: str, model_name: str, badges:
     return img_html
 
 
+# ---------- UI logic for Automatic / Manual iterations ----------
+
+@_catch_and_report
+def _on_badges_change(badges: list[str], auto_checked: bool, manual_checked: bool):
+    if auto_checked and not manual_checked:
+        n = _auto_iterations_from_badges(badges)
+        # Disabled (non-interactive) shows greyed text, signalling system-set value
+        return gr.update(value=n, interactive=False)
+    # Manual mode: keep field editable; do not override user value
+    return gr.update(interactive=True)
+
+@_catch_and_report
+def _toggle_auto(auto_checked: bool, badges: list[str]):
+    if auto_checked:
+        # Enforce exclusivity: turning Auto on turns Manual off and disables input
+        n = _auto_iterations_from_badges(badges)
+        return gr.update(value=False), gr.update(value=n, interactive=False)
+    # If Auto is unticked, fall back to Manual enabled
+    return gr.update(value=True), gr.update(value=100, interactive=True)
+
+@_catch_and_report
+def _toggle_manual(manual_checked: bool, badges: list[str]):
+    if manual_checked:
+        # Enforce exclusivity: turning Manual on turns Auto off and enables input (default 100)
+        return gr.update(value=False), gr.update(value=100, interactive=True)
+    # If Manual is unticked, return to Auto
+    n = _auto_iterations_from_badges(badges)
+    return gr.update(value=True), gr.update(value=n, interactive=False)
+
+
 # ---------- UI ----------
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     gr.Markdown(
@@ -447,7 +496,16 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     with gr.Row():
         price = gr.Number(label="Price", value=0.0, precision=2)
         currency = gr.Dropdown(choices=CURRENCY_CHOICES, value=CURRENCY_CHOICES[0], label="Currency")
-        n_iterations = gr.Number(label="Iterations", value=50, precision=0)
+
+    # Iterations controls: two tick boxes above the iterations field
+    with gr.Row():
+        auto_iter = gr.Checkbox(label="Automatic", value=True, scale=1)
+        manual_iter = gr.Checkbox(label="Manual", value=False, scale=1)
+
+    # Default auto value based on zero selected badges: ceil_to_8(max(100, 0)) = 104
+    default_auto_iters = _auto_iterations_from_badges([])
+    n_iterations = gr.Number(label="Iterations", value=default_auto_iters, precision=0, interactive=False)
+
     badges = gr.CheckboxGroup(choices=BADGE_CHOICES, label="Select badges (multi-select)")
 
     # Search-first workflow
@@ -479,6 +537,23 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[results_md, results_json],
     )
 
+    # --- Interactions for Automatic / Manual iterations and badges changes ---
+    auto_iter.change(
+        fn=_toggle_auto,
+        inputs=[auto_iter, badges],
+        outputs=[manual_iter, n_iterations],
+    )
+    manual_iter.change(
+        fn=_toggle_manual,
+        inputs=[manual_iter, badges],
+        outputs=[auto_iter, n_iterations],
+    )
+    badges.change(
+        fn=_on_badges_change,
+        inputs=[badges, auto_iter, manual_iter],
+        outputs=[n_iterations],
+    )
+
     with gr.Accordion("Admin preview (storefront)", open=False):
         admin_key_in = gr.Textbox(label="Admin key", type="password", placeholder="Enter ADMIN_KEY", scale=1)
         refresh = gr.Button("List storefronts")
@@ -506,7 +581,3 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
-
-
-
-
