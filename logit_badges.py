@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Conditional-logit with page (case) & product fixed effects + position controls.
+Conditional-logit with case (screen) & product fixed effects + position controls.
 Inputs: path to results/df_choice.csv and the list of badges selected in the UI.
 Outputs: DataFrame with columns: badge, beta, p, sign; also writes results/table_badges.csv.
 sign: '+' if p<.05 & beta>0; '−' if p<.05 & beta<0; '0' otherwise.
 
 Robustness:
 - If no badges are selected, missing columns, or no complete screens → returns an empty,
-  correctly-shaped DataFrame without raising.
-- If statsmodels/patsy/scipy are available, uses MLE; otherwise returns an empty table.
+  correctly shaped DataFrame without raising.
+- Uses statsmodels Logit with patsy design matrices; falls back to ridge-IRLS if needed.
 """
 from __future__ import annotations
 import pathlib
@@ -27,10 +27,15 @@ except Exception:
 
 RESULTS_DIR = pathlib.Path("results")
 
-# Map UI badge labels -> df_choice column names
-_BADGE_MAP = {
-    "All-in pricing": "frame",           # 1 = all-in (vs 0 = partitioned)
-    "Partitioned pricing": None,         # complement of frame — exclude to avoid collinearity
+# Map UI badge labels -> df_choice column names (ground-truth)
+# Includes backward-compat labels and the new single-toggle pricing comparison.
+_BADGE_TO_COL = {
+    # Pricing frame (new single toggle)
+    "All-in v. partitioned pricing": "frame",   # 1 = all-in (vs 0 = partitioned)
+    # Back-compat UI labels (both map to same binary; do NOT include both at once)
+    "All-in pricing": "frame",
+    "Partitioned pricing": "frame",  # complement of frame; same column but reversed coding if used alone
+    # Non-frame badges
     "Assurance": "assurance",
     "Scarcity tag": "scarcity",
     "Strike-through": "strike",
@@ -38,6 +43,20 @@ _BADGE_MAP = {
     "social": "social_proof",
     "voucher": "voucher",
     "bundle": "bundle",
+}
+
+# Human-readable labels for output table/CSV
+_UI_LABEL_TO_REPORT = {
+    "All-in v. partitioned pricing": "Pricing frame (β for all-in vs partitioned)",
+    "All-in pricing":                "Pricing frame (β for all-in vs partitioned)",
+    "Partitioned pricing":           "Pricing frame (β for all-in vs partitioned)",
+    "Assurance":                     "Assurance",
+    "Scarcity tag":                  "Scarcity tag",
+    "Strike-through":                "Strike-through",
+    "Timer":                         "Timer",
+    "social":                        "Social proof",
+    "voucher":                       "Voucher",
+    "bundle":                        "Bundle",
 }
 
 _EMPTY_SCHEMA = ["badge", "beta", "p", "sign"]
@@ -111,7 +130,7 @@ def _fit_with_fallback(y: pd.DataFrame, X: pd.DataFrame):
 def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.DataFrame:
     """
     Returns a DataFrame with columns: badge, beta, p, sign.
-    Writes results/table_badges.csv if non-empty.
+    Writes results/table_badges.csv if non-empty (runner handles file I/O).
     """
     if not _HAVE_SM:
         return _empty_table()
@@ -135,53 +154,71 @@ def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.Da
     if df.empty:
         return _empty_table()
 
-    # Map UI badges to dataframe columns
-    cols = []
-    for b in (selected_badges or []):
-        k = _BADGE_MAP.get(b)
-        if k and k in df.columns:
-            cols.append(k)
+    # ---------- build variable list ----------
+    selected_badges = list(selected_badges or [])
 
-    # Optional covariates (ACES-style): ln(price) if available
+    # Map UI labels → dataframe columns; deduplicate and keep only present columns
+    mapped_cols = []
+    col_to_ui = {}  # for reporting back under the requested label (esp. frame)
+    for ui_lab in selected_badges:
+        col = _BADGE_TO_COL.get(ui_lab)
+        if not col:
+            continue
+        if col in df.columns and col not in mapped_cols:
+            mapped_cols.append(col)
+            col_to_ui[col] = ui_lab
+
+    # If user accidentally included both legacy "All-in pricing" and "Partitioned pricing",
+    # keep only one appearance (both map to 'frame' anyway).
+    # With the new single toggle, only "All-in v. partitioned pricing" will be present.
+
+    # Optional covariates (price)
     covars = []
     if "ln_price" in df.columns and df["ln_price"].notna().any():
         covars.append("ln_price")
 
     # Nothing to estimate
-    if not cols and not covars:
+    if not mapped_cols and not covars:
         return _empty_table()
 
-    # Build RHS: position controls + selected badges + covariates + FE
+    # Base position controls
     base_cols = ["row_top", "col1", "col2", "col3"]
-    for c in base_cols:
-        if c not in df.columns:
-            return _empty_table()
+    if not set(base_cols).issubset(df.columns):
+        return _empty_table()
 
-    rhs_terms = base_cols + cols + covars + ["C(case_id)", "C(title)"]
+    # Fixed effects: case (screen) + product title
+    rhs_terms = base_cols + mapped_cols + covars + ["C(case_id)", "C(title)"]
     formula = "chosen ~ -1 + " + " + ".join(rhs_terms)
 
     try:
         y, X = pt.dmatrices(formula, df, return_type="dataframe")
 
-        # Drop zero-variance columns (defensive against perfect separation/collinearity)
-        nunique = (X != 0).sum()
-        keep = [c for c in X.columns if X[c].std(ddof=0) > 0 and nunique.get(c, 1) > 0]
+        # Drop zero-variance columns (defensive)
+        keep = [c for c in X.columns if X[c].std(ddof=0) > 0]
         X = X[keep]
         if X.shape[1] == 0:
             return _empty_table()
 
         params, pvals = _fit_with_fallback(y, X)
 
-        # Keep only rows for the reported levers (badges) in the output table
-        out = []
-        for ui_label in (selected_badges or []):
-            col = _BADGE_MAP.get(ui_label)
-            if col and col in X.columns and col in params.index:
+        # Prepare output rows ONLY for the levers (mapped_cols) that survived in X
+        out_rows = []
+        for col in mapped_cols:
+            if col in X.columns and col in params.index:
                 beta = float(params[col])
-                p = float(pvals[col])
-                out.append({"badge": ui_label, "beta": beta, "p": p, "sign": _sign(beta, p)})
-        return pd.DataFrame(out, columns=_EMPTY_SCHEMA) if out else _empty_table()
+                pval = float(pvals[col])
+                ui_lab = col_to_ui.get(col, col)
+
+                # Use reporting label (pretty name) for pricing frame row
+                label = _UI_LABEL_TO_REPORT.get(ui_lab, ui_lab)
+                out_rows.append({
+                    "badge": label,
+                    "beta": beta,
+                    "p": pval,
+                    "sign": _sign(beta, pval),
+                })
+
+        return pd.DataFrame(out_rows, columns=_EMPTY_SCHEMA) if out_rows else _empty_table()
+
     except Exception:
         return _empty_table()
-
-
