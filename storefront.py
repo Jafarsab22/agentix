@@ -1,52 +1,62 @@
 # -*- coding: utf-8 -*-
 """
-Agentix storefront (Railway) — v1.6
-Date: 2025-10-23
-
-Assumptions & design rationale (for methods and code review)
-1) Balanced lever exposure per screen (internal validity):
-   - Frame (all-in vs partitioned) and Assurance use orthogonal 4/8 masks with a 4-screen rotation.
-   - The chosen dark cue (exactly one of {scarcity, strike, timer, none} per screen) uses the same balanced mask.
-   - Additional independent cues (e.g., social, voucher, bundle) also use the balanced masks when enabled.
-
-2) Seed‑randomised, blocked rotation (reproducibility + randomness):
-   - Within every block of 4 consecutive screens, a seed-determined permutation of the dark types
-     ensures each type appears exactly once per block while the order is randomised by seed.
-
-3) Price variation anchored on user input (external validity + identification):
-   - The user enters an anchor price P₀. We generate eight within-screen price levels
-     by multiplying P₀ by log‑symmetric factors spanning approximately ±30% around P₀.
-   - Assignment uses an 8×8 Latin-square schedule across 8‑screen blocks: each card position receives
-     each price level exactly once per block. This keeps ln(price) orthogonal to position and to the other levers.
-   - We include ln(price) in the ground truth so the conditional logit can identify price sensitivity
-     and purge badge effects of any residual correlation.
-   - For partitioned pricing, base+fees+shipping+taxes always sums exactly to the varied total Pᵢ to keep
-     the frame a pure presentation manipulation.
-
-4) Rounding & currency:
-   - Prices are rounded deterministically to the smallest currency unit (e.g., £0.01) using the screen seed.
-
-5) Reproducibility keys:
-   - All randomisation is keyed by: catalog_seed, brand, category, and screen index (set_id),
-     with clear helper functions below. Given the same inputs, the storefront is exactly reproducible.
-
-This module is intended to be imported by agent_runner.py; the public API is render_screen(...),
-plus small helpers to build/save payloads.
+Agentix storefront (Railway) — v1.7
+Date: 2025-10-25
+# ---------------------------------------------------------------------------
+# Reviewer notes & modelling assumptions (paste near the top of storefront.py)
+#
+# Badge assignment is per-card and uniform over the set of user-selected badges.
+# Exactly one badge is drawn for each card from that set with equal probability
+# (pricing frames count as badges too). If no badge is selected we default to
+# an all-in pricing frame so that the screen remains coherent. With this design,
+# badges other than the pricing frame are purely presentational and do not alter
+# the numeric transaction price; they only set the ground-truth flags consumed by
+# the downstream logit.
+#
+# Pricing uses the UI anchor as the geometric center and applies eight
+# multiplicative levels that are symmetric in log-space, exp(Δ) where
+# Δ ∈ {−0.3567, −0.2231, −0.1053, −0.0513, 0.0513, 0.1053, 0.2231, 0.3567},
+# yielding roughly ×0.70 … ×1.43 around the anchor. Levels are scheduled across
+# the 8 cards via a fixed 8×8 Latin square so that in each block every relative
+# price appears exactly once in each card position. This removes position–price
+# confounds. All randomness (badge draw and partitioning rates) is deterministic
+# and reproducible, seeded by (catalog_seed, brand, category, set_id, card_idx).
+#
+# Partitioned pricing is a framing only. When the partitioned frame is drawn,
+# the total card price is decomposed into base+fees+shipping+tax using rates
+# sampled once per screen from the ranges tax≈9–11%, fees≈5–7%, shipping≈3–5%.
+# Components are rounded to two decimals and any rounding residual is absorbed
+# into the base component so that base+fees+ship+tax equals the displayed total.
+# All-in pricing shows only the total. Currency formatting is symbol-first with
+# two decimals and no locale-specific separators beyond the thousands comma.
+#
+# Visual discount/urgency/social elements do not change the numeric price.
+# Strike-through displays a notional reference price set to 1.20× the card’s
+# total. Voucher shows “10% OFF · code SAVE10” as a label only. Bundle displays
+# “Buy 2, save 10%” as a label only. Scarcity prints “Only N left” with N
+# derived deterministically from the price and card index; the timer text is a
+# seeded pseudo-countdown; social proof is a fixed “2k bought this month”.
+# These elements exist to isolate framing effects without contaminating price.
+#
+# Ground-truth output includes binary indicators for each visual (assurance,
+# scarcity, strike, timer, social_proof, voucher, bundle) and a legacy “frame”
+# column where 1=all-in and 0=partitioned. For modelling, ln_price is the log of
+# the card’s displayed total (>=1e-8 guard). Adding a new badge requires three
+# coordinated edits: include it in the enabled-badge mapping, render its visual,
+# and emit its ground-truth flag.
+# ---------------------------------------------------------------------------
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 import json, math, pathlib, random
 
 # ------------------------------
-# Constants & basic helpers
+# Constants & helpers
 # ------------------------------
-_DARK_TYPES = ["scarcity","strike","timer","none"]
-
-# Log-symmetric 8-level price design spanning about ±30% around the anchor.
-# Levels are set by equally spaced steps in log-space for approximate symmetry.
 _LOG_DELTAS = (-0.3567, -0.2231, -0.1053, -0.0513, 0.0513, 0.1053, 0.2231, 0.3567)
-_PRICE_MULTIPLIERS = tuple(math.exp(x) for x in _LOG_DELTAS)  # ~ [0.70,0.80,0.90,0.95,1.05,1.11,1.25,1.43]
+_PRICE_MULTIPLIERS = tuple(math.exp(x) for x in _LOG_DELTAS)  # ~ [0.70 ... 1.43]
 
 @dataclass(frozen=True)
 class Seeds:
@@ -61,160 +71,48 @@ class Seeds:
             mix ^= abs(hash(c)) & 0x7FFFFFFF
         return random.Random(mix)
 
-# ------------------------------
-# Balanced 4/8 masks with 4-screen rotation
-# ------------------------------
-_PATTERNS = [
-    [1,1,1,1,0,0,0,0],
-    [1,1,0,0,1,1,0,0],
-    [1,0,1,0,1,0,1,0],
-    [1,0,0,1,0,1,0,1],
-]
-
-
-def _layout_index(set_id: str) -> int:
-    # 0..3 depending on screen number; you likely already have something like this
-    try:
-        n = int(str(set_id).strip().lstrip("S"))
-    except Exception:
-        n = 1
-    return (n - 1) % 4
-
-# GUARANTEED distinct offsets for the main levers
-_LEVER_OFFSET = {
-    "frame": 0,
-    "assurance": 1,
-    "dark": 2,
-    "social": 3,
-    "voucher": 1,   # secondary group; can reuse if not estimated together
-    "bundle": 2,
-}
-
-def _balanced_mask(set_id: str) -> list[int]:
-    return _PATTERNS[_layout_index(set_id)][:]
-
-# ------------------------------
-# Seed-randomised, blocked rotation for dark types (4-screen blocks)
-# ------------------------------
-
-def _dark_type_for_screen(set_id: str, seeds: Seeds) -> str:
-    idx = _screen_index(set_id)
-    block, within = (idx - 1) // 4, (idx - 1) % 4
-    rng = seeds.rng("dark", block)
-    order = list(_DARK_TYPES)
-    rng.shuffle(order)
-    return order[within]
-
-# ------------------------------
-# Latin-square schedule for price levels across 8-screen blocks
-# ------------------------------
-
 def _screen_index(set_id: str) -> int:
     try:
         return int("".join(ch for ch in set_id if ch.isdigit()))
     except Exception:
         return 1
 
-# Precompute a canonical 8×8 Latin square L where L[r][c] = (c + r) % 8
+# 8×8 Latin square L where L[r][c] = (c + r) % 8
 _LATIN_8 = [[(c + r) % 8 for c in range(8)] for r in range(8)]
 
-
 def _price_levels_for_block(anchor: float, seeds: Seeds, block_id: int) -> List[float]:
-    """Return the 8 price levels for this block as a seed-shuffled mapping of the 8 multipliers."""
     multipliers = list(_PRICE_MULTIPLIERS)
     rng = seeds.rng("price-levels", block_id)
     rng.shuffle(multipliers)
     return [round(anchor * m, 2) for m in multipliers]
 
-
 def _price_for_card(anchor: float, set_id: str, card_index: int, seeds: Seeds) -> float:
-    """
-    Latin-square assignment across 8-screen blocks:
-    - Let b = floor((idx-1)/8) and t = (idx-1) % 8 be the block and the screen-within-block indices.
-    - Let L be the fixed 8×8 Latin square. Card position p∈{0..7} on screen t takes the level L[t][p].
-    - Map that level through a seed-shuffled list of the 8 log-symmetric multipliers for block b.
-    """
     idx = _screen_index(set_id)
     block, within = (idx - 1) // 8, (idx - 1) % 8
     price_levels = _price_levels_for_block(anchor, seeds, block)
     level_index = _LATIN_8[within][card_index]
     return price_levels[level_index]
 
-# ------------------------------
-# Currency helpers
-# ------------------------------
-
 def _format_currency(x: float, currency: str) -> str:
     return f"{currency}{x:,.2f}"
 
-
 def _partition_total_into_components(total: float, seeds: Seeds, set_id: str) -> tuple[float, float, float, float]:
-    """
-    Partition total into base + fees + shipping + tax such that the sum equals total exactly.
-    Ratios are deterministic per screen, varied slightly by seed; tax is anchored around 10%.
-    """
     rng = seeds.rng("partition", set_id)
     tax_rate = rng.uniform(0.09, 0.11)
     fees_rate = rng.uniform(0.05, 0.07)
     ship_rate = rng.uniform(0.03, 0.05)
-    # Compute base as residual to hit exact total
     base = total / (1 + tax_rate + fees_rate + ship_rate)
     fees = base * fees_rate
     ship = base * ship_rate
     tax = base * tax_rate
-    # Round to cents and fix residual on base
     base_r = round(base, 2); fees_r = round(fees, 2); ship_r = round(ship, 2); tax_r = round(tax, 2)
     residual = round(total - (base_r + fees_r + ship_r + tax_r), 2)
     base_r = round(base_r + residual, 2)
     return base_r, fees_r, ship_r, tax_r
 
 # ------------------------------
-# Ground-truth row builder for each card
+# Public API
 # ------------------------------
-
-def _gt_row(i: int, set_id: str, masks: dict, dark_type: str, price_total: float) -> dict:
-    row = 0 if i < 4 else 1
-    col = i % 4
-    return {
-        "title": f"Card {i+1}",
-        "row": row, "col": col,
-        "row_top": 1 if row == 0 else 0,
-        "col1": 1 if col == 0 else 0, "col2": 1 if col == 1 else 0, "col3": 1 if col == 2 else 0,
-        "frame": masks["frame"][i],
-        "assurance": masks["assurance"][i],
-        "scarcity": 1 if (dark_type == "scarcity" and masks["dark"][i]) else 0,
-        "strike":   1 if (dark_type == "strike"   and masks["dark"][i]) else 0,
-        "timer":    1 if (dark_type == "timer"    and masks["dark"][i]) else 0,
-        "price": round(price_total, 2),
-        "ln_price": math.log(max(price_total, 1e-8)),
-    }
-
-# ------------------------------
-# Public API: render_screen + helpers
-# ------------------------------
-
-_LEVER_KEYS = ["frame","assurance","social","voucher","bundle","dark"]
-
-def _lever_mask(set_id: str, lever_key: str) -> list[int]:
-    """
-    Return a balanced 4/8 mask for this lever that is orthogonal to others.
-    We deterministically rotate the base layout by a lever-specific offset.
-    """
-    li  = _layout_index(set_id)              # 0..3 rotation by screen index
-    off = _LEVER_OFFSET.get(lever_key, 0)    # guaranteed mapping
-    return _PATTERNS[(li + off) % 4][:]
-
-_LEVER_KEYS = ["frame","assurance","social","voucher","bundle","dark"]
-
-def _lever_mask(set_id: str, lever_key: str) -> list[int]:
-    """
-    Return a balanced 4/8 mask for this lever that is orthogonal to others.
-    We rotate the base pattern by a lever-specific offset, deterministically.
-    """
-    li = _layout_index(set_id)      # 0..3 rotation by screen
-    off = abs(hash(lever_key)) % 4  # lever-specific offset 0..3
-    pat_idx = (li + off) % 4
-    return _PATTERNS[pat_idx][:]
 
 def render_screen(
     category: str,
@@ -226,118 +124,42 @@ def render_screen(
     brand: str = "",
 ) -> str:
     """
-    Storefront v1.6 — balanced masks, 1 dark type / screen, Latin-square prices.
-    Outputs a hidden #groundtruth with row/col, levers, price, ln_price per card.
+    Storefront v1.7 — Equal per-card chance across ALL selected badges.
+    Exactly one badge is rendered per card, drawn uniformly from the
+    selected badge set (deterministic given seeds). Prices still follow
+    the Latin-square schedule anchored on the UI price.
     """
 
-    import json, math, random, hashlib
-
-    # ---------------- helpers ----------------
-    def _layout_index(sid: str) -> int:
-        # 0..3 repeating per screen
-        try:
-            n = int(str(sid).strip().lstrip("S"))
-        except Exception:
-            n = 1
-        return (n - 1) % 4
-
-    # Four balanced 4/8 patterns (any 4 orthogonal-ish patterns are fine)
-    _PATTERNS = [
-        [1,1,1,1,0,0,0,0],
-        [1,1,0,0,1,1,0,0],
-        [1,0,1,0,1,0,1,0],
-        [1,0,0,1,0,1,0,1],
-    ]
-
-    # Guaranteed distinct offsets for the main levers
-    _LEVER_OFFSET = {
-        "frame": 0,
-        "assurance": 1,
-        "dark": 2,
-        "social": 3,
-        "voucher": 1,   # OK to reuse if those levers aren’t co-estimated
-        "bundle": 2,
-    }
-
-    def _lever_mask(sid: str, lever_key: str) -> list[int]:
-        li  = _layout_index(sid)               # screen-based rotation 0..3
-        off = _LEVER_OFFSET.get(lever_key, 0)  # lever-specific offset
-        return _PATTERNS[(li + off) % 4][:]
-
-    def _dark_type_for_screen(sid: str) -> str:
-        # Blocked rotation across 4 screens: scarcity → strike → timer → none (seeded order)
-        base_order = ["scarcity", "strike", "timer", "none"]
-        # deterministic shuffle by catalog_seed
-        rnd = random.Random((int(catalog_seed) & 0x7fffffff) ^ 0x9e3779b9)
-        order = base_order[:]
-        rnd.shuffle(order)
-        return order[_layout_index(sid)]
-
-    def _format_currency(x: float, cur: str) -> str:
-        try:
-            return f"{cur}{x:,.2f}"
-        except Exception:
-            return f"{cur}{x:.2f}"
-
-    def _partition_total_into_components(total: float) -> tuple[float,float,float,float]:
-        # deterministic, tiny variation that sums exactly to total
-        fees = round(total * 0.05, 2)
-        ship = round(total * 0.03, 2)
-        tax  = round(total * 0.02, 2)
-        base = round(total - (fees + ship + tax), 2)
-        # repair rounding if needed
-        delta = round(total - (base + fees + ship + tax), 2)
-        base = round(base + delta, 2)
-        return base, fees, ship, tax
-
-    def _price_levels(p0: float) -> list[float]:
-        # 8 log-symmetric factors around p0, ≈±30%
-        a = math.log(1.30)
-        factors = [math.exp(t) for t in [ -a, -2*a/3, -a/3, -a/6, a/6, a/3,  2*a/3,  a ]]
-        return [round(max(p0 * f, 0.01), 2) for f in factors]
-
-    def _latin_assign(levels: list[float], sid: str) -> list[float]:
-        # 8×8 Latin-ish: rotate by screen index across blocks of 8 screens
-        try:
-            n = int(str(sid).strip().lstrip("S"))
-        except Exception:
-            n = 1
-        k = (n - 1) % 8
-        idx = list(range(8))
-        # rotate by k
-        return [levels[(i + k) % 8] for i in idx]
-
-    # ---------------- derive UI selections ----------------
+    # Normalize the user's selected badges (lower-cased keys)
     sel = { (b or "").strip().lower(): True for b in (badges or []) }
 
-    # Lever masks (distinct patterns by construction)
-    masks = {
-        "frame":     _lever_mask(set_id, "frame")     if sel.get("all-in pricing", False) else [0]*8,
-        "assurance": _lever_mask(set_id, "assurance") if sel.get("assurance", False) else [0]*8,
-        "dark":      _lever_mask(set_id, "dark"),   # applied only to whichever dark type is active
-        "social":    _lever_mask(set_id, "social")    if sel.get("social", False) else [0]*8,
-        "voucher":   _lever_mask(set_id, "voucher")   if sel.get("voucher", False) else [0]*8,
-        "bundle":    _lever_mask(set_id, "bundle")    if sel.get("bundle", False) else [0]*8,
-    }
-    # Guardrail: frame and assurance must not be identical
-    if masks["frame"] == masks["assurance"] and any(masks["frame"]):
-        raise RuntimeError("Design error: frame and assurance masks are identical; adjust _LEVER_OFFSET.")
+    # Map UI labels to internal badge keys
+    # We keep both frame options as badges so they compete fairly.
+    enabled: list[str] = []
+    if sel.get("all-in pricing"):       enabled.append("frame_allin")
+    if sel.get("partitioned pricing"):  enabled.append("frame_partitioned")
+    if sel.get("assurance"):            enabled.append("assurance")
+    if sel.get("scarcity tag"):         enabled.append("scarcity")
+    if sel.get("strike-through"):       enabled.append("strike")
+    if sel.get("timer"):                enabled.append("timer")
+    if sel.get("social"):               enabled.append("social")
+    if sel.get("voucher"):              enabled.append("voucher")
+    if sel.get("bundle"):               enabled.append("bundle")
 
-    # Choose exactly one dark mechanism for this screen (blocked + seeded)
-    dark_candidates = []
-    if sel.get("scarcity tag", False):   dark_candidates.append("scarcity")
-    if sel.get("strike-through", False): dark_candidates.append("strike")
-    if sel.get("timer", False):          dark_candidates.append("timer")
-    dark_type = _dark_type_for_screen(set_id) if dark_candidates else "none"
-    if dark_type not in dark_candidates and dark_candidates:
-        dark_type = sorted(dark_candidates)[0]
+    seeds = Seeds(catalog_seed=int(catalog_seed), brand=str(brand or ""), category=str(category or "product"))
 
-    # Prices: 8 levels via Latin schedule anchored on user price
-    base_price = float(price_anchor or 0.0)
-    levels = _price_levels(base_price)
-    prices = _latin_assign(levels, set_id)
+    # If nothing is selected, we still show all-in pricing as a harmless default
+    if not enabled:
+        enabled = ["frame_allin"]
 
-    # ---------------- build cards + ground truth ----------------
+    # Deterministic per-card uniform draw over enabled badges
+    def draw_badge_for_card(i: int) -> str:
+        rng = seeds.rng("card-badge", set_id, i)
+        return enabled[rng.randrange(len(enabled))]
+
+    # Prices: 8 log-symmetric levels via Latin schedule
+    p0 = float(price_anchor or 0.0)
+
     cards_html: list[str] = []
     gt_rows: list[dict] = []
 
@@ -346,41 +168,80 @@ def render_screen(
 
     for i in range(8):
         r, c = (0 if i < 4 else 1), (i % 4)
-        f = masks["frame"][i]
-        a = masks["assurance"][i]
-        d = masks["dark"][i]
-        price_total = prices[i]
+        price_total = _price_for_card(p0, set_id, i, seeds)
 
-        # visual price block
-        if f == 1:  # all-in
-            price_block = f"<div class='price'>{_format_currency(price_total, currency)}</div>"
-            part_block = ""
-        else:       # partitioned
-            base, fees, ship, tax = _partition_total_into_components(price_total)
+        # Initialize flags
+        frame_allin = 0
+        frame_partitioned = 0
+        assurance = 0
+        scarcity = strike = timer = 0
+        social_proof = voucher = bundle = 0
+
+        chosen = draw_badge_for_card(i)
+
+        # Render blocks based on the chosen badge
+        assur_block = ""
+        dark_block = ""
+        social_block = voucher_block = bundle_block = ""
+
+        # Frame (also affects how price is displayed)
+        if chosen == "frame_allin":
+            frame_allin = 1
+        elif chosen == "frame_partitioned":
+            frame_partitioned = 1
+        # Assurance
+        elif chosen == "assurance":
+            assurance = 1
+        # Dark variants
+        elif chosen == "scarcity":
+            scarcity = 1
+        elif chosen == "strike":
+            strike = 1
+        elif chosen == "timer":
+            timer = 1
+        # Social family
+        elif chosen == "social":
+            social_proof = 1
+        elif chosen == "voucher":
+            voucher = 1
+        elif chosen == "bundle":
+            bundle = 1
+
+        # Visual rendering for price (depends on frame badge if drawn)
+        if frame_partitioned:
+            base, fees, ship, tax = _partition_total_into_components(price_total, seeds, set_id)
             price_block = f"<div class='price'>{_format_currency(base, currency)} + charges</div>"
             part_block = (
                 f"<div class='pp'>+ Fees {_format_currency(fees, currency)} · "
                 f"ship {_format_currency(ship, currency)} · tax {_format_currency(tax, currency)}"
                 f"<br>Total {_format_currency(price_total, currency)}</div>"
             )
+        else:
+            # Default and 'frame_allin' use all-in price
+            frame_allin = 1 if chosen == "frame_allin" else frame_allin
+            price_block = f"<div class='price'>{_format_currency(price_total, currency)}</div>"
+            part_block = ""
 
-        assur_block = "<div class='badge'>Free returns · 30-day warranty</div>" if a else ""
+        # Visuals for badges (only one is shown per card)
+        if assurance:
+            assur_block = "<div class='badge'>Free returns · 30-day warranty</div>"
 
-        if dark_type == "scarcity" and d:
+        if scarcity:
             scarcity_level = max(2, int(round(price_total % 7)) + 2)
             dark_block = f"<div class='pill warn'>Only {scarcity_level} left</div>"
-        elif dark_type == "strike" and d:
+        elif strike:
             strike_price = round(price_total * 1.20, 2)
             dark_block = f"<div class='pill'><s>{_format_currency(strike_price, currency)}</s></div>"
-        elif dark_type == "timer" and d:
+        elif timer:
             mm = 1 + ((i*7) % 15); ss = 5 + ((i*13) % 55)
             dark_block = f"<div class='pill warn'>Deal ends in {mm:02d}:{ss:02d}</div>"
-        else:
-            dark_block = ""
 
-        social_block  = "<div class='chip'>👥 2k bought this month</div>" if masks["social"][i] else ""
-        voucher_block = "<div class='chip good'>10% OFF · code SAVE10</div>" if masks["voucher"][i] else ""
-        bundle_block  = "<div class='chip info'>Buy 2, save 10%</div>" if masks["bundle"][i] else ""
+        if social_proof:
+            social_block  = "<div class='chip'>👥 2k bought this month</div>"
+        elif voucher:
+            voucher_block = "<div class='chip good'>10% OFF · code SAVE10</div>"
+        elif bundle:
+            bundle_block  = "<div class='chip info'>Buy 2, save 10%</div>"
 
         cards_html.append(
             f"<div class='card' style='grid-row:{r+1};grid-column:{c+1}'>"
@@ -389,7 +250,6 @@ def render_screen(
             f"</div>"
         )
 
-        # ground truth row for this card
         gt_rows.append({
             "title": f"{display_name} #{i+1}",
             "row": r, "col": c,
@@ -397,36 +257,37 @@ def render_screen(
             "col1": 1 if c == 0 else 0,
             "col2": 1 if c == 1 else 0,
             "col3": 1 if c == 2 else 0,
-            "frame": f,
-            "assurance": a,
-            "scarcity": 1 if (dark_type == "scarcity" and d) else 0,
-            "strike":   1 if (dark_type == "strike"   and d) else 0,
-            "timer":    1 if (dark_type == "timer"    and d) else 0,
+            "frame": 1 if frame_allin else 0,          # 1 = all-in, 0 = partitioned (for backwards compat)
+            "assurance": 1 if assurance else 0,
+            "scarcity": 1 if scarcity else 0,
+            "strike":   1 if strike else 0,
+            "timer":    1 if timer else 0,
+            "social_proof": 1 if social_proof else 0,
+            "voucher":  1 if voucher else 0,
+            "bundle":   1 if bundle else 0,
             "price": round(price_total, 2),
             "ln_price": math.log(max(price_total, 1e-8)),
         })
 
-    # ---------------- assemble HTML ----------------
     grid = "".join(cards_html)
     gt_json = json.dumps(gt_rows)
 
-    # Plain triple-quoted string (NOT an f-string); CSS braces are doubled {{ }}
     html = """<!doctype html>
 <html><head><meta charset='utf-8'>
 <style>
-body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 24px; }}
-.grid {{ display: grid; grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(2, 320px); gap: 16px; }}
-.card {{ border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
-.title {{ font-weight: 600; margin-bottom: 8px; }}
-.price {{ font-size: 18px; font-weight: 700; margin: 4px 0; }}
-.pp {{ color: #6b7280; font-size: 12px; }}
-.badge {{ display:inline-block; margin-top:8px; background:#eef2ff; color:#3730a3; padding:4px 8px; border-radius:9999px; font-size:12px; }}
-.pill {{ display:inline-block; margin-left:6px; background:#f3f4f6; color:#111827; padding:4px 8px; border-radius:9999px; font-size:12px; }}
-.pill.warn {{ background:#fff7ed; color:#9a3412; }}
-.chip {{ display:inline-block; margin-left:6px; background:#f1f5f9; color:#0f172a; padding:2px 8px; border-radius:9999px; font-size:12px; }}
-.chip.good {{ background:#ecfdf5; color:#065f46; }}
-.chip.info {{ background:#eff6ff; color:#1e3a8a; }}
-.footer {{ margin-top: 8px; color:#6b7280; font-size: 12px; }}
+body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 24px; }
+.grid { display: grid; grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(2, 320px); gap: 16px; }
+.card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+.title { font-weight: 600; margin-bottom: 8px; }
+.price { font-size: 18px; font-weight: 700; margin: 4px 0; }
+.pp { color: #6b7280; font-size: 12px; }
+.badge { display:inline-block; margin-top:8px; background:#eef2ff; color:#3730a3; padding:4px 8px; border-radius:9999px; font-size:12px; }
+.pill { display:inline-block; margin-left:6px; background:#f3f4f6; color:#111827; padding:4px 8px; border-radius:9999px; font-size:12px; }
+.pill.warn { background:#fff7ed; color:#9a3412; }
+.chip { display:inline-block; margin-left:6px; background:#f1f5f9; color:#0f172a; padding:2px 8px; border-radius:9999px; font-size:12px; }
+.chip.good { background:#ecfdf5; color:#065f46; }
+.chip.info { background:#eff6ff; color:#1e3a8a; }
+.footer { margin-top: 8px; color:#6b7280; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -439,7 +300,6 @@ body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; m
 </body></html>"""
 
     return html.format(grid=grid, gt=gt_json)
-
 
 
 # Convenience wrappers used by the runner
@@ -473,4 +333,3 @@ def save_storefront(job_id: str, html: str, meta: dict) -> tuple[str, str]:
     html_path.write_text(html, encoding="utf-8")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return str(html_path), str(meta_path)
-
