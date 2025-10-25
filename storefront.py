@@ -5,46 +5,60 @@ Date: 2025-10-25
 # ---------------------------------------------------------------------------
 # Reviewer notes & modelling assumptions (paste near the top of storefront.py)
 #
-# Badge assignment is per-card and uniform over the set of user-selected badges.
-# Exactly one badge is drawn for each card from that set with equal probability
-# (pricing frames count as badges too). If no badge is selected we default to
-# an all-in pricing frame so that the screen remains coherent. With this design,
-# badges other than the pricing frame are purely presentational and do not alter
-# the numeric transaction price; they only set the ground-truth flags consumed by
-# the downstream logit.
+# Experimental design (two-stage, per-card):
+# 1) Pricing frame is an independent factor. If both “All-in pricing” and
+#    “Partitioned pricing” are selected, each card is assigned a frame with
+#    50/50 probability, blocked within screen to guarantee exactly 4 all-in
+#    and 4 partitioned cards. If only one frame is selected (or neither),
+#    the frame is fixed (defaulting to all-in when neither is selected), and
+#    no frame effect is estimable in that run.
+# 2) Visual badges are assigned independently of the frame. Exactly one
+#    non-frame badge (assurance, scarcity, strike-through, timer, social,
+#    voucher, bundle) is drawn uniformly at random for each card from the
+#    subset selected by the user. If no non-frame badges are selected, no
+#    visual badge is shown.
 #
-# Pricing uses the UI anchor as the geometric center and applies eight
-# multiplicative levels that are symmetric in log-space, exp(Δ) where
-# Δ ∈ {−0.3567, −0.2231, −0.1053, −0.0513, 0.0513, 0.1053, 0.2231, 0.3567},
-# yielding roughly ×0.70 … ×1.43 around the anchor. Levels are scheduled across
-# the 8 cards via a fixed 8×8 Latin square so that in each block every relative
-# price appears exactly once in each card position. This removes position–price
-# confounds. All randomness (badge draw and partitioning rates) is deterministic
-# and reproducible, seeded by (catalog_seed, brand, category, set_id, card_idx).
+# Identification and reporting:
+# This orthogonal design yields clean main effects for the pricing frame and
+# for each non-frame badge; pre-specified frame×badge interactions can be
+# estimated if desired. The ground truth includes a legacy “frame” column
+# (1 = all-in, 0 = partitioned) present on every row, plus one-hot indicators
+# for the non-frame badges (at most one equals 1 on any card). The effects
+# table and CSV should report the pricing-frame coefficient explicitly
+# (“All-in vs Partitioned: β for all-in”), alongside the non-frame badges.
 #
-# Partitioned pricing is a framing only. When the partitioned frame is drawn,
-# the total card price is decomposed into base+fees+shipping+tax using rates
-# sampled once per screen from the ranges tax≈9–11%, fees≈5–7%, shipping≈3–5%.
-# Components are rounded to two decimals and any rounding residual is absorbed
-# into the base component so that base+fees+ship+tax equals the displayed total.
-# All-in pricing shows only the total. Currency formatting is symbol-first with
-# two decimals and no locale-specific separators beyond the thousands comma.
+# Pricing schedule:
+# Prices use the UI anchor as geometric centre and apply eight multiplicative
+# levels symmetric in log-space, exp(Δ) where Δ ∈ {−0.3567, −0.2231, −0.1053,
+# −0.0513, 0.0513, 0.1053, 0.2231, 0.3567}, yielding approximately ×0.70…×1.43
+# around the anchor. Levels are placed via a fixed 8×8 Latin square so that
+# within each screen every relative price appears exactly once at each card
+# position, removing position–price confounds. All randomness (frame draw,
+# badge draw, and partitioning rates) is deterministic and reproducible,
+# seeded by (catalog_seed, brand, category, set_id, card_idx).
 #
-# Visual discount/urgency/social elements do not change the numeric price.
-# Strike-through displays a notional reference price set to 1.20× the card’s
-# total. Voucher shows “10% OFF · code SAVE10” as a label only. Bundle displays
-# “Buy 2, save 10%” as a label only. Scarcity prints “Only N left” with N
-# derived deterministically from the price and card index; the timer text is a
-# seeded pseudo-countdown; social proof is a fixed “2k bought this month”.
-# These elements exist to isolate framing effects without contaminating price.
+# Frame rendering and partitioning:
+# The frame is presentational; it does not change the card’s total price.
+# In the partitioned frame, the total is decomposed into base+fees+shipping+tax
+# using rates sampled once per screen from tax≈9–11%, fees≈5–7%, shipping≈3–5%.
+# Components are rounded to two decimals; any rounding residual is absorbed
+# into the base so components sum exactly to the displayed total. All-in shows
+# the total only. Currency formatting is symbol-first with two decimals.
 #
-# Ground-truth output includes binary indicators for each visual (assurance,
-# scarcity, strike, timer, social_proof, voucher, bundle) and a legacy “frame”
-# column where 1=all-in and 0=partitioned. For modelling, ln_price is the log of
-# the card’s displayed total (>=1e-8 guard). Adding a new badge requires three
-# coordinated edits: include it in the enabled-badge mapping, render its visual,
-# and emit its ground-truth flag.
+# Other visuals:
+# Visual discount/urgency/social elements do not alter the numeric total.
+# Strike-through shows a notional reference price set to 1.20× the card total.
+# Voucher displays “10% OFF · code SAVE10”. Bundle displays “Buy 2, save 10%”.
+# Scarcity prints “Only N left” with N derived deterministically; the timer
+# uses a seeded pseudo-countdown; social proof is a fixed “2k bought this month”.
+#
+# Implementation notes:
+# Adding a new non-frame badge requires three coordinated edits: include it in
+# the enabled-badge mapping, render its visual block, and emit its ground-truth
+# flag. If you change the frame policy (e.g., different randomisation ratio or
+# blocking scheme), update both the assignment function and the reviewer notes.
 # ---------------------------------------------------------------------------
+
 """
 
 # -*- coding: utf-8 -*-
@@ -112,6 +126,35 @@ def _partition_total_into_components(total: float, seeds: Seeds, set_id: str) ->
     return base_r, fees_r, ship_r, tax_r
 
 # ------------------------------
+# Frame assignment (two-stage design)
+# ------------------------------
+
+def _frame_mode(enabled_frames: list[str]) -> str:
+    # enabled_frames contains any of: "frame_allin", "frame_partitioned"
+    fa = "frame_allin" in enabled_frames
+    fp = "frame_partitioned" in enabled_frames
+    if fa and fp:
+        return "random50"
+    if fa:
+        return "allin"
+    if fp:
+        return "partitioned"
+    return "default_allin"
+
+def _assign_frame_for_card(i: int, set_id: str, seeds: Seeds, mode: str) -> tuple[int, int]:
+    # Returns (frame_allin, frame_partitioned) as 0/1, mutually exclusive.
+    if mode in ("allin", "default_allin"):
+        return 1, 0
+    if mode == "partitioned":
+        return 0, 1
+    # random50 with per-screen blocking: exactly 4 all-in, 4 partitioned per screen
+    rng = seeds.rng("frame-block", set_id)
+    pattern = [1]*4 + [0]*4  # 1=all-in, 0=partitioned
+    rng.shuffle(pattern)
+    v = pattern[i % 8]
+    return (1, 0) if v == 1 else (0, 1)
+
+# ------------------------------
 # Public API
 # ------------------------------
 
@@ -124,31 +167,27 @@ def render_screen(
     currency: str,
     brand: str = "",
 ) -> str:
-    # Normalize the user's selected badges (lower-cased keys)
+    # Normalise the user's selected badges (lower-cased keys)
     sel = { (b or "").strip().lower(): True for b in (badges or []) }
 
-    # Map UI labels to internal badge keys; pricing frames are badges too.
-    enabled: list[str] = []
-    if sel.get("all-in pricing"):       enabled.append("frame_allin")
-    if sel.get("partitioned pricing"):  enabled.append("frame_partitioned")
-    if sel.get("assurance"):            enabled.append("assurance")
-    if sel.get("scarcity tag"):         enabled.append("scarcity")
-    if sel.get("strike-through"):       enabled.append("strike")
-    if sel.get("timer"):                enabled.append("timer")
-    if sel.get("social"):               enabled.append("social")
-    if sel.get("voucher"):              enabled.append("voucher")
-    if sel.get("bundle"):               enabled.append("bundle")
+    # Map UI labels to internal keys
+    enabled_frames: list[str] = []
+    if sel.get("all-in pricing"):       enabled_frames.append("frame_allin")
+    if sel.get("partitioned pricing"):  enabled_frames.append("frame_partitioned")
+
+    enabled_nonframes: list[str] = []
+    if sel.get("assurance"):            enabled_nonframes.append("assurance")
+    if sel.get("scarcity tag"):         enabled_nonframes.append("scarcity")
+    if sel.get("strike-through"):       enabled_nonframes.append("strike")
+    if sel.get("timer"):                enabled_nonframes.append("timer")
+    if sel.get("social"):               enabled_nonframes.append("social")
+    if sel.get("voucher"):              enabled_nonframes.append("voucher")
+    if sel.get("bundle"):               enabled_nonframes.append("bundle")
 
     seeds = Seeds(catalog_seed=int(catalog_seed), brand=str(brand or ""), category=str(category or "product"))
 
-    # If nothing is selected, default to all-in frame so the screen is coherent
-    if not enabled:
-        enabled = ["frame_allin"]
-
-    # Deterministic per-card uniform draw over enabled badges
-    def draw_badge_for_card(i: int) -> str:
-        rng = seeds.rng("card-badge", set_id, i)
-        return enabled[rng.randrange(len(enabled))]
+    # If no frame explicitly selected, default to all-in (coherent screen)
+    frame_mode = _frame_mode(enabled_frames)
 
     # Prices: 8 log-symmetric levels via Latin schedule
     p0 = float(price_anchor or 0.0)
@@ -163,37 +202,42 @@ def render_screen(
         r, c = (0 if i < 4 else 1), (i % 4)
         price_total = _price_for_card(p0, set_id, i, seeds)
 
-        # Initialize flags
-        frame_allin = 0
-        frame_partitioned = 0
+        # --- Stage 1: assign pricing frame (mutually exclusive; blocked 4/4 if randomised) ---
+        frame_allin, frame_partitioned = _assign_frame_for_card(i, set_id, seeds, frame_mode)
+        is_partitioned = bool(frame_partitioned)
+
+        # --- Stage 2: pick exactly one non-frame badge uniformly (if any were selected) ---
+        chosen_nonframe = None
+        if enabled_nonframes:
+            rng = seeds.rng("nonframe", set_id, i)
+            chosen_nonframe = enabled_nonframes[rng.randrange(len(enabled_nonframes))]
+
+        # Initialise flags
         assurance = 0
-        scarcity = strike = timer = 0
-        social_proof = voucher = bundle = 0
+        scarcity = 0
+        strike = 0
+        timer = 0
+        social_proof = 0
+        voucher = 0
+        bundle = 0
 
-        chosen = draw_badge_for_card(i)
-
-        # --- Pricing frame: mutually exclusive & exhaustive ---
-        is_partitioned = (chosen == "frame_partitioned")
-        frame_partitioned = 1 if is_partitioned else 0
-        frame_allin = 0 if is_partitioned else 1  # all non-partition badges render all-in totals
-
-        # Non-frame badges
-        if chosen == "assurance":
+        # Activate the chosen non-frame flag
+        if chosen_nonframe == "assurance":
             assurance = 1
-        elif chosen == "scarcity":
+        elif chosen_nonframe == "scarcity":
             scarcity = 1
-        elif chosen == "strike":
+        elif chosen_nonframe == "strike":
             strike = 1
-        elif chosen == "timer":
+        elif chosen_nonframe == "timer":
             timer = 1
-        elif chosen == "social":
+        elif chosen_nonframe == "social":
             social_proof = 1
-        elif chosen == "voucher":
+        elif chosen_nonframe == "voucher":
             voucher = 1
-        elif chosen == "bundle":
+        elif chosen_nonframe == "bundle":
             bundle = 1
 
-        # Visual rendering for price (driven by the frame)
+        # Render price depending on frame
         if is_partitioned:
             base, fees, ship, tax = _partition_total_into_components(price_total, seeds, set_id)
             price_block = f"<div class='price'>{_format_currency(base, currency)} + charges</div>"
@@ -206,7 +250,7 @@ def render_screen(
             price_block = f"<div class='price'>{_format_currency(price_total, currency)}</div>"
             part_block = ""
 
-        # Visuals for badges (only one is shown per card)
+        # Visuals for badges (at most one non-frame visual shown)
         assur_block = ""
         dark_block = ""
         social_block = ""
@@ -233,6 +277,7 @@ def render_screen(
         elif bundle:
             bundle_block  = "<div class='chip info'>Buy 2, save 10%</div>"
 
+        # Compose one card
         cards_html.append(
             f"<div class='card' style='grid-row:{r+1};grid-column:{c+1}'>"
             f"<div class='title'>{display_name}</div>"
@@ -240,6 +285,7 @@ def render_screen(
             f"</div>"
         )
 
+        # Ground-truth row
         gt_rows.append({
             "title": f"{display_name} #{i+1}",
             "row": r, "col": c,
@@ -247,14 +293,14 @@ def render_screen(
             "col1": 1 if c == 0 else 0,
             "col2": 1 if c == 1 else 0,
             "col3": 1 if c == 2 else 0,
-            "frame": 1 if frame_allin else 0,          # legacy: 1 = all-in, 0 = partitioned
-            "assurance": 1 if assurance else 0,
-            "scarcity": 1 if scarcity else 0,
-            "strike":   1 if strike else 0,
-            "timer":    1 if timer else 0,
-            "social_proof": 1 if social_proof else 0,
-            "voucher":  1 if voucher else 0,
-            "bundle":   1 if bundle else 0,
+            "frame": 1 if frame_allin else 0,  # legacy meaning: 1 = all-in, 0 = partitioned
+            "assurance": assurance,
+            "scarcity":  scarcity,
+            "strike":    strike,
+            "timer":     timer,
+            "social_proof": social_proof,
+            "voucher":   voucher,
+            "bundle":    bundle,
             "price": round(price_total, 2),
             "ln_price": math.log(max(price_total, 1e-8)),
         })
@@ -324,3 +370,4 @@ def save_storefront(job_id: str, html: str, meta: dict) -> tuple[str, str]:
     html_path.write_text(html, encoding="utf-8")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return str(html_path), str(meta_path)
+
