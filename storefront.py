@@ -47,6 +47,7 @@ Date: 2025-10-25
 # ---------------------------------------------------------------------------
 """
 
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -123,18 +124,10 @@ def render_screen(
     currency: str,
     brand: str = "",
 ) -> str:
-    """
-    Storefront v1.7 — Equal per-card chance across ALL selected badges.
-    Exactly one badge is rendered per card, drawn uniformly from the
-    selected badge set (deterministic given seeds). Prices still follow
-    the Latin-square schedule anchored on the UI price.
-    """
-
     # Normalize the user's selected badges (lower-cased keys)
     sel = { (b or "").strip().lower(): True for b in (badges or []) }
 
-    # Map UI labels to internal badge keys
-    # We keep both frame options as badges so they compete fairly.
+    # Map UI labels to internal badge keys; pricing frames are badges too.
     enabled: list[str] = []
     if sel.get("all-in pricing"):       enabled.append("frame_allin")
     if sel.get("partitioned pricing"):  enabled.append("frame_partitioned")
@@ -148,7 +141,7 @@ def render_screen(
 
     seeds = Seeds(catalog_seed=int(catalog_seed), brand=str(brand or ""), category=str(category or "product"))
 
-    # If nothing is selected, we still show all-in pricing as a harmless default
+    # If nothing is selected, default to all-in frame so the screen is coherent
     if not enabled:
         enabled = ["frame_allin"]
 
@@ -179,27 +172,20 @@ def render_screen(
 
         chosen = draw_badge_for_card(i)
 
-        # Render blocks based on the chosen badge
-        assur_block = ""
-        dark_block = ""
-        social_block = voucher_block = bundle_block = ""
+        # --- Pricing frame: mutually exclusive & exhaustive ---
+        is_partitioned = (chosen == "frame_partitioned")
+        frame_partitioned = 1 if is_partitioned else 0
+        frame_allin = 0 if is_partitioned else 1  # all non-partition badges render all-in totals
 
-        # Frame (also affects how price is displayed)
-        if chosen == "frame_allin":
-            frame_allin = 1
-        elif chosen == "frame_partitioned":
-            frame_partitioned = 1
-        # Assurance
-        elif chosen == "assurance":
+        # Non-frame badges
+        if chosen == "assurance":
             assurance = 1
-        # Dark variants
         elif chosen == "scarcity":
             scarcity = 1
         elif chosen == "strike":
             strike = 1
         elif chosen == "timer":
             timer = 1
-        # Social family
         elif chosen == "social":
             social_proof = 1
         elif chosen == "voucher":
@@ -207,8 +193,8 @@ def render_screen(
         elif chosen == "bundle":
             bundle = 1
 
-        # Visual rendering for price (depends on frame badge if drawn)
-        if frame_partitioned:
+        # Visual rendering for price (driven by the frame)
+        if is_partitioned:
             base, fees, ship, tax = _partition_total_into_components(price_total, seeds, set_id)
             price_block = f"<div class='price'>{_format_currency(base, currency)} + charges</div>"
             part_block = (
@@ -217,12 +203,16 @@ def render_screen(
                 f"<br>Total {_format_currency(price_total, currency)}</div>"
             )
         else:
-            # Default and 'frame_allin' use all-in price
-            frame_allin = 1 if chosen == "frame_allin" else frame_allin
             price_block = f"<div class='price'>{_format_currency(price_total, currency)}</div>"
             part_block = ""
 
         # Visuals for badges (only one is shown per card)
+        assur_block = ""
+        dark_block = ""
+        social_block = ""
+        voucher_block = ""
+        bundle_block = ""
+
         if assurance:
             assur_block = "<div class='badge'>Free returns · 30-day warranty</div>"
 
@@ -257,7 +247,7 @@ def render_screen(
             "col1": 1 if c == 0 else 0,
             "col2": 1 if c == 1 else 0,
             "col3": 1 if c == 2 else 0,
-            "frame": 1 if frame_allin else 0,          # 1 = all-in, 0 = partitioned (for backwards compat)
+            "frame": 1 if frame_allin else 0,          # legacy: 1 = all-in, 0 = partitioned
             "assurance": 1 if assurance else 0,
             "scarcity": 1 if scarcity else 0,
             "strike":   1 if strike else 0,
@@ -299,6 +289,7 @@ body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; ma
 </div>
 </body></html>"""
 
+    # Use simple replacement to avoid str.format clashing with CSS braces
     return html.replace("{grid}", grid).replace("{gt}", gt_json)
 
 
