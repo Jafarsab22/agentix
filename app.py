@@ -44,8 +44,7 @@ except Exception:
 # -------- UI choices --------
 MODEL_CHOICES = ["OpenAI GPT-4.1-mini"]  # extend later if needed
 BADGE_CHOICES = [
-    "All-in pricing",
-    "Partitioned pricing",
+    "All-in v. partitioned pricing",
     "Assurance",
     "Scarcity tag",
     "Strike-through",
@@ -58,7 +57,7 @@ CURRENCY_CHOICES = ["£", "$", "EUR"]
 
 # Subset of badges estimated separately in the logit (used to compute B)
 SEPARATE_BADGES = {
-    "All-in pricing",   # “All-in”
+    "All-in v. partitioned pricing",
     "Assurance",
     "Strike-through",   # “Strike”
     "Timer",
@@ -76,8 +75,16 @@ def _ceil_to_8(n: int) -> int:
     return int(((int(n) + 7) // 8) * 8)
 
 def _auto_iterations_from_badges(badges: list[str]) -> int:
-    b = len(badges or [])
-    return _ceil_to_8(max(100, 30 * b))
+    sel = set(badges or [])
+    b = 0
+    if "All-in v. partitioned pricing" in sel:
+        b += 1
+    # Non-frame levers you currently estimate separately in the logit
+    for lab in ("Assurance", "Strike-through", "Timer"):
+        if lab in sel:
+            b += 1
+    base = max(100, 30 * b)
+    return _ceil_to_8(base)
 
 def _validate_inputs(product_name, price, currency, n_iterations):
     if not product_name or not product_name.strip():
@@ -578,6 +585,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
