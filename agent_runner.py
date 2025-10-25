@@ -1,84 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-Agentix — Vision runner (jpeg_b64) for ALL badges + per-screen choice logs.
-Version: v1.6 (2025-10-23)
+Agentix — Vision runner (jpeg_b64) for per-card, two-stage design (pricing frame + one non-frame badge).
+Version: v1.7 (2025-10-25)
 
-• Headless Chrome → JPEG base64 → VLM tool/function call → reconcile to 2×4 grid.
-• Uses only what is rendered: prices (varied within-screen) + badges + position.
-• Fresh-run clearing via payload["fresh"]=True.
-• After finishing, calls logit_badges.run_logit(...) with the user-selected badges.
-• Produces results/table_badges.csv and includes logit_table_rows in the returned JSON.
+Key changes in v1.7
+- Aligns with the two-stage experimental design:
+  (1) Pricing frame (all-in vs partitioned) is assigned independently 50/50 per screen with 4/4 blocking
+      when the user enables the pricing comparison; otherwise it is fixed (defaulting to all-in).
+  (2) Exactly one non-frame badge is drawn uniformly per card from the user-selected set.
+- Ground-truth ingestion remains tolerant to both legacy and v1.7 storefront schemas.
+- The logit downstream should now treat 'frame' as a first-class effect and report it in the table/CSV.
 
 Payload shape (example):
 {
   "job_id": "job-0001",
-  "model": "OpenAI GPT-4.1-mini",           # or "Anthropic Claude 3.5 Haiku" | "Google Gemini 1.5 Flash"
+  "model": "OpenAI GPT-4.1-mini",
   "render_url": "",                         # if empty → inline HTML is used (recommended)
   "product": "fitness watch",
-  "brand": "",                              # optional brand label for display
-  "price": 100,                             # ← anchor from UI (we vary around this)
-  "currency": "£",                          # ← from UI
-  "badges": ["social","voucher","bundle","Assurance","Strike-through"],
-  "n_iterations": 100,
+  "brand": "",
+  "price": 100,
+  "currency": "£",
+  "badges": ["All-in v. partitioned pricing","Assurance","Strike-through","Timer"],
+  "n_iterations": 50,
   "fresh": true,
   "catalog_seed": 777
 }
 
-The inline page exposes <div id="groundtruth">…</div> or
-<script id="groundtruth" type="application/json">…</script> with either:
+The inline page exposes <div id="groundtruth">…</div> (textContent = JSON) with either:
   • {"products": [ ... ]}   or   • [ ... ]   (runner handles both).
 
 Each product row contains:
-  title, row, col, frame, assurance,
-  scarcity/strike/timer (either as booleans or a single “dark” string),
-  social_proof/voucher/bundle flags,
-  price and ln_price (preferred) or total_price (legacy).
+  title, row, col,
+  frame (1=all-in, 0=partitioned),
+  assurance, scarcity, strike, timer, social_proof, voucher, bundle,
+  price and ln_price.
 
-####
-Design principles for Agentix simulation runner
------------------------------------------------
-
-1. Within-screen variation (choice identifiability)
-   Each screen (case_id) must include multiple product cards differing in key levers
-   (e.g., frame, assurance, scarcity, strike, timer) and in price. Variation within the
-   same screen is essential: without it, the conditional-logit model cannot estimate how
-   a given badge or price affects choice probability.
-
-2. Between-screen rotation (balanced exposure)
-   Across iterations, badges use orthogonal 4/8 masks with a 4-screen rotation.
-   Exactly one dark lever is active per screen. Dark types {scarcity, strike, timer, none}
-   are seed-randomised and blocked so each appears exactly once per 4-screen block
-   (order varies by seed).
-
-3. Controlled randomness with reproducibility
-   Badges and price levels are allocated pseudo-randomly under structural constraints,
-   keyed by catalog_seed, brand, category, and screen index (set_id). This yields
-   reproducible yet randomised runs.
-
-4. Price variation anchored on user input (external validity + identification)
-   The UI price acts as an anchor P₀. We generate eight within-screen price levels by
-   multiplying P₀ by log-symmetric factors spanning ≈ ±30%. Assignment follows an 8×8
-   Latin-square schedule across 8-screen blocks so that ln(price) is orthogonal to
-   row/column and to other levers. We include ln(price) in the ground truth to identify
-   price sensitivity and to purge badge effects of residual correlation.
-
-5. Frame integrity
-   For partitioned pricing, base+fees+shipping+tax equals the varied total price exactly.
-   Framing is a pure presentation change; the true total price does not differ by frame.
-
-6. Estimation integrity
-   After simulation, within-screen variation is checked implicitly by the estimator;
-   columns with zero variance are dropped to avoid singularities. With this design,
-   levers and ln(price) have identifying variation by construction.
-
-7. Scalability
-   Increasing n_iterations increases design coverage and tightens standard errors; seed
-   control allows A/B reruns.
-
-In short:
-Each screen contains diversity (within-screen variation in badges and prices),
-blocks enforce balance (between-screen rotation and Latin-square price scheduling),
-and randomisation is reproducible (seeded).
+Design principles (v1.7)
+- Within-screen variation: each 2×4 screen mixes price levels (Latin-square placement) and levers.
+- Pricing frame: mutually exclusive; if randomised, exactly 4 all-in and 4 partitioned per screen.
+- One non-frame badge per card drawn uniformly from selected set (if any).
+- Reproducibility: all randomness is keyed by catalog_seed, brand, category, and set_id.
 """
 
 from __future__ import annotations
@@ -94,21 +55,21 @@ from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By   # <-- FIXED: lowercase module 'by'
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from urllib3.exceptions import ReadTimeoutError
 
-import logit_badges  # separate statistical module
+import logit_badges  # statistical module (must include 'frame' in EFFECT_VARS)
 
 # ---------------- paths ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
 HTML_DIR    = pathlib.Path("pages");   HTML_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "Agentix MC runner – inline-render or URL – 2025-10-23"
+VERSION = "Agentix MC runner – inline-render or URL – 2025-10-25 (v1.7)"
 print(f"[agent_runner] {VERSION}", flush=True)
 
 # ---------------- small helpers ----------------
@@ -117,11 +78,13 @@ def _load_html(driver, html: str):
     driver.get(data_url)
 
 def _fresh_reset(fresh: bool):
-    if not fresh: return
+    if not fresh: 
+        return
     for fn in ("df_choice.csv","df_long.csv","log_compare.jsonl","table_badges.csv"):
         p = RESULTS_DIR / fn
         try:
-            if p.exists(): p.unlink()
+            if p.exists():
+                p.unlink()
         except Exception:
             pass
 
@@ -239,8 +202,8 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
     """
     Align the model's decision to the ground truth schema; propagate lever flags and price fields.
     Works with either:
-      • 'dark' string + 'social' bool (legacy)  OR
-      • separate scarcity/strike/timer ints + 'social_proof' int (storefront v1.6).
+      • legacy 'dark' string + 'social' bool  OR
+      • v1.7 separate scarcity/strike/timer ints + 'social_proof' int.
     """
     r = int(decision.get("row", 0)); c = int(decision.get("col", 0))
     r = 0 if r < 0 else (1 if r > 1 else r)
@@ -249,11 +212,9 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
 
     if prod:
         decision["row"], decision["col"] = int(prod.get("row", r)), int(prod.get("col", c))
-        # Frame & assurance
         decision["frame"] = int(prod.get("frame", 1)) if prod.get("frame") is not None else None
         decision["assurance"] = int(prod.get("assurance", 0)) if prod.get("assurance") is not None else None
 
-        # Dark flags: accept either 'dark' string or individual booleans
         dark_str = (str(prod.get("dark", "")).strip().lower()) if "dark" in prod else None
         if dark_str is not None:
             decision["scarcity"] = 1 if dark_str == "scarcity" else 0
@@ -264,12 +225,10 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
             decision["strike"]   = int(prod.get("strike", 0))
             decision["timer"]    = int(prod.get("timer", 0))
 
-        # Social/voucher/bundle keys: accept both schemas
-        decision["social_proof"] = int(prod.get("social_proof", 1 if prod.get("social") else 0)) if ("social_proof" in prod or "social" in prod) else None
-        decision["voucher"]      = int(prod.get("voucher", 0)) if ("voucher" in prod) else None
-        decision["bundle"]       = int(prod.get("bundle", 0)) if ("bundle" in prod) else None
+        decision["social_proof"] = int(prod.get("social_proof", 1 if prod.get("social") else 0)) if ("social_proof" in prod or "social" in prod) else 0
+        decision["voucher"]      = int(prod.get("voucher", 0)) if ("voucher" in prod) else 0
+        decision["bundle"]       = int(prod.get("bundle", 0)) if ("bundle" in prod) else 0
 
-        # Price fields
         price_val = prod.get("price", prod.get("total_price", None))
         if price_val is not None:
             decision["price"] = float(price_val)
@@ -285,7 +244,8 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
 # ---------------- vendor calls ----------------
 def _openai_choose(image_b64, category, model):
     key = os.getenv("OPENAI_API_KEY")
-    if not key: raise RuntimeError("OPENAI_API_KEY missing.")
+    if not key: 
+        raise RuntimeError("OPENAI_API_KEY missing.")
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
     tools = [{"type": "function", "function": {"name": "choose", "description": "Select one grid item", "parameters": SCHEMA_JSON}}]
@@ -306,12 +266,14 @@ def _openai_choose(image_b64, category, model):
     r.raise_for_status()
     msg = r.json()["choices"][0]["message"]
     tcs = msg.get("tool_calls", [])
-    if not tcs: raise RuntimeError("OpenAI: no tool_calls.")
+    if not tcs: 
+        raise RuntimeError("OpenAI: no tool_calls.")
     return json.loads(tcs[0]["function"]["arguments"])
 
 def _anthropic_choose(image_b64, category, model):
     key = os.getenv("ANTHROPIC_API_KEY")
-    if not key: raise RuntimeError("ANTHROPIC_API_KEY missing.")
+    if not key: 
+        raise RuntimeError("ANTHROPIC_API_KEY missing.")
     url = "https://api.anthropic.com/v1/messages"
     headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     tools = [{"name":"choose","description":"Select one grid item","input_schema":SCHEMA_JSON}]
@@ -329,12 +291,14 @@ def _anthropic_choose(image_b64, category, model):
     r.raise_for_status()
     blocks = r.json().get("content", [])
     tool_blocks = [b for b in blocks if b.get("type")=="tool_use" and b.get("name")=="choose"]
-    if not tool_blocks: raise RuntimeError("Anthropic: no tool_use choose.")
+    if not tool_blocks: 
+        raise RuntimeError("Anthropic: no tool_use choose.")
     return tool_blocks[0].get("input", {}) or {}
 
 def _gemini_choose(image_b64, category, model):
     key = os.getenv("GEMINI_API_KEY")
-    if not key: raise RuntimeError("GEMINI_API_KEY missing.")
+    if not key: 
+        raise RuntimeError("GEMINI_API_KEY missing.")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     tools = [{"function_declarations": [{
         "name": "choose", "description": "Select one grid item",
@@ -354,7 +318,8 @@ def _gemini_choose(image_b64, category, model):
     r.raise_for_status()
     resp = r.json()
     candidates = resp.get("candidates", [])
-    if not candidates: raise RuntimeError("Gemini: no candidates.")
+    if not candidates: 
+        raise RuntimeError("Gemini: no candidates.")
     parts = candidates[0].get("content", {}).get("parts", [])
     for p in parts:
         fc = p.get("functionCall")
@@ -387,14 +352,9 @@ def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_
 # ---------------- inline renderer (Option B) ----------------
 def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price_anchor: float, currency: str, brand: str = "") -> str:
     """
-    Inline storefront renderer (v1.6):
-    Delegates to storefront.render_screen(...) which enforces:
-      • Balanced 4/8 masks for frame/assurance and any independent cues.
-      • Seed-randomised, 4-screen blocked rotation across {scarcity, strike, timer, none}.
-      • Within-screen price variation anchored on the UI price using eight log-symmetric levels
-        (≈±30%) assigned via an 8×8 Latin-square across 8-screen blocks.
-      • Ground truth includes price and ln_price per card; in partitioned frames, components
-        sum exactly to the varied total.
+    Inline storefront renderer (v1.7): delegates to storefront.render_screen(...),
+    which implements the two-stage design (frame 4/4 blocked when randomised, plus one
+    uniformly drawn non-frame badge per card) and Latin-square price placement.
     """
     from storefront import render_screen
     html = render_screen(
@@ -447,7 +407,7 @@ def preview_one(payload: Dict) -> Dict:
 
 # ---------------- run one episode ----------------
 def _episode(
-    driver,                                # <-- driver is passed in
+    driver,
     category: str,
     ui_label: str,
     render_url_tpl: str,
@@ -504,7 +464,8 @@ def _episode(
             raise
 
 # ---------------- writers ----------------
-def _ensure_dir(p: pathlib.Path): p.mkdir(parents=True, exist_ok=True)
+def _ensure_dir(p: pathlib.Path): 
+    p.mkdir(parents=True, exist_ok=True)
 
 def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: dict):
     rows_choice, rows_long = [], []
@@ -512,7 +473,6 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
 
     # df_choice (8 rows per screen)
     for p in products:
-        # Handle either schema
         dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
         row_top = 1 if int(p.get("row",0)) == 0 else 0
         col1 = 1 if int(p.get("col",0)) == 0 else 0
@@ -552,7 +512,8 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
     df_choice = pd.DataFrame(rows_choice)
     for c in ("row","col","row_top","col1","col2","col3","frame","assurance",
               "scarcity","strike","timer","social_proof","voucher","bundle","chosen"):
-        if c in df_choice.columns: df_choice[c] = df_choice[c].astype(int)
+        if c in df_choice.columns: 
+            df_choice[c] = df_choice[c].astype(int)
     agg_choice = RESULTS_DIR / "df_choice.csv"
     df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False)
 
@@ -599,7 +560,8 @@ def run_job_sync(payload: Dict) -> Dict:
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
     badges   = list(payload.get("badges") or [])
-    badges = [b for b in badges if b.strip().lower() != "partitioned pricing"]
+    # IMPORTANT (v1.7): keep the badges list as-is; storefront handles the two-stage design,
+    # interpreting the single toggle "All-in v. partitioned pricing" to enable 50/50 frame.
     render_tpl = str(payload.get("render_url") or "")  # if empty → inline HTML via storefront
     catalog_seed = int(payload.get("catalog_seed", 777))
 
@@ -632,7 +594,7 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             pass
 
-    # ----- robust conditional-logit post-processing -----
+    # ----- conditional-logit post-processing -----
     out_csv = RESULTS_DIR / "table_badges.csv"
     badge_rows = []
     badge_table = pd.DataFrame()
@@ -643,8 +605,11 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             return False
 
-    if badges and _has_nonempty_file(RESULTS_DIR / "df_choice.csv"):
+    if _has_nonempty_file(RESULTS_DIR / "df_choice.csv"):
         try:
+            # Pass through the user's selected badges; the logit module should:
+            # - include 'frame' as an explicit effect when it varies
+            # - include only non-frame badges with variance
             bt = logit_badges.run_logit(RESULTS_DIR / "df_choice.csv", badges)
             if isinstance(bt, pd.DataFrame):
                 badge_table = bt
@@ -664,7 +629,7 @@ def run_job_sync(payload: Dict) -> Dict:
     else:
         badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
         badge_rows = []
-    # ----- end robust block -----
+    # ----- end post-processing -----
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
     return {
@@ -702,5 +667,3 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
-
-
