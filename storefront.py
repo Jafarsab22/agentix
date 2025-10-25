@@ -169,11 +169,16 @@ def render_screen(
 ) -> str:
     # Normalise the user's selected badges (lower-cased keys)
     sel = { (b or "").strip().lower(): True for b in (badges or []) }
-
     # Map UI labels to internal keys
     enabled_frames: list[str] = []
-    if sel.get("all-in pricing"):       enabled_frames.append("frame_allin")
-    if sel.get("partitioned pricing"):  enabled_frames.append("frame_partitioned")
+    if sel.get("all-in v. partitioned pricing"):
+        enabled_frames.extend(["frame_allin", "frame_partitioned"])
+
+    # Legacy fallback (keep if old labels might appear)
+    if sel.get("all-in pricing"):
+        enabled_frames.append("frame_allin")
+    if sel.get("partitioned pricing"):
+        enabled_frames.append("frame_partitioned")
 
     enabled_nonframes: list[str] = []
     if sel.get("assurance"):            enabled_nonframes.append("assurance")
@@ -183,7 +188,6 @@ def render_screen(
     if sel.get("social"):               enabled_nonframes.append("social")
     if sel.get("voucher"):              enabled_nonframes.append("voucher")
     if sel.get("bundle"):               enabled_nonframes.append("bundle")
-
     seeds = Seeds(catalog_seed=int(catalog_seed), brand=str(brand or ""), category=str(category or "product"))
 
     # If no frame explicitly selected, default to all-in (coherent screen)
