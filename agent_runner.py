@@ -19,7 +19,7 @@ Payload shape (example):
   "price": 100,                             # ← anchor from UI (we vary around this)
   "currency": "£",                          # ← from UI
   "badges": ["social","voucher","bundle","Assurance","Strike-through"],
-  "n_iterations": 50,
+  "n_iterations": 100,
   "fresh": true,
   "catalog_seed": 777
 }
@@ -595,7 +595,7 @@ def run_job_sync(payload: Dict) -> Dict:
 
     _fresh_reset(bool(payload.get("fresh", True)))
 
-    n = int(payload.get("n_iterations", 50) or 50)
+    n = int(payload.get("n_iterations", 100) or 100)
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
     badges   = list(payload.get("badges") or [])
@@ -702,4 +702,5 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
