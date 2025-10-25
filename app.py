@@ -482,7 +482,8 @@ def _toggle_manual(manual_checked: bool, badges: list[str]):
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     gr.Markdown(
         "# Agentix\n"
-        "Search our database for prior significant results before you simulate. "
+        "Agentix helps you understand how marketing badges—such as scarcity indicators and strike-through pricing—affect AI agents’ buying behaviour on your e-commerce site.\n\n"
+        "Before you simulate, search our database for prior significant results by filling in the product name.\n\n"
         "If nothing is found, run a new simulation to estimate badge effects.\n\n"
     )
     with gr.Row():
@@ -577,5 +578,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
