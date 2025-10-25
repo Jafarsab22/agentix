@@ -27,36 +27,33 @@ except Exception:
 
 RESULTS_DIR = pathlib.Path("results")
 
-# Map UI badge labels -> df_choice column names (ground-truth)
-# Includes backward-compat labels and the new single-toggle pricing comparison.
+# ---------- UI label → df_choice column ----------
+# Includes the new single-toggle label. Legacy labels map to the same 'frame' column.
 _BADGE_TO_COL = {
-    # Pricing frame (new single toggle)
-    "All-in v. partitioned pricing": "frame",   # 1 = all-in (vs 0 = partitioned)
-    # Back-compat UI labels (both map to same binary; do NOT include both at once)
-    "All-in pricing": "frame",
-    "Partitioned pricing": "frame",  # complement of frame; same column but reversed coding if used alone
-    # Non-frame badges
-    "Assurance": "assurance",
-    "Scarcity tag": "scarcity",
-    "Strike-through": "strike",
-    "Timer": "timer",
-    "social": "social_proof",
-    "voucher": "voucher",
-    "bundle": "bundle",
+    "All-in v. partitioned pricing": "frame",   # 1 = all-in, 0 = partitioned
+    "All-in pricing":                "frame",
+    "Partitioned pricing":           "frame",   # same column; coding reversed conceptually if used alone
+    "Assurance":       "assurance",
+    "Scarcity tag":    "scarcity",
+    "Strike-through":  "strike",
+    "Timer":           "timer",
+    "social":          "social_proof",
+    "voucher":         "voucher",
+    "bundle":          "bundle",
 }
 
-# Human-readable labels for output table/CSV
-_UI_LABEL_TO_REPORT = {
+# Pretty labels for reporting
+_PRETTY = {
     "All-in v. partitioned pricing": "Pricing frame (β for all-in vs partitioned)",
     "All-in pricing":                "Pricing frame (β for all-in vs partitioned)",
     "Partitioned pricing":           "Pricing frame (β for all-in vs partitioned)",
-    "Assurance":                     "Assurance",
-    "Scarcity tag":                  "Scarcity tag",
-    "Strike-through":                "Strike-through",
-    "Timer":                         "Timer",
-    "social":                        "Social proof",
-    "voucher":                       "Voucher",
-    "bundle":                        "Bundle",
+    "Assurance":       "Assurance",
+    "Scarcity tag":    "Scarcity tag",
+    "Strike-through":  "Strike-through",
+    "Timer":           "Timer",
+    "social":          "Social proof",
+    "voucher":         "Voucher",
+    "bundle":          "Bundle",
 }
 
 _EMPTY_SCHEMA = ["badge", "beta", "p", "sign"]
@@ -75,11 +72,7 @@ def _sign(beta: float, p: float) -> str:
 
 
 def _fit_with_fallback(y: pd.DataFrame, X: pd.DataFrame):
-    """
-    Primary: statsmodels Logit MLE.
-    Fallback: ridge-IRLS if MLE fails numerically.
-    """
-    # Try canonical MLE first
+    """Primary: statsmodels Logit; Fallback: ridge-IRLS."""
     try:
         fit = sm.Logit(y.values.ravel(), X).fit(disp=0, maxiter=2000, method="lbfgs")
         params = pd.Series(fit.params, index=X.columns)
@@ -92,7 +85,6 @@ def _fit_with_fallback(y: pd.DataFrame, X: pd.DataFrame):
         alpha = 1e-2
         I = np.eye(X.shape[1])
         beta = np.zeros(X.shape[1])
-        # tiny jitter to break perfect separation symmetry
         rng = np.random.default_rng(0)
         beta += rng.normal(scale=1e-6, size=X.shape[1])
 
@@ -130,7 +122,7 @@ def _fit_with_fallback(y: pd.DataFrame, X: pd.DataFrame):
 def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.DataFrame:
     """
     Returns a DataFrame with columns: badge, beta, p, sign.
-    Writes results/table_badges.csv if non-empty (runner handles file I/O).
+    The runner will write results/table_badges.csv if non-empty.
     """
     if not _HAVE_SM:
         return _empty_table()
@@ -143,7 +135,7 @@ def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.Da
     if df.empty:
         return _empty_table()
 
-    # Require complete 8-alternative screens and the standard controls
+    # Need complete 8-alternative choice sets and position controls
     required = {"case_id", "title", "chosen", "row_top", "col1", "col2", "col3"}
     if not required.issubset(df.columns):
         return _empty_table()
@@ -154,46 +146,43 @@ def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.Da
     if df.empty:
         return _empty_table()
 
-    # ---------- build variable list ----------
     selected_badges = list(selected_badges or [])
 
-    # Map UI labels → dataframe columns; deduplicate and keep only present columns
-    mapped_cols = []
-    col_to_ui = {}  # for reporting back under the requested label (esp. frame)
+    # Map UI labels → present columns, keeping each column once
+    mapped_cols: list[str] = []
+    col_to_ui: dict[str, str] = {}
     for ui_lab in selected_badges:
         col = _BADGE_TO_COL.get(ui_lab)
         if not col:
             continue
         if col in df.columns and col not in mapped_cols:
-            mapped_cols.append(col)
-            col_to_ui[col] = ui_lab
+            # Only include if there is variation (drop constants defensively)
+            if df[col].nunique(dropna=False) > 1:
+                mapped_cols.append(col)
+                col_to_ui[col] = ui_lab
 
-    # If user accidentally included both legacy "All-in pricing" and "Partitioned pricing",
-    # keep only one appearance (both map to 'frame' anyway).
-    # With the new single toggle, only "All-in v. partitioned pricing" will be present.
-
-    # Optional covariates (price)
+    # covariates
     covars = []
     if "ln_price" in df.columns and df["ln_price"].notna().any():
         covars.append("ln_price")
 
-    # Nothing to estimate
-    if not mapped_cols and not covars:
-        return _empty_table()
-
-    # Base position controls
+    # base position controls
     base_cols = ["row_top", "col1", "col2", "col3"]
     if not set(base_cols).issubset(df.columns):
         return _empty_table()
 
-    # Fixed effects: case (screen) + product title
+    # nothing to estimate
+    if not mapped_cols and not covars:
+        return _empty_table()
+
+    # Fixed effects for case and product title (conditional logit emulation)
     rhs_terms = base_cols + mapped_cols + covars + ["C(case_id)", "C(title)"]
     formula = "chosen ~ -1 + " + " + ".join(rhs_terms)
 
     try:
         y, X = pt.dmatrices(formula, df, return_type="dataframe")
 
-        # Drop zero-variance columns (defensive)
+        # Drop zero-variance cols (guard against singularities)
         keep = [c for c in X.columns if X[c].std(ddof=0) > 0]
         X = X[keep]
         if X.shape[1] == 0:
@@ -201,22 +190,14 @@ def run_logit(df_choice_path: pathlib.Path, selected_badges: List[str]) -> pd.Da
 
         params, pvals = _fit_with_fallback(y, X)
 
-        # Prepare output rows ONLY for the levers (mapped_cols) that survived in X
+        # Report only the lever columns we asked to estimate (mapped_cols)
         out_rows = []
         for col in mapped_cols:
             if col in X.columns and col in params.index:
-                beta = float(params[col])
-                pval = float(pvals[col])
+                beta = float(params[col]); pval = float(pvals[col])
                 ui_lab = col_to_ui.get(col, col)
-
-                # Use reporting label (pretty name) for pricing frame row
-                label = _UI_LABEL_TO_REPORT.get(ui_lab, ui_lab)
-                out_rows.append({
-                    "badge": label,
-                    "beta": beta,
-                    "p": pval,
-                    "sign": _sign(beta, pval),
-                })
+                label = _PRETTY.get(ui_lab, ui_lab)
+                out_rows.append({"badge": label, "beta": beta, "p": pval, "sign": _sign(beta, pval)})
 
         return pd.DataFrame(out_rows, columns=_EMPTY_SCHEMA) if out_rows else _empty_table()
 
