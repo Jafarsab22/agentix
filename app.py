@@ -495,8 +495,8 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
     # Iterations controls: two tick boxes above the iterations field
     with gr.Row():
-        auto_iter = gr.Checkbox(label="Automatic", value=True, scale=1)
-        manual_iter = gr.Checkbox(label="Manual", value=False, scale=1)
+        auto_iter = gr.Checkbox(label="Automatic calculations of iterations", value=True, scale=1)
+        manual_iter = gr.Checkbox(label="Manual calculations of iterations", value=False, scale=1)
 
     # Default auto value based on zero selected badges: ceil_to_8(max(100, 0)) = 104
     default_auto_iters = _auto_iterations_from_badges([])
@@ -577,4 +577,5 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
