@@ -190,6 +190,10 @@ def render_screen(
     if sel.get("bundle"):               enabled_nonframes.append("bundle")
     seeds = Seeds(catalog_seed=int(catalog_seed), brand=str(brand or ""), category=str(category or "product"))
 
+    # --- Debug guards (remove after verifying) ---
+    assert all(isinstance(x, str) for x in enabled_frames), f"enabled_frames malformed: {enabled_frames}"
+    # quick visibility while debugging:
+    print("[storefront] enabled_frames:", enabled_frames)
     # If no frame explicitly selected, default to all-in (coherent screen)
     frame_mode = _frame_mode(enabled_frames)
 
