@@ -594,71 +594,70 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             pass
 
-   # ----- conditional-logit post-processing -----
-# ----- conditional-logit post-processing -----
-from pathlib import Path
-import pandas as pd
-
-out_csv = RESULTS_DIR / "table_badges.csv"
-badge_rows = []
-badge_table = pd.DataFrame()
-
-# --- DEBUG A: verify df_choice and basic variation before logit ---
-choice_path = RESULTS_DIR / "df_choice.csv"
-print("DEBUG choice_path_exists=", Path(choice_path).exists())
-if Path(choice_path).exists():
-    _df_dbg = pd.read_csv(choice_path)
-    print("DEBUG rows=", len(_df_dbg))
-    print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
-    for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
-        if _c in _df_dbg.columns:
-            try:
-                _u = int(_df_dbg[_c].nunique(dropna=False))
-            except Exception:
-                _u = "NA"
-            print(f"DEBUG {_c}_unique=", _u)
-
-import logit_badges
-print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
-
-def _has_nonempty_file(p: Path) -> bool:
-    try:
-        return p.exists() and p.stat().st_size > 0
-    except Exception:
-        return False
-
-if _has_nonempty_file(choice_path):
-    try:
-        bt = logit_badges.run_logit(choice_path, badges)
-        if isinstance(bt, pd.DataFrame):
-            badge_table = bt
-        elif isinstance(bt, list):
-            badge_table = pd.DataFrame(bt)
-        else:
-            badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
-
-        # --- DEBUG B: inspect the table returned by run_logit ---
+    # ----- conditional-logit post-processing -----
+    from pathlib import Path
+    import pandas as pd
+    
+    out_csv = RESULTS_DIR / "table_badges.csv"
+    badge_rows = []
+    badge_table = pd.DataFrame()
+    
+    # --- DEBUG A: verify df_choice and basic variation before logit ---
+    choice_path = RESULTS_DIR / "df_choice.csv"
+    print("DEBUG choice_path_exists=", Path(choice_path).exists())
+    if Path(choice_path).exists():
+        _df_dbg = pd.read_csv(choice_path)
+        print("DEBUG rows=", len(_df_dbg))
+        print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
+        for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
+            if _c in _df_dbg.columns:
+                try:
+                    _u = int(_df_dbg[_c].nunique(dropna=False))
+                except Exception:
+                    _u = "NA"
+                print(f"DEBUG {_c}_unique=", _u)
+    
+    import logit_badges
+    print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
+    
+    def _has_nonempty_file(p: Path) -> bool:
         try:
-            print("DEBUG badge_table_shape=", tuple(badge_table.shape))
-            print("DEBUG badge_table_cols=", list(badge_table.columns))
-            print("DEBUG badge_table_head=\n" + badge_table.head(10).to_string(index=False))
-        except Exception as _e_dbg:
-            print("DEBUG badge_table_print_error=", repr(_e_dbg))
-
-        if "badge" in badge_table.columns and not badge_table.empty:
-            badge_rows = badge_table.to_dict("records")
-            badge_table.to_csv(out_csv, index=False)
-        else:
+            return p.exists() and p.stat().st_size > 0
+        except Exception:
+            return False
+    
+    if _has_nonempty_file(choice_path):
+        try:
+            bt = logit_badges.run_logit(choice_path, badges)
+            if isinstance(bt, pd.DataFrame):
+                badge_table = bt
+            elif isinstance(bt, list):
+                badge_table = pd.DataFrame(bt)
+            else:
+                badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+    
+            # --- DEBUG B: inspect the table returned by run_logit ---
+            try:
+                print("DEBUG badge_table_shape=", tuple(badge_table.shape))
+                print("DEBUG badge_table_cols=", list(badge_table.columns))
+                print("DEBUG badge_table_head=\n" + badge_table.head(10).to_string(index=False))
+            except Exception as _e_dbg:
+                print("DEBUG badge_table_print_error=", repr(_e_dbg))
+    
+            if "badge" in badge_table.columns and not badge_table.empty:
+                badge_rows = badge_table.to_dict("records")
+                badge_table.to_csv(out_csv, index=False)
+            else:
+                badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+                badge_rows = []
+        except Exception as e:
+            print("[logit] skipped due to error:", repr(e), flush=True)
             badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
             badge_rows = []
-    except Exception as e:
-        print("[logit] skipped due to error:", repr(e), flush=True)
+    else:
         badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
         badge_rows = []
-else:
-    badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
-    badge_rows = []
-# ----- end post-processing -----
+    # ----- end post-processing -----
 
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
@@ -697,5 +696,6 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
