@@ -420,7 +420,30 @@ def _list_stats_files(admin_key: str):
         str(badges_effects_path) if badges_effects_path.exists() else None,
     )
 
-
+@_catch_and_report
+def preview_example(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str):
+    import uuid  # ensure in-scope
+    payload = _build_payload(
+        job_id=f"preview-{uuid.uuid4().hex[:8]}",
+        product=product_name,
+        brand=brand_name,
+        model=model_name,
+        badges=badges,
+        price=price,
+        currency=currency,
+        n_iterations=1,
+        fresh=False,
+    )
+    from agent_runner import preview_one
+    res = preview_one(payload)
+    img_html = (
+        f'<div style="margin-top:8px">'
+        f'<div style="font-weight:600;margin-bottom:6px">Example screen ({res.get("set_id","S0001")})</div>'
+        f'<img alt="Agentix example screen" src="{res.get("image_b64","")}" '
+        f'style="max-width:100%;border:1px solid #ddd;border-radius:8px" />'
+        f"</div>"
+    )
+    return img_html
 
 @_catch_and_report
 def _preview_badges_effects(admin_key: str):
@@ -591,6 +614,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
