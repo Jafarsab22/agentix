@@ -393,6 +393,7 @@ def _preview_storefront(admin_key: str, job_id: str):
 def _list_stats_files(admin_key: str):
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
         return ("Invalid or missing admin key.", None, None, None, None)
+
     res = pathlib.Path("results")
     if not res.exists():
         return ("No results/ directory yet.", None, None, None, None)
@@ -400,34 +401,25 @@ def _list_stats_files(admin_key: str):
     agg_choice = res / "df_choice.csv"
     agg_long   = res / "df_long.csv"
     agg_log    = res / "log_compare.jsonl"
+    badges_effects_path = res / "badges_effects.csv"  # single source of truth
 
-    # Consolidated badge effects file (latest export copied to results/badges_effects.csv)
-    badges_effects_path = res / "badges_effects.csv"
-    eff_dir = res / "effects"
-    if eff_dir.exists():
-        csvs = sorted(eff_dir.glob("*.csv"))
-        if csvs:
-            import shutil
-            try:
-                shutil.copyfile(csvs[-1], badges_effects_path)
-            except Exception:
-                pass
-
-    msg = []
-    if agg_choice.exists(): msg.append(f"• Found {agg_choice}")
-    if agg_long.exists():   msg.append(f"• Found {agg_long}")
-    if agg_log.exists():    msg.append(f"• Found {agg_log}")
-    if badges_effects_path.exists(): msg.append(f"• Found {badges_effects_path}")
-    if not msg:
-        msg = ["No aggregate files yet. Run a simulation first."]
+    msgs = []
+    if agg_choice.exists():        msgs.append(f"• Found {agg_choice}")
+    if agg_long.exists():          msgs.append(f"• Found {agg_long}")
+    if agg_log.exists():           msgs.append(f"• Found {agg_log}")
+    if badges_effects_path.exists():
+        msgs.append(f"• Found {badges_effects_path}")
+    if not msgs:
+        msgs = ["No aggregate files yet. Run a simulation first."]
 
     return (
-        "\n".join(msg),
+        "\n".join(msgs),
         str(agg_choice) if agg_choice.exists() else None,
         str(agg_long)   if agg_long.exists()   else None,
         str(agg_log)    if agg_log.exists()    else None,
         str(badges_effects_path) if badges_effects_path.exists() else None,
     )
+
 
 
 @_catch_and_report
@@ -585,6 +577,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
