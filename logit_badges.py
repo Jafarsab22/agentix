@@ -249,17 +249,23 @@ def _load_df(df_or_path: Union[str, Path, pd.DataFrame]) -> pd.DataFrame:
 
 
 def _coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Schema normalisation so runner/logit never disagree on column names.
+    Accept any of {"choice","chosen","picked","y"} as the outcome and map to "choice".
+    Create missing IDs; coerce lever dtypes; handle optional controls.
+    """
     df = df.copy()
-    # outcome
+
+    # --- Outcome: unify to 'choice' ---
     if "choice" not in df.columns:
-        # support legacy name "y" or "picked"
-        for cand in ["y", "picked"]:
+        for cand in ("chosen", "picked", "y"):
             if cand in df.columns:
                 df["choice"] = df[cand]
                 break
-    df["choice"] = df["choice"].astype(int)
+    if "choice" not in df.columns:
+        raise KeyError("No outcome column found. Expected one of: 'choice','chosen','picked','y'.")
+    df["choice"] = pd.to_numeric(df["choice"], errors="coerce").fillna(0).astype(int)
 
-    # ids
+    # --- IDs ---
     if "case_id" not in df.columns:
         if "set_id" in df.columns:
             df["case_id"] = df["set_id"].astype(str)
@@ -269,18 +275,18 @@ def _coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
         if "title" in df.columns:
             df["prod_id"] = df["title"].astype(str)
         else:
-            # ensure 8 alts per case still get unique prod ids
+            # ensure uniqueness within case if nothing else is available
             df["prod_id"] = df.groupby("case_id").cumcount().astype(str)
 
-    # coerce lever dtypes to ints
+    # --- Levers to int ---
     for var, _label in LEVER_VARS:
         if var in df.columns:
-            df[var] = df[var].fillna(0).astype(int)
+            df[var] = pd.to_numeric(df[var], errors="coerce").fillna(0).astype(int)
 
-    # optional controls
+    # --- Optional controls ---
     for c in ["row", "col"]:
         if c in df.columns:
-            df[c] = df[c].astype(int)
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
     for c in ["price", "ln_price"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
