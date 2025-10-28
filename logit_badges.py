@@ -1,14 +1,11 @@
-
-# logit_badges.py — Agentix v1.7 compatible
+# logit_badges.py — clean, Colab-parity implementation
 # Conditional-logit with page & product fixed effects, position controls,
-# and a robust ridge-IRLS fallback. Mirrors the Colab specification while
-# treating dark badges as separate indicators (not a single categorical).
-# Entry point: run_logit(path_or_df, selected_badges=None) → DataFrame
-# Returns compact table with columns: [badge, beta, p, sign].
+# no intercept, and a robust ridge-IRLS fallback. Dark badges are separate
+# indicators (not a single categorical). Entry point run_logit(...) returns
+# a compact table with columns: [badge, beta, p, sign]. No ellipses.
 
 from __future__ import annotations
 
-import json
 from typing import Union, List, Tuple
 from pathlib import Path
 
@@ -19,13 +16,29 @@ import patsy as pt
 from scipy.special import expit
 from scipy.stats import norm
 
-
-# ---------------------- helpers ----------------------
+# ---------------------- configuration ----------------------
 BADGE_VARS = [
     "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"
 ]
 POSITION_VARS = ["row_top", "col1", "col2", "col3"]
 
+# Pretty labels for the output table
+LABELS = {
+    "row_top": "Row 1",
+    "col1": "Column 1",
+    "col2": "Column 2",
+    "col3": "Column 3",
+    "frame": "All-in framing",
+    "assurance": "Purchase assurance",
+    "scarcity": "Scarcity tag",
+    "strike": "Strike-through tag",
+    "timer": "Countdown timer",
+    "social_proof": "Social proof",
+    "voucher": "Voucher",
+    "bundle": "Bundle",
+}
+
+# ---------------------- small utilities ----------------------
 
 def _ensure_case_and_prod(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -60,14 +73,21 @@ def _add_position_controls(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- fast ridge-IRLS (penalised Newton) ----------
+def _drop_nonvarying(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in ["frame"] + BADGE_VARS:
+        if c in df.columns and df[c].nunique(dropna=False) <= 1:
+            df = df.drop(columns=[c])
+    return df
+
+# ---------------------- ridge IRLS (fallback) ----------------------
+
 def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_iter: int = 200, tol: float = 1e-7) -> Tuple[np.ndarray, np.ndarray]:
     n, k = X.shape
     beta = np.zeros(k)
     rng = np.random.default_rng(0)
     beta += rng.normal(scale=1e-6, size=k)
     I = np.eye(k)
-
     for _ in range(max_iter):
         xb = np.clip(X @ beta, -35, 35)
         p = expit(xb)
@@ -83,7 +103,6 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_ite
             beta = beta_new
             break
         beta = beta_new
-
     xb = np.clip(X @ beta, -35, 35)
     p = expit(xb)
     W = p * (1 - p)
@@ -92,53 +111,55 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_ite
     cov = np.linalg.pinv(H)
     return beta, cov
 
+# ---------------------- data-aware formula ----------------------
 
-# ---------------- estimation core (mirrors Colab) ----------------
-def _fmla(fe_case: bool = True, fe_prod: bool = True) -> str:
-    rhs = POSITION_VARS + [
-        "frame",
-        # dark badges and other non-frame badges as separate indicators
-        "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle",
-    ]
-    if fe_case:
+def _fmla_from_df(df: pd.DataFrame, fe_case: bool = True, fe_prod: bool = True) -> str:
+    rhs = []
+    for v in POSITION_VARS:
+        if v in df.columns:
+            rhs.append(v)
+    for v in ["frame"] + BADGE_VARS:
+        if v in df.columns:
+            rhs.append(v)
+    if fe_case and "case_cat" in df.columns:
         rhs.append("C(case_cat)")
-    if fe_prod:
+    if fe_prod and "prod_cat" in df.columns:
         rhs.append("C(prod_cat)")
+    if not rhs:
+        # No regressors available: return a benign constant-less formula
+        return "chosen ~ -1 + 0"
     return "chosen ~ -1 + " + " + ".join(rhs)
 
+# ---------------------- estimators ----------------------
 
 def _fit_mle(df: pd.DataFrame, fe_case: bool = True, fe_prod: bool = True):
-    return smf.logit(_fmla(fe_case, fe_prod), data=df).fit(disp=0, maxiter=2000, method="lbfgs")
+    fmla = _fmla_from_df(df, fe_case, fe_prod)
+    return smf.logit(fmla, data=df).fit(disp=0, maxiter=2000, method="lbfgs")
 
 
 def _fit_ridge(df: pd.DataFrame, fe_case: bool = True, fe_prod: bool = True, alpha: float = 1e-2):
-    y, X = pt.dmatrices(_fmla(fe_case, fe_prod), df, return_type="dataframe")
+    fmla = _fmla_from_df(df, fe_case, fe_prod)
+    y, X = pt.dmatrices(fmla, df, return_type="dataframe")
     beta, cov = _ridge_logit_irls(y.values.ravel(), X.values, alpha=alpha)
     params = pd.Series(beta, index=X.columns)
     bse = pd.Series(np.sqrt(np.diag(cov)), index=X.columns)
     z = params / bse.replace(0, np.nan)
     pvals = pd.Series(2 * (1 - norm.cdf(np.abs(z))), index=X.columns)
-
-    class Wrap:
-        pass
-
-    w = Wrap()
-    w.params = params
-    w.bse = bse
-    w.pvalues = pvals
+    class Wrap: ...
+    w = Wrap(); w.params = params; w.bse = bse; w.pvalues = pvals
     return w
 
 
-def _estimate_slice(gslice: pd.DataFrame, n_cases: int):
-    ok = gslice.groupby("case_id").size()
-    gg = gslice[gslice["case_id"].isin(ok[ok == 8].index)].copy()
+def _estimate(df: pd.DataFrame):
+    # keep only complete 8-alternative screens
+    ok = df.groupby("case_id").size()
+    gg = df[df["case_id"].isin(ok[ok == 8].index)].copy()
     if gg.empty:
         raise RuntimeError("No complete 8-alternative screens available for estimation.")
-
     try:
         fit = _fit_mle(gg, fe_case=True, fe_prod=True)
-        se_focus = pd.Series(np.asarray(getattr(fit, "bse")).ravel(), index=list(fit.params.index))
-        if se_focus.isna().any():
+        se_ok = pd.Series(np.asarray(getattr(fit, "bse")).ravel(), index=list(fit.params.index))
+        if se_ok.isna().any():
             raise RuntimeError("MLE SE NaN")
         mode = "MLE, page+product FE"
     except Exception:
@@ -150,82 +171,67 @@ def _estimate_slice(gslice: pd.DataFrame, n_cases: int):
             mode = "Ridge-IRLS, page FE only"
     return fit, mode
 
+# ---------------------- output shaping ----------------------
 
-def _tidy_effects(fit) -> pd.DataFrame:
+def _tidy_table(fit) -> pd.DataFrame:
+    # Pull available coefficients and format a compact table
     idx = list(getattr(fit.params, "index", []))
     cs = pd.Series(np.asarray(fit.params).ravel(), index=idx)
-    bs = pd.Series(np.asarray(getattr(fit, "bse")).ravel(), index=idx)
     ps = pd.Series(np.asarray(getattr(fit, "pvalues")).ravel(), index=idx)
 
-    labels = [
-        ("Position effects", "Row 1", "row_top"),
-        ("Position effects", "Column 1", "col1"),
-        ("Position effects", "Column 2", "col2"),
-        ("Position effects", "Column 3", "col3"),
-        ("Badge/Lever effects", "All-in framing", "frame"),
-        ("Badge/Lever effects", "Purchase assurance", "assurance"),
-        ("Badge/Lever effects", "Scarcity tag", "scarcity"),
-        ("Badge/Lever effects", "Strike-through tag", "strike"),
-        ("Badge/Lever effects", "Countdown timer", "timer"),
-        ("Badge/Lever effects", "Social proof", "social_proof"),
-        ("Badge/Lever effects", "Voucher", "voucher"),
-        ("Badge/Lever effects", "Bundle", "bundle"),
-    ]
+    keys = []
+    # frame first if present
+    if "frame" in cs.index:
+        keys.append("frame")
+    # then badges in a stable order
+    for k in BADGE_VARS:
+        if k in cs.index:
+            keys.append(k)
+    # (position effects are omitted from the compact UI table)
 
     rows = []
-    for _, lab, key in labels:
-        beta = float(cs.get(key, np.nan))
-        se = float(bs.get(key, np.nan))
-        p = float(ps.get(key, np.nan))
+    for k in keys:
+        beta = float(cs.get(k, np.nan))
+        p = float(ps.get(k, np.nan))
         sign = "↑" if (p < 0.05 and beta > 0) else ("↓" if (p < 0.05 and beta < 0) else "")
-        rows.append({"badge": lab, "beta": beta, "p": p, "sign": sign})
-    return pd.DataFrame(rows)
+        rows.append({
+            "badge": LABELS.get(k, k),
+            "beta": beta,
+            "p": p,
+            "sign": sign,
+        })
+    return pd.DataFrame(rows, columns=["badge", "beta", "p", "sign"])
 
+# ---------------------- public entry point ----------------------
 
-# ---------------- public entry point ----------------
 def run_logit(path_or_df: Union[str, Path, pd.DataFrame], selected_badges: List[str] | None = None) -> pd.DataFrame:
-    """
-    Mirrors the Colab conditional-logit specification while keeping dark badges as separate indicators.
-    Behaviour:
-      • No intercept; includes page (case) and product fixed effects, and position controls.
-      • Retains frame as a separate 0/1 regressor.
-      • Treats each non-frame badge as its own indicator column (scarcity, strike, timer, etc.).
-      • Keeps only complete 8-alternative screens.
-      • Falls back to ridge-IRLS when MLE is unstable.
-    """
+    # Load
     if isinstance(path_or_df, pd.DataFrame):
         df = path_or_df.copy()
     else:
         df = pd.read_csv(path_or_df)
 
+    # Prep
     df = _ensure_case_and_prod(df)
     df = _add_position_controls(df)
 
-    # cast known binary columns to 0/1
+    # Cast binary fields to 0/1 where present
     for c in ["chosen", "frame"] + BADGE_VARS:
         if c in df.columns:
             df[c] = df[c].fillna(0).astype(int)
 
-    # categorical encodings for FE
+    # Fixed effect categories
     df["case_cat"] = df["case_id"].astype("category")
     df["prod_cat"] = df["prod_id"].astype("category")
 
-    # drop non-varying levers within the dataset
-    for b in ["frame"] + BADGE_VARS:
-        if b in df.columns and df[b].nunique(dropna=False) <= 1:
-            df.drop(columns=[b], inplace=True)
+    # Drop non-varying levers to avoid singular designs and NameErrors in patsy
+    df = _drop_nonvarying(df)
 
-    n_cases = int(df["case_id"].nunique())
-    fit, mode = _estimate_slice(df, n_cases)
-    table = _tidy_effects(fit)
+    # If nothing left to estimate besides FE/positions, return an empty badge table gracefully
+    if not any(c in df.columns for c in ["frame"] + BADGE_VARS):
+        return pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+
+    # Estimate and format
+    fit, _ = _estimate(df)
+    table = _tidy_table(fit)
     return table
-
-
-# Optional: simple CLI usage
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("csv_path", help="Path to results/df_choice.csv")
-    args = parser.parse_args()
-    t = run_logit(args.csv_path)
-    print(t.to_csv(index=False))
