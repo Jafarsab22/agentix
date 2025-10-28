@@ -78,39 +78,21 @@ class LogitResult:
     meta: Dict[str, Any]
 
 
-def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
-              selected_badges: List[str] | None = None,
-              min_cases: int = 10,
-              ridge_cutoff_cases: int = 50,
-              ridge_alpha: float = 1.0,
-              use_price: bool = False) -> pd.DataFrame:
+def run_logit(
+    df_or_path: Union[str, Path, pd.DataFrame],
+    selected_badges: List[str] | None = None,
+    min_cases: int = 10,
+    ridge_cutoff_cases: int = 50,
+    ridge_alpha: float = 1.0,
+    use_price: bool = False,
+) -> pd.DataFrame:
     """Fit the conditional logit and return a tidy effects table.
 
     Backward compatibility: the second positional argument may be a list of
     selected badge names coming from the runner UI. This function accepts that
     as ``selected_badges``. All other parameters are keyword-friendly.
-
-    Parameters
-    ----------
-    df_or_path : str | Path | DataFrame
-        Input choice data or path to CSV with one row per alternative.
-    selected_badges : list[str] | None
-        Optional subset of badges coming from the UI (e.g.,
-        ['All-in v. partitioned pricing','Assurance','Scarcity tag', ...]).
-        When provided, effects are reported only for those badges.
-    min_cases : int
-        Minimum number of complete 8-alt cases required to attempt estimation.
-    ridge_cutoff_cases : int
-        Below this number of cases, apply ridge penalisation with alpha=ridge_alpha.
-    ridge_alpha : float
-        ℓ2 penalty strength for small-N fits. Ignored when n_cases ≥ ridge_cutoff_cases.
-    use_price : bool
-        If True, include price controls [price or ln_price if available].
-
-    Returns
-    -------
-    DataFrame with at least [badge, beta, p, sign] and additional numeric columns.
     """
+    # Load and normalise data
     df = _load_df(df_or_path)
     df = _coerce_schema(df)
     df = _filter_complete_cases(df)
@@ -173,15 +155,13 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
     ridge = float(ridge_alpha) if n_cases < ridge_cutoff_cases else 0.0
 
     if ridge > 0.0:
-        # Penalised GLM via sm.GLM.fit with L2 using "normal" penalty through the fit_regularized API
-        # We fit a logistic regression with L2 penalty on all coefficients.
+        # Penalised GLM (L2) via regularized Logit
         model = sm.Logit(y, X)
-        # statsmodels regularized fit expects alpha for L1; for L2 we pass L1_wt=0.0
         res = model.fit_regularized(method="l1", alpha=ridge, L1_wt=0.0, disp=False, maxiter=1000)
         params = res.params
         # Approximate covariance by penalised Fisher info (X'WX + 2*alpha*I)^-1
-        p = res.predict()
-        W = np.asarray(p * (1 - p))
+        p_pred = res.predict()
+        W = np.asarray(p_pred * (1.0 - p_pred))
         XtW = (X.T * W)
         H = XtW @ X + 2.0 * ridge * np.eye(X.shape[1])
         cov = np.linalg.pinv(H)
@@ -200,9 +180,10 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
     out = pd.DataFrame({
         "badge_var": lever_index,
         "beta": params[lever_index].astype(float),
-        "se": se[lever_index].astype(float)
+        "se": se[lever_index].astype(float),
     })
     out["z"] = out["beta"] / out["se"]
+
     # Two-sided p-values from normal approximation
     from scipy.stats import norm
     out["p"] = 2.0 * (1.0 - norm.cdf(np.abs(out["z"])) )
@@ -224,12 +205,11 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
     out["ci_high"] = np.exp(out["beta"] + 1.96 * out["se"]) 
 
     # AME (percentage points)
-    # Predict p for each row using full model
     if ridge > 0.0:
         p_hat = res.predict()
     else:
         p_hat = res.predict(res.model.exog)
-    V = np.asarray(p_hat * (1 - p_hat))
+    V = np.asarray(p_hat * (1.0 - p_hat))
     ame = {}
     for v, _label in present:
         if v in X.columns:
@@ -237,18 +217,16 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
             ame[v] = float(100.0 * np.mean(V * beta_v))
     out["ame_pp"] = out["badge_var"].map(ame)
 
-    # Human-friendly labels and sign column
+    # Human-friendly labels and signs
     label_map = {var: label for var, label in LEVER_VARS}
     out["badge"] = out["badge_var"].map(label_map)
-    # Direction (raw) and significance-coded sign per user's reporting rule
-out["dir"] = out["beta"].apply(lambda b: "+" if b > 0 else ("-" if b < 0 else "0"))
-# 'sign' now encodes significance: 0 if p>=0.05; otherwise '+' or '-' by direction
-out["sign"] = np.where(out["p"] >= 0.05, "0", np.where(out["beta"] > 0, "+", np.where(out["beta"] < 0, "-", "0")))
+    out["dir"] = out["beta"].apply(lambda b: "+" if b > 0 else ("-" if b < 0 else "0"))
+    out["sign"] = np.where(out["p"] >= 0.05, "0", np.where(out["beta"] > 0, "+", np.where(out["beta"] < 0, "-", "0")))
 
     # Backward-compatible subset and enriched columns
     ordered_cols = [
         "badge", "beta", "p", "sign",
-        "dir", "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
+        "dir", "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score",
     ]
     out = out[ordered_cols]
 
@@ -328,6 +306,7 @@ def _filter_complete_cases(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby("case_id")
     mask = (g["choice"].transform("size") == 8) & (g["choice"].transform("sum") == 1)
     return df.loc[mask].copy()
+
 # ---------------------------------------------------------------------------
 # Runner-side helper (optional): write full effects table to CSV with metadata
 # ---------------------------------------------------------------------------
@@ -373,4 +352,3 @@ def write_badge_effects_csv(df_badges: pd.DataFrame, badges_effects_path: Union[
         df_legacy = df_badges[legacy_cols].copy()
         Path(legacy_path).parent.mkdir(parents=True, exist_ok=True)
         df_legacy.to_csv(legacy_path, index=False)
-
