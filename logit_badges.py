@@ -9,10 +9,10 @@
 import sys
 import json
 from typing import List, Tuple, Union
-
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+import pathlib as _pl
 
 # sklearn is optional
 try:
@@ -182,15 +182,14 @@ def _format_effect_rows(result: dict) -> pd.DataFrame:
 
 # ---------- NEW: wrapper expected by agent_runner.run_job_sync ----------
 
-def run_logit(path_or_df: Union[str, "pathlib.Path", pd.DataFrame], selected_badges: List[str] | None = None) -> pd.DataFrame:
-    """
-    Adapter for the runner. Accepts a CSV path or a pre-loaded DataFrame and returns
-    a compact effects table DataFrame with columns [badge, beta, p, sign].
+# --- add this to logit_badges.py ---
 
-    Behaviour:
-      • Includes 'frame' iff it varies in the data (both all-in and partitioned present).
-      • Includes only non-frame badges that exist in the DF and exhibit variance.
-      • Uses screen fixed effects via case_id when available; if missing, derives from set_id.
+def run_logit(path_or_df: Union[str, _pl.Path, pd.DataFrame], selected_badges=None) -> pd.DataFrame:
+    """
+    Adapter for agent_runner.run_job_sync.
+    Returns a compact effects table DataFrame with columns [badge, beta, p, sign].
+    Includes 'frame' only if it varies; includes only non-frame badges that exist and vary.
+    Applies screen fixed effects via 'case_id'.
     """
     # Load
     if isinstance(path_or_df, pd.DataFrame):
@@ -198,40 +197,34 @@ def run_logit(path_or_df: Union[str, "pathlib.Path", pd.DataFrame], selected_bad
     else:
         df = pd.read_csv(path_or_df)
 
-    # Ensure case_id exists for FE
+    # Ensure 'case_id' for fixed effects
     if "case_id" not in df.columns:
         if "set_id" in df.columns:
             df["case_id"] = df["set_id"].astype(str)
         else:
             df["case_id"] = "S0001"
 
-    # Keep only columns we know about + essentials
-    cols_needed = {
+    # Keep only known columns if present
+    keep_cols = [c for c in [
         "case_id", "chosen", "ln_price", "frame",
         "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"
-    } & set(df.columns)
-    keep = [
-        c for c in [
-            "case_id", "chosen", "ln_price", "frame",
-            "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"
-        ] if c in cols_needed
-    ]
-    dfm = df[keep].copy()
+    ] if c in df.columns]
+    dfm = df[keep_cols].copy()
 
-    # Drop badges that have no variance (all zeros or all ones)
-    for b in BADGE_COLS_CANON:
+    # Drop badges with no variance
+    for b in ["assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
         if b in dfm.columns and dfm[b].nunique(dropna=False) <= 1:
-            dfm = dfm.drop(columns=[b])
+            dfm.drop(columns=[b], inplace=True)
 
     # Drop frame if no variance
     if "frame" in dfm.columns and dfm["frame"].nunique(dropna=False) <= 1:
-        dfm = dfm.drop(columns=["frame"])  # no estimable frame effect in this run
+        dfm.drop(columns=["frame"], inplace=True)
 
-    # If after cleaning only price + FE remain, estimation will still run but table would be empty
+    # If only price + FE remain, result table may be empty (and that is correct)
     result = run_estimation(dfm, use_case_fe=True, ref_badge="")
-
     table = _format_effect_rows(result)
     return table
+
 
 
 def pretty_print(result: dict):
@@ -271,3 +264,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
