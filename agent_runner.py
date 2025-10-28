@@ -598,7 +598,10 @@ def run_job_sync(payload: Dict) -> Dict:
     from pathlib import Path
     import pandas as pd
     
-    out_csv = RESULTS_DIR / "table_badges.csv"
+    out_csv = RESULTS_DIR / "table_badges.csv"  # legacy 4-col file for backward compatibility
+    effects_dir = RESULTS_DIR / "effects"
+    effects_dir.mkdir(parents=True, exist_ok=True)
+    
     badge_rows = []
     badge_table = pd.DataFrame()
     
@@ -626,15 +629,14 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             return False
     
+    artifacts = {}
+    
     if _has_nonempty_file(choice_path):
         try:
-            bt = logit_badges.run_logit(choice_path, badges)
-            if isinstance(bt, pd.DataFrame):
-                badge_table = bt
-            elif isinstance(bt, list):
-                badge_table = pd.DataFrame(bt)
-            else:
-                badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
+            # badges is the list coming from the UI payload
+            badge_table = logit_badges.run_logit(choice_path, badges)
+            if not isinstance(badge_table, pd.DataFrame):
+                badge_table = pd.DataFrame(badge_table)
     
             # --- DEBUG B: inspect the table returned by run_logit ---
             try:
@@ -645,21 +647,77 @@ def run_job_sync(payload: Dict) -> Dict:
                 print("DEBUG badge_table_print_error=", repr(_e_dbg))
     
             if "badge" in badge_table.columns and not badge_table.empty:
+                # Rich effects outputs
+                effects_csv = effects_dir / f"{ts}_{job_id}_badge_effects.csv"
+                effects_html = effects_dir / f"{ts}_{job_id}_badge_effects.html"
+    
+                # Persist rich table with job metadata when helper is available
+                job_meta = {
+                    "job_id": job_id,
+                    "ts": ts,
+                    "product": category,
+                    "brand": brand,
+                    "price": price,
+                    "currency": currency,
+                    "n_iterations": n,
+                }
+    
+                try:
+                    # Preferred path using helper from logit_badges (also writes legacy file)
+                    from logit_badges import write_badge_effects_csv
+                    write_badge_effects_csv(
+                        df_badges=badge_table,
+                        badges_effects_path=effects_csv,
+                        job_meta=job_meta,
+                        include_legacy=True,
+                        legacy_path=out_csv,
+                    )
+                except Exception as _e_helper:
+                    # Fallback: write legacy and rich files directly
+                    print("DEBUG write_badge_effects_csv helper not used:", repr(_e_helper))
+                    # Legacy 4-column CSV for compatibility
+                    legacy_cols = [c for c in ["badge", "beta", "p", "sign"] if c in badge_table.columns]
+                    badge_table[legacy_cols].to_csv(out_csv, index=False)
+                    # Rich CSV: keep all known columns if present
+                    preferred_cols = [
+                        "badge", "beta", "p", "sign", "dir",
+                        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
+                    ]
+                    cols = [c for c in preferred_cols if c in badge_table.columns]
+                    df_rich = badge_table[cols].copy()
+                    # Prepend metadata
+                    for k in list(job_meta.keys())[::-1]:
+                        df_rich.insert(0, k, job_meta[k])
+                    df_rich.to_csv(effects_csv, index=False)
+    
+                # Also render quick HTML for inspection
+                try:
+                    badge_table.to_html(effects_html, index=False)
+                except Exception as _e_html:
+                    print("DEBUG effects_html_write_error=", repr(_e_html))
+    
+                # Prepare rows for API response
                 badge_rows = badge_table.to_dict("records")
-                badge_table.to_csv(out_csv, index=False)
+    
+                # Expose artifact paths
+                artifacts["effects_csv"] = str(effects_csv)
+                artifacts["effects_html"] = str(effects_html)
+                artifacts["table_badges"] = str(out_csv)
             else:
                 badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
                 badge_rows = []
+                artifacts["table_badges"] = str(out_csv)
         except Exception as e:
             print("[logit] skipped due to error:", repr(e), flush=True)
             badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
             badge_rows = []
+            artifacts["table_badges"] = str(out_csv)
     else:
         badge_table = pd.DataFrame(columns=["badge", "beta", "p", "sign"])
         badge_rows = []
+        artifacts["table_badges"] = str(out_csv)
     # ----- end post-processing -----
-
-
+    
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
     return {
         "job_id": payload.get("job_id", ""),
@@ -678,10 +736,13 @@ def run_job_sync(payload: Dict) -> Dict:
             "df_choice": str(RESULTS_DIR / "df_choice.csv"),
             "df_long": str(RESULTS_DIR / "df_long.csv"),
             "log_compare": str(RESULTS_DIR / "log_compare.jsonl"),
-            "table_badges": (str(out_csv) if badge_rows else "")
+            "table_badges": artifacts.get("table_badges", ""),
+            "effects_csv": artifacts.get("effects_csv", ""),
+            "effects_html": artifacts.get("effects_html", "")
         },
         "logit_table_rows": badge_rows
     }
+
 
 if __name__ == "__main__":
     # simple manual run driver: read jobs/*.json and process
@@ -696,6 +757,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
