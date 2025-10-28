@@ -594,40 +594,38 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             pass
 
-    # ----- conditional-logit post-processing -----
+    # ----- conditional-logit post-processing (single file: badges_effects.csv) -----
     from pathlib import Path
     from datetime import datetime
     from uuid import uuid4
     import pandas as pd
     import logit_badges
     
-    # derive stable ids for this block
+    # derive ids (local, defined)
     ts = datetime.utcnow().isoformat() + "Z"
     job_id = payload.get("job_id") or f"run-{uuid4().hex[:8]}"
     
-    # where to save
-    out_csv = RESULTS_DIR / "table_badges.csv"   # legacy 4-col file
-    effects_dir = RESULTS_DIR / "effects"
-    effects_dir.mkdir(parents=True, exist_ok=True)
+    # paths
+    effects_path = RESULTS_DIR / "badges_effects.csv"   # the ONE file we will write/use
+    effects_path.parent.mkdir(parents=True, exist_ok=True)
     
     badge_rows = []
     badge_table = pd.DataFrame()
     artifacts = {}
     
-    # --- DEBUG A: verify df_choice and variation ---
+    # sanity/debug
     choice_path = RESULTS_DIR / "df_choice.csv"
-    print("DEBUG choice_path_exists=", Path(choice_path).exists())
-    if Path(choice_path).exists():
+    print("DEBUG choice_path_exists=", choice_path.exists())
+    if choice_path.exists():
         _df_dbg = pd.read_csv(choice_path)
         print("DEBUG rows=", len(_df_dbg))
         print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
         for _c in ["frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle"]:
             if _c in _df_dbg.columns:
                 try:
-                    _u = int(_df_dbg[_c].nunique(dropna=False))
+                    print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
                 except Exception:
-                    _u = "NA"
-                print(f"DEBUG {_c}_unique=", _u)
+                    print(f"DEBUG {_c}_unique= NA")
     
     print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
     
@@ -639,79 +637,53 @@ def run_job_sync(payload: Dict) -> Dict:
     
     if _has_nonempty_file(choice_path):
         try:
-            # badges: list from UI payload
+            # run the model (accepts the UI badge list as 2nd positional arg)
             badge_table = logit_badges.run_logit(choice_path, badges)
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
     
-            # DEBUG B
-            try:
-                print("DEBUG badge_table_shape=", tuple(badge_table.shape))
-                print("DEBUG badge_table_cols=", list(badge_table.columns))
-                print("DEBUG badge_table_head=\n" + badge_table.head(10).to_string(index=False))
-            except Exception as _e_dbg:
-                print("DEBUG badge_table_print_error=", repr(_e_dbg))
+            print("DEBUG badge_table_shape=", tuple(badge_table.shape))
+            print("DEBUG badge_table_cols=", list(badge_table.columns))
     
             if "badge" in badge_table.columns and not badge_table.empty:
-                # Always write legacy file for compatibility
-                legacy_cols = [c for c in ["badge","beta","p","sign"] if c in badge_table.columns]
-                badge_table[legacy_cols].to_csv(out_csv, index=False)
+                # preferred rich columns; keep only those that exist
+                pref_cols = [
+                    "badge","beta","p","sign","dir",
+                    "se","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score"
+                ]
+                cols = [c for c in pref_cols if c in badge_table.columns]
+                df_rich = badge_table[cols].copy()
     
-                # Write rich effects file (prefer helper; else fallback)
-                effects_csv = effects_dir / f"{ts}_{job_id}_badge_effects.csv"
-                effects_html = effects_dir / f"{ts}_{job_id}_badge_effects.html"
-    
+                # prepend metadata columns (stable order)
                 job_meta = {
                     "job_id": job_id,
-                    "ts": ts,
+                    "timestamp": ts,
                     "product": category,
                     "brand": brand,
+                    "model": ui_label,      # or another model string you track
                     "price": price,
                     "currency": currency,
-                    "n_iterations": n,
+                    "n_iteration": n,       # keeping your existing naming
                 }
+                for k in list(job_meta.keys())[::-1]:
+                    df_rich.insert(0, k, job_meta[k])
     
-                try:
-                    from logit_badges import write_badge_effects_csv
-                    write_badge_effects_csv(
-                        df_badges=badge_table,
-                        badges_effects_path=effects_csv,
-                        job_meta=job_meta,
-                        include_legacy=False,   # already wrote legacy above
-                    )
-                except Exception as _e_helper:
-                    print("DEBUG write_badge_effects_csv helper not used:", repr(_e_helper))
-                    preferred_cols = [
-                        "badge","beta","p","sign","dir",
-                        "se","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score",
-                    ]
-                    cols = [c for c in preferred_cols if c in badge_table.columns]
-                    df_rich = badge_table[cols].copy()
-                    # prepend metadata
-                    for k in list(job_meta.keys())[::-1]:
-                        df_rich.insert(0, k, job_meta[k])
-                    df_rich.to_csv(effects_csv, index=False)
+                # write the ONE file (UTF-8 BOM so Excel shows £)
+                df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
     
-                # Optional HTML for quick viewing
-                try:
-                    badge_table.to_html(effects_html, index=False)
-                except Exception as _e_html:
-                    print("DEBUG effects_html_write_error=", repr(_e_html))
-    
+                # rows for JSON response
                 badge_rows = badge_table.to_dict("records")
-                artifacts["effects_csv"]  = str(effects_csv)
-                artifacts["effects_html"] = str(effects_html)
     
+                # all artifact keys point to the same single file for compatibility
+                artifacts["badges_effects"] = str(effects_path)
+                artifacts["effects_csv"] = str(effects_path)
+                artifacts["table_badges"] = str(effects_path)
             else:
                 print("DEBUG empty_or_missing_badge_table")
         except Exception as e:
             print("[logit] skipped due to error:", repr(e), flush=True)
     else:
         print("DEBUG choice file missing or empty")
-    
-    # table_badges artifact: publish the path if the legacy file exists
-    artifacts["table_badges"] = str(out_csv) if out_csv.exists() else ""
-    
     # ----- end post-processing -----
     
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
@@ -732,12 +704,15 @@ def run_job_sync(payload: Dict) -> Dict:
             "df_choice": str(RESULTS_DIR / "df_choice.csv"),
             "df_long": str(RESULTS_DIR / "df_long.csv"),
             "log_compare": str(RESULTS_DIR / "log_compare.jsonl"),
-            "table_badges": artifacts.get("table_badges", ""),
+            # single place to read from:
+            "badges_effects": artifacts.get("badges_effects", ""),
+            # compatibility keys mapped to the same file:
             "effects_csv": artifacts.get("effects_csv", ""),
-            "effects_html": artifacts.get("effects_html", "")
+            "table_badges": artifacts.get("table_badges", "")
         },
         "logit_table_rows": badge_rows
     }
+
 
 
 if __name__ == "__main__":
@@ -753,6 +728,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
