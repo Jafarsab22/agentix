@@ -423,28 +423,32 @@ def _list_stats_files(admin_key: str):
 
 
 @_catch_and_report
-def preview_example(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str):
-    payload = _build_payload(
-        job_id=f"preview-{uuid.uuid4().hex[:8]}",
-        product=product_name,
-        brand=brand_name,
-        model=model_name,
-        badges=badges,
-        price=price,
-        currency=currency,
-        n_iterations=1,
-        fresh=False,
-    )
-    from agent_runner import preview_one
-    res = preview_one(payload)
-    img_html = (
-        f'<div style="margin-top:8px">'
-        f'<div style="font-weight:600;margin-bottom:6px">Example screen ({res.get("set_id","S0001")})</div>'
-        f'<img alt="Agentix example screen" src="{res.get("image_b64","")}" '
-        f'style="max-width:100%;border:1px solid #ddd;border-radius:8px" />'
-        f"</div>"
-    )
-    return img_html
+def _preview_badges_effects(admin_key: str):
+    """Render results/badges_effects.csv as an HTML table for quick inspection."""
+    if not ADMIN_KEY or admin_key != ADMIN_KEY:
+        return "<p>Invalid or missing admin key.</p>"
+
+    import pandas as pd
+    path = pathlib.Path("results") / "badges_effects.csv"
+    if not path.exists():
+        return "<p>No badges_effects.csv yet. Run a simulation first.</p>"
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return f"<p>Could not read {path}: {e}</p>"
+
+    # Keep a slim view for the UI, but the CSV on disk still has all rich fields
+    view_cols = [c for c in ["badge", "beta", "p", "sign"] if c in df.columns]
+    if not view_cols:
+        # Fallback to all columns if expected ones aren’t present
+        view_cols = list(df.columns)
+
+    # Build a compact HTML table (works with Gradio HTML/Markdown)
+    # Escape is not required here because pandas handles HTML.
+    html = df[view_cols].to_html(index=False, border=1, justify="center")
+    return html
+
 
 
 # ---------- UI logic for Automatic / Manual iterations ----------
@@ -567,6 +571,16 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     stats_long = gr.File(label="df_long.csv")
     stats_log = gr.File(label="log_compare.jsonl")
     stats_badges = gr.File(label="badges_effects.csv")  # shows latest effects export
+    
+    # Preview of badges_effects.csv inside the app
+    stats_badges_preview_btn = gr.Button("Preview badges_effects table")
+    stats_badges_preview_html = gr.HTML(label="badges_effects preview")
+    
+    stats_badges_preview_btn.click(
+        _preview_badges_effects,
+        inputs=[admin_key_in],
+        outputs=[stats_badges_preview_html],
+    )
 
     stats_refresh.click(
         _list_stats_files,
@@ -577,6 +591,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
