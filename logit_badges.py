@@ -240,12 +240,15 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
     # Human-friendly labels and sign column
     label_map = {var: label for var, label in LEVER_VARS}
     out["badge"] = out["badge_var"].map(label_map)
-    out["sign"] = out["beta"].apply(lambda b: "+" if b > 0 else ("-" if b < 0 else "0"))
+    # Direction (raw) and significance-coded sign per user's reporting rule
+out["dir"] = out["beta"].apply(lambda b: "+" if b > 0 else ("-" if b < 0 else "0"))
+# 'sign' now encodes significance: 0 if p>=0.05; otherwise '+' or '-' by direction
+out["sign"] = np.where(out["p"] >= 0.05, "0", np.where(out["beta"] > 0, "+", np.where(out["beta"] < 0, "-", "0")))
 
     # Backward-compatible subset and enriched columns
     ordered_cols = [
         "badge", "beta", "p", "sign",
-        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
+        "dir", "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
     ]
     out = out[ordered_cols]
 
@@ -325,3 +328,49 @@ def _filter_complete_cases(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby("case_id")
     mask = (g["choice"].transform("size") == 8) & (g["choice"].transform("sum") == 1)
     return df.loc[mask].copy()
+# ---------------------------------------------------------------------------
+# Runner-side helper (optional): write full effects table to CSV with metadata
+# ---------------------------------------------------------------------------
+
+def write_badge_effects_csv(df_badges: pd.DataFrame, badges_effects_path: Union[str, Path], job_meta: Dict[str, Any], include_legacy: bool = True, legacy_path: Union[str, Path] | None = None) -> None:
+    """Persist the full effects table plus job metadata.
+
+    Parameters
+    ----------
+    df_badges : DataFrame
+        Output of run_logit(...).
+    badges_effects_path : str | Path
+        Destination CSV for the rich effects table.
+    job_meta : dict
+        Keys you want to prepend as columns (e.g., job_id, timestamp, product, brand, price, currency, n_iterations).
+    include_legacy : bool
+        If True, also write a legacy 4-column CSV to legacy_path (or alongside if provided).
+    legacy_path : str | Path | None
+        Destination for the legacy file (badge,beta,p,sign). Required if include_legacy is True.
+    """
+    badges_effects_path = Path(badges_effects_path)
+    if include_legacy and legacy_path is None:
+        raise ValueError("legacy_path must be provided when include_legacy=True")
+
+    # Preferred column order; keep whatever is present
+    pref = [
+        "badge", "beta", "p", "sign", "dir",
+        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
+    ]
+    cols = [c for c in pref if c in df_badges.columns]
+    df_out = df_badges[cols].copy()
+
+    # Prepend metadata columns in a stable order
+    meta_keys = list(job_meta.keys())
+    for k in meta_keys[::-1]:
+        df_out.insert(0, k, job_meta[k])
+
+    badges_effects_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(badges_effects_path, index=False)
+
+    if include_legacy:
+        legacy_cols = [c for c in ["badge", "beta", "p", "sign"] if c in df_badges.columns]
+        df_legacy = df_badges[legacy_cols].copy()
+        Path(legacy_path).parent.mkdir(parents=True, exist_ok=True)
+        df_legacy.to_csv(legacy_path, index=False)
+
