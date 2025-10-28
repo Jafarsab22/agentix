@@ -1,3 +1,4 @@
+
 # logit_badges.py — Agentix v1.7 compatible
 # Conditional-logit with page & product fixed effects, position controls,
 # and a robust ridge-IRLS fallback. Mirrors the Colab specification while
@@ -5,8 +6,11 @@
 # Entry point: run_logit(path_or_df, selected_badges=None) → DataFrame
 # Returns compact table with columns: [badge, beta, p, sign].
 
+from __future__ import annotations
+
 import json
-from typing import Union, Tuple, Dict, List
+from typing import Union, List, Tuple
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,21 +19,12 @@ import patsy as pt
 from scipy.special import expit
 from scipy.stats import norm
 
+
 # ---------------------- helpers ----------------------
 BADGE_VARS = [
     "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"
 ]
 POSITION_VARS = ["row_top", "col1", "col2", "col3"]
-
-
-def _stars(p: float) -> str:
-    if p < 0.001:
-        return "***"
-    if p < 0.01:
-        return "**"
-    if p < 0.05:
-        return "*"
-    return ""
 
 
 def _ensure_case_and_prod(df: pd.DataFrame) -> pd.DataFrame:
@@ -39,7 +34,6 @@ def _ensure_case_and_prod(df: pd.DataFrame) -> pd.DataFrame:
             df["case_id"] = df["set_id"].astype(str)
         else:
             df["case_id"] = "S0001"
-    # product id proxy
     if "prod_id" not in df.columns:
         if "title" in df.columns:
             df["prod_id"] = df["title"].astype(str)
@@ -60,13 +54,14 @@ def _add_position_controls(df: pd.DataFrame) -> pd.DataFrame:
         df["col2"] = (df["col"] == 1).astype(int)
         df["col3"] = (df["col"] == 2).astype(int)
     else:
-        df["col1"] = df["col2"] = df["col3"] = 0
+        df["col1"] = 0
+        df["col2"] = 0
+        df["col3"] = 0
     return df
 
 
 # ---------- fast ridge-IRLS (penalised Newton) ----------
-
-def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_iter: int = 200, tol: float = 1e-7):
+def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_iter: int = 200, tol: float = 1e-7) -> Tuple[np.ndarray, np.ndarray]:
     n, k = X.shape
     beta = np.zeros(k)
     rng = np.random.default_rng(0)
@@ -77,14 +72,14 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_ite
         xb = np.clip(X @ beta, -35, 35)
         p = expit(xb)
         W = p * (1 - p)
-        if np.max(W) < 1e-12:
+        if float(np.max(W)) < 1e-12:
             break
         z = xb + (y - p) / np.maximum(W, 1e-12)
         Xw = X * W[:, None]
         H = X.T @ Xw + 2.0 * alpha * I
         g = X.T @ (W * z)
         beta_new = np.linalg.pinv(H) @ g
-        if np.linalg.norm(beta_new - beta, ord=np.inf) < tol:
+        if float(np.linalg.norm(beta_new - beta, ord=np.inf)) < tol:
             beta = beta_new
             break
         beta = beta_new
@@ -99,7 +94,6 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_ite
 
 
 # ---------------- estimation core (mirrors Colab) ----------------
-
 def _fmla(fe_case: bool = True, fe_prod: bool = True) -> str:
     rhs = POSITION_VARS + [
         "frame",
@@ -124,19 +118,23 @@ def _fit_ridge(df: pd.DataFrame, fe_case: bool = True, fe_prod: bool = True, alp
     bse = pd.Series(np.sqrt(np.diag(cov)), index=X.columns)
     z = params / bse.replace(0, np.nan)
     pvals = pd.Series(2 * (1 - norm.cdf(np.abs(z))), index=X.columns)
-    class Wrap: ...
-    w = Wrap(); w.params = params; w.bse = bse; w.pvalues = pvals
+
+    class Wrap:
+        pass
+
+    w = Wrap()
+    w.params = params
+    w.bse = bse
+    w.pvalues = pvals
     return w
 
 
 def _estimate_slice(gslice: pd.DataFrame, n_cases: int):
-    # keep only complete 8-alternative screens
     ok = gslice.groupby("case_id").size()
     gg = gslice[gslice["case_id"].isin(ok[ok == 8].index)].copy()
     if gg.empty:
         raise RuntimeError("No complete 8-alternative screens available for estimation.")
 
-    # prefer MLE; fall back to ridge with same FE structure; last resort: page FE only
     try:
         fit = _fit_mle(gg, fe_case=True, fe_prod=True)
         se_focus = pd.Series(np.asarray(getattr(fit, "bse")).ravel(), index=list(fit.params.index))
@@ -175,7 +173,7 @@ def _tidy_effects(fit) -> pd.DataFrame:
     ]
 
     rows = []
-    for grp, lab, key in labels:
+    for _, lab, key in labels:
         beta = float(cs.get(key, np.nan))
         se = float(bs.get(key, np.nan))
         p = float(ps.get(key, np.nan))
@@ -185,9 +183,9 @@ def _tidy_effects(fit) -> pd.DataFrame:
 
 
 # ---------------- public entry point ----------------
-
-def run_logit(path_or_df: Union[str, "pathlib.Path", pd.DataFrame], selected_badges: List[str] | None = None) -> pd.DataFrame:
-    """Mirrors the Colab conditional-logit specification while keeping dark badges as separate indicators.
+def run_logit(path_or_df: Union[str, Path, pd.DataFrame], selected_badges: List[str] | None = None) -> pd.DataFrame:
+    """
+    Mirrors the Colab conditional-logit specification while keeping dark badges as separate indicators.
     Behaviour:
       • No intercept; includes page (case) and product fixed effects, and position controls.
       • Retains frame as a separate 0/1 regressor.
@@ -195,7 +193,6 @@ def run_logit(path_or_df: Union[str, "pathlib.Path", pd.DataFrame], selected_bad
       • Keeps only complete 8-alternative screens.
       • Falls back to ridge-IRLS when MLE is unstable.
     """
-    # load
     if isinstance(path_or_df, pd.DataFrame):
         df = path_or_df.copy()
     else:
@@ -218,7 +215,17 @@ def run_logit(path_or_df: Union[str, "pathlib.Path", pd.DataFrame], selected_bad
         if b in df.columns and df[b].nunique(dropna=False) <= 1:
             df.drop(columns=[b], inplace=True)
 
-    n_cases = df["case_id"].nunique()
+    n_cases = int(df["case_id"].nunique())
     fit, mode = _estimate_slice(df, n_cases)
     table = _tidy_effects(fit)
     return table
+
+
+# Optional: simple CLI usage
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("csv_path", help="Path to results/df_choice.csv")
+    args = parser.parse_args()
+    t = run_logit(args.csv_path)
+    print(t.to_csv(index=False))
