@@ -79,16 +79,25 @@ class LogitResult:
 
 
 def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
+              selected_badges: List[str] | None = None,
               min_cases: int = 10,
               ridge_cutoff_cases: int = 50,
               ridge_alpha: float = 1.0,
               use_price: bool = False) -> pd.DataFrame:
     """Fit the conditional logit and return a tidy effects table.
 
+    Backward compatibility: the second positional argument may be a list of
+    selected badge names coming from the runner UI. This function accepts that
+    as ``selected_badges``. All other parameters are keyword-friendly.
+
     Parameters
     ----------
     df_or_path : str | Path | DataFrame
         Input choice data or path to CSV with one row per alternative.
+    selected_badges : list[str] | None
+        Optional subset of badges coming from the UI (e.g.,
+        ['All-in v. partitioned pricing','Assurance','Scarcity tag', ...]).
+        When provided, effects are reported only for those badges.
     min_cases : int
         Minimum number of complete 8-alt cases required to attempt estimation.
     ridge_cutoff_cases : int
@@ -107,15 +116,34 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
     df = _filter_complete_cases(df)
 
     n_cases = df["case_id"].nunique()
-    meta: Dict[str, Any] = {"n_rows": int(df.shape[0]), "n_cases": int(n_cases)}
+
+    # Map UI names → canonical labels used in LEVER_VARS
+    ui_to_label = {
+        "All-in v. partitioned pricing": "All-in framing",
+        "All-in framing": "All-in framing",
+        "Assurance": "Purchase assurance",
+        "Purchase assurance": "Purchase assurance",
+        "Scarcity": "Scarcity tag",
+        "Scarcity tag": "Scarcity tag",
+        "Strike-through": "Strike-through tag",
+        "Strike-through tag": "Strike-through tag",
+        "Timer": "Countdown timer",
+        "Countdown timer": "Countdown timer",
+        "Social proof": "Social proof",
+        "Voucher": "Voucher",
+        "Bundle": "Bundle",
+    }
 
     # Identify varying levers
-    present = []
+    present: List[Tuple[str, str]] = []
     for var, label in LEVER_VARS:
         if var in df.columns and df[var].nunique() > 1:
             present.append((var, label))
-    meta["varying_levers"] = [label for _, label in present]
-    meta["dropped_levers"] = [label for var, label in LEVER_VARS if (var, label) not in present]
+
+    # Optional filtering by selected_badges from UI
+    if selected_badges:
+        want_labels = {ui_to_label.get(s, s) for s in selected_badges}
+        present = [(v, lbl) for (v, lbl) in present if lbl in want_labels]
 
     if n_cases < min_cases or len(present) == 0:
         return _empty_table()
@@ -224,8 +252,6 @@ def run_logit(df_or_path: Union[str, Path, pd.DataFrame],
     # Stable sort by badge label for predictable tables
     out = out.sort_values("badge").reset_index(drop=True)
 
-    # You can uncomment the return of LogitResult if the caller wants meta as well
-    # return LogitResult(table=out, meta=meta)
     return out
 
 # ---------------------------------------------------------------------------
