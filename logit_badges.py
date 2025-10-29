@@ -61,11 +61,11 @@
 # Badges: frame, assurance, scarcity, strike, timer, social_proof, voucher, bundle
 # ================================================================
 
+
 from __future__ import annotations
 
 import argparse
 import sys
-import math
 from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
@@ -73,176 +73,110 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.stats.multitest import multipletests
 
-# Fixed list of badge columns present in your file
 BADGE_VARS: List[str] = [
     "frame", "assurance", "scarcity", "strike",
     "timer", "social_proof", "voucher", "bundle"
 ]
 
-
 # -----------------------
-# I/O helpers (minimal)
+# I/O helpers
 # -----------------------
 
-def _load_df(df_or_path):
+def _load_df(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]]) -> pd.DataFrame:
     """
-    Accept:
-      - pandas.DataFrame
-      - str / pathlib.Path to CSV/TXT/Parquet/JSON
-      - dict payloads (e.g., the app's 'payload') with a path under common keys,
-        including nested structures (choice_path, path, file, csv, data, paths.choice, etc.)
-      - file-like objects and raw CSV bytes
-
-    Returns a pandas DataFrame or raises a clear error.
+    Accept a pandas DataFrame, a string path to CSV/TXT,
+    or a dict payload with 'choice_path'.
     """
-    import pathlib, io, json
-
-    # 1) Already a DataFrame
     if isinstance(df_or_path, pd.DataFrame):
         return df_or_path.copy()
 
-    # 2) String/Path
-    if isinstance(df_or_path, (str, pathlib.Path)):
-        p = pathlib.Path(str(df_or_path))
-        if not p.exists():
-            raise FileNotFoundError(f"Choice file not found: {p}")
-        suf = p.suffix.lower()
-        if suf in {".csv", ".txt"}:
-            return pd.read_csv(p)
-        if suf in {".parquet"}:
-            return pd.read_parquet(p)
-        if suf in {".json"}:
-            return pd.read_json(p)
-        # default fallback: try CSV
-        return pd.read_csv(p)
-
-    # 3) Dict payloads (common in the app)
     if isinstance(df_or_path, dict):
-        # direct keys first
-        direct_keys = ("choice_path", "path", "file", "csv")
-        for k in direct_keys:
-            v = df_or_path.get(k)
-            if isinstance(v, (str, pathlib.Path)):
-                return _load_df(v)
-        # nested common structures, e.g., payload["paths"]["choice"]
-        for k in ("paths", "files", "data"):
-            v = df_or_path.get(k)
-            if isinstance(v, dict):
-                for kk in ("choice", "choices", "path", "file", "csv"):
-                    vv = v.get(kk)
-                    if isinstance(vv, (str, pathlib.Path)):
-                        return _load_df(vv)
-        # if dict looks like column→list mapping, try building a DataFrame
-        try:
-            return pd.DataFrame(df_or_path)
-        except Exception:
-            pass
+        cp = df_or_path.get("choice_path")
+        if isinstance(cp, str) and cp:
+            return pd.read_csv(cp)
+        raise TypeError("run_logit expects a DataFrame, a CSV path, or a dict with 'choice_path'.")
 
-    # 4) File-like
-    if hasattr(df_or_path, "read"):
-        try:
-            return pd.read_csv(df_or_path)
-        except Exception:
-            try:
-                df_or_path.seek(0)
-            except Exception:
-                pass
-            return pd.read_json(df_or_path)
+    if isinstance(df_or_path, str):
+        return pd.read_csv(df_or_path)
 
-    # 5) Raw bytes
-    if isinstance(df_or_path, (bytes, bytearray)):
-        bio = io.BytesIO(df_or_path)
-        try:
-            return pd.read_csv(bio)
-        except Exception:
-            bio.seek(0)
-            return pd.read_json(bio)
-
-    raise TypeError("run_logit could not find a choice file: pass a DataFrame, a file path, or a payload dict containing it.")
+    raise TypeError("Unsupported input to run_logit.")
 
 # -----------------------
 # Schema + feature prep
 # -----------------------
 
 def _rename_core_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enforce the exact schema mapping you confirmed:
-      case_id -> screen_id
-      title   -> product
-    """
-    df = df.copy()
-    df = df.rename(columns={"case_id": "screen_id", "title": "product"})
-    return df
-
+    """Map your confirmed headers to internal names."""
+    return df.rename(columns={"case_id": "screen_id", "title": "product"})
 
 def _ensure_required_columns(df: pd.DataFrame) -> None:
     required = ["screen_id", "product", "chosen", "price"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise KeyError(
-            f"Missing required columns: {missing}. "
-            f"Available columns: {list(df.columns)}"
-        )
-
+        raise KeyError(f"Missing required columns: {missing}. Available: {list(df.columns)}")
 
 def _make_position_dummies(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Use existing row_top, col1–col3 when present; else derive from row/col.
-    Baseline: bottom row, 4th column (index 3).
-    """
+    """Use existing row_top, col1–col3 if present; else derive from row/col (baseline: bottom row, 4th col)."""
     df = df.copy()
     if "row_top" not in df.columns and "row" in df.columns:
         df["row_top"] = (pd.to_numeric(df["row"], errors="coerce").fillna(1).astype(int) == 0).astype(int)
-
     if not all(c in df.columns for c in ["col1", "col2", "col3"]) and "col" in df.columns:
         ci = pd.to_numeric(df["col"], errors="coerce").fillna(3).astype(int)
-        if "col1" not in df.columns:
-            df["col1"] = (ci == 0).astype(int)
-        if "col2" not in df.columns:
-            df["col2"] = (ci == 1).astype(int)
-        if "col3" not in df.columns:
-            df["col3"] = (ci == 2).astype(int)
+        if "col1" not in df.columns: df["col1"] = (ci == 0).astype(int)
+        if "col2" not in df.columns: df["col2"] = (ci == 1).astype(int)
+        if "col3" not in df.columns: df["col3"] = (ci == 2).astype(int)
     return df
-
 
 def _make_logs(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure ln_price exists; keep existing ln_price if already in the file.
-    Optionally create ln_reviews if reviews present (not required here).
-    """
+    """Ensure ln_price exists; keep file-supplied ln_price if already present."""
     df = df.copy()
-    if (pd.to_numeric(df["price"], errors="coerce") <= 0).any():
+    price_num = pd.to_numeric(df["price"], errors="coerce")
+    if (price_num <= 0).any():
         raise ValueError("Found non-positive prices; ln(price) undefined.")
     if "ln_price" not in df.columns:
-        df["ln_price"] = np.log(pd.to_numeric(df["price"], errors="coerce"))
+        df["ln_price"] = np.log(price_num)
     return df
 
-
 def _collect_badge_columns(df: pd.DataFrame) -> List[str]:
-    """Return only the badge columns that exist and vary."""
-    cols = []
-    for c in BADGE_VARS:
-        if c in df.columns and df[c].nunique() > 1:
-            cols.append(c)
+    """Return badge columns that exist and vary (at least 2 distinct values)."""
+    cols = [c for c in BADGE_VARS if c in df.columns and df[c].nunique(dropna=True) > 1]
     return cols
 
+# -----------------------
+# Matrix sanitisation
+# -----------------------
+
+def _drop_constant_cols(X: pd.DataFrame) -> pd.DataFrame:
+    """Drop columns with zero variance (constant), which break estimation and inflate rank."""
+    nun = X.nunique(dropna=False)
+    keep = nun[nun > 1].index.tolist()
+    return X[keep].copy()
+
+def _coerce_numeric(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coerce every column to numeric float:
+      - convert non-numeric to NaN then fill with 0
+      - cast to float64
+    This prevents 'Pandas data cast to numpy dtype of object' errors in statsmodels.
+    """
+    Xn = X.apply(pd.to_numeric, errors="coerce")
+    Xn = Xn.fillna(0.0)
+    return Xn.astype("float64")
 
 def _build_design(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame, pd.Series, List[str]]:
     """
     Build y, X with absorbed fixed effects for screen_id and product.
-    Returns: y, X, clusters (screen_id), list_of_predictor_names_in_order
+    Returns: y, X (float64), clusters (screen_id), list_of_predictor_names_in_order
     """
     df = df.copy()
 
-    # levers (order matters only for display later)
+    # levers: position first, then ln_price, then optional attributes
     lever_cols: List[str] = []
     for c in ["row_top", "col1", "col2", "col3"]:
         if c in df.columns:
             lever_cols.append(c)
     if "ln_price" in df.columns:
         lever_cols.append("ln_price")
-
-    # optional attributes if present (kept minimal by request)
     for opt in ["rating", "ln_reviews"]:
         if opt in df.columns:
             lever_cols.append(opt)
@@ -250,14 +184,13 @@ def _build_design(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame, pd.Series,
     # badges
     badge_cols = _collect_badge_columns(df)
 
-    # model dummies (no interactions unless you explicitly want them)
+    # model dummies (no interactions here)
     model_cols: List[str] = []
     if "model" in df.columns:
         dummies = pd.get_dummies(df["model"], prefix="model", drop_first=True)
         df = pd.concat([df, dummies], axis=1)
         model_cols = list(dummies.columns)
 
-    # cluster unit
     clusters = df["screen_id"].astype(str)
 
     # absorb FE via dummies (no intercept)
@@ -268,10 +201,15 @@ def _build_design(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame, pd.Series,
 
     x_vars_existing = [c for c in x_vars if c in df_fe.columns]
     X = df_fe[x_vars_existing + fe_cols]
-    y = df_fe["chosen"].astype(int)
+
+    # sanitise X to avoid object dtype
+    X = _drop_constant_cols(X)
+    X = _coerce_numeric(X)
+
+    # dependent
+    y = pd.to_numeric(df_fe["chosen"], errors="coerce").fillna(0).astype(int)
 
     return y, X, clusters, x_vars_existing
-
 
 # -----------------------
 # Estimation + output
@@ -315,7 +253,6 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series) -> pd
         "evid_score": evid_score
     })
     return out
-
 
 def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -374,20 +311,25 @@ def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
     rows.sort(key=lambda r: str(r.get("badge", "")))
     return rows
 
-
 # -----------------------
 # Public API for the app
 # -----------------------
 
 def run_logit(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]],
               selected_badges: List[str] | None = None,
-              min_cases: int = 2,  # was 5/10; allow small pilot runs
+              min_cases: int = 2,
               use_price: bool = True) -> List[Dict[str, Any]]:
+    """
+    App-facing API. Returns list[dict] for the 'Badge Effects' table.
+    """
     df = _load_df(df_or_path)
     df = _rename_core_columns(df)
     _ensure_required_columns(df)
+
+    # Basic cleaning and typing
     df = df.dropna(subset=["chosen", "screen_id", "product", "price"]).copy()
     df["chosen"] = pd.to_numeric(df["chosen"], errors="coerce").fillna(0).astype(int)
+
     df = _make_position_dummies(df)
     df = _make_logs(df)
 
@@ -409,14 +351,14 @@ def run_logit(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]],
     return rows
 
 # -----------------------
-# CLI entrypoint (optional)
+# CLI entrypoint
 # -----------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Conditional (FE) logit for AI-agent readiness.")
     parser.add_argument("--input", type=str, default="ai_agent_choices.csv", help="Input CSV with choices.")
     parser.add_argument("--output", type=str, default="logit_readiness_results.csv", help="Output CSV for tidy results.")
-    parser.add_argument("--min_screens", type=int, default=5, help="Minimum number of screens required to proceed.")
+    parser.add_argument("--min_screens", type=int, default=2, help="Minimum number of screens required to proceed.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.input)
@@ -440,14 +382,11 @@ def main():
     results = fit_logit_and_tidy(y, X, clusters)
     results.round(6).to_csv(args.output, index=True)
 
-    # Console summary for common levers, if present
+    # Console summary for common levers
     show_keys = []
-    for v in ["row_top", "col1", "col2", "col3", "ln_price"]:
+    for v in ["row_top", "col1", "col2", "col3", "ln_price"] + BADGE_VARS:
         if v in results.index:
             show_keys.append(v)
-    for b in BADGE_VARS:
-        if b in results.index:
-            show_keys.append(b)
 
     print("Model fitted and results written to", args.output)
     if show_keys:
@@ -458,4 +397,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
