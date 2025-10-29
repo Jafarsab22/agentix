@@ -170,6 +170,47 @@ def _assign_frame_for_card(i: int, set_id: str, seeds: Seeds, mode: str) -> tupl
     v = pattern[i % 8]
     return (1, 0) if v == 1 else (0, 1)
 
+def _balanced_badge_assignments(enabled_nonframes: list[str], seeds: Seeds, set_id: str) -> list[str]:
+    """
+    Deterministically allocate the 8 cards across the user-enabled non-frame badges
+    PLUS a true 'none' baseline so that every screen has an identifiable reference.
+    Split is as even as possible; remainder is distributed by a seeded shuffle.
+
+    Examples
+      K=1 badge  -> 4 with that badge, 4 with none
+      K=2 badges -> 3,3,2 (two badges get 3 each, none gets 2)
+      K=3 badges -> 2,2,2,2 (each badge 2, none 2)
+      K>=4       -> floor(8/(K+1)) each, remainder spread via seeded order
+    """
+    # normalise and de-duplicate while preserving order
+    cats = [c.strip().lower() for c in (enabled_nonframes or []) if c]
+    cats = [("social" if c in ("social", "social_proof") else c) for c in cats]
+    cats = list(dict.fromkeys(cats))
+
+    # always include a real 'none' cell in the allocation
+    cats_plus_none = cats + ["none"]
+    K = len(cats_plus_none)
+    if K <= 1:
+        return ["none"] * 8
+
+    base = 8 // K
+    rem = 8 % K
+    counts = {c: base for c in cats_plus_none}
+
+    rng = seeds.rng("badge-alloc", set_id)
+    order = list(cats_plus_none)
+    rng.shuffle(order)
+    for c in order[:rem]:
+        counts[c] += 1
+
+    assignments = []
+    for c, k in counts.items():
+        assignments.extend([c] * k)
+
+    rng2 = seeds.rng("badge-assign", set_id)
+    rng2.shuffle(assignments)
+    return assignments
+
 # ------------------------------
 # Public API
 # ------------------------------
@@ -239,7 +280,10 @@ def render_screen(
 
     brand_text = (brand or "").strip()
     display_name = (f"{brand_text} {category}".strip()) or str(category)
-
+    
+    # build a deterministic per-screen assignment across selected badges + 'none'
+    badge_plan = _balanced_badge_assignments(enabled_nonframes, seeds, set_id)
+    assert len(badge_plan) == 8
     for i in range(8):
         # Grid coordinates: rows 0/1, cols 0..3
         r, c = (0 if i < 4 else 1), (i % 4)
@@ -250,13 +294,10 @@ def render_screen(
         # Stage 1: assign pricing frame (mutually exclusive; blocked 4/4 if randomised)
         frame_allin, frame_partitioned = _assign_frame_for_card(i, set_id, seeds, frame_mode)
         is_partitioned = bool(frame_partitioned)
-
-        # Stage 2: draw at most one non-frame badge (uniform over enabled subset)
-        chosen_nonframe = None
-        if enabled_nonframes:
-            rng = seeds.rng("nonframe", set_id, i)
-            chosen_nonframe = enabled_nonframes[rng.randrange(len(enabled_nonframes))]
-
+        
+        # --- Stage 2: we now follow a deterministic balanced plan rather than a uniform random draw.
+        chosen_nonframe = badge_plan[i]
+            
         # Initialise badge flags (0/1)
         assurance = 0
         scarcity = 0
