@@ -48,7 +48,7 @@ import base64
 import pathlib
 import math
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterable
 from urllib.parse import quote
 
 import requests
@@ -128,6 +128,31 @@ SCHEMA_JSON = {
     "required": ["chosen_title", "row", "col"],
     "additionalProperties": False
 }
+
+# ---- normalise UI badge labels → estimator column keys (non-frame only) ----
+def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
+    m = {
+        "all-in v. partitioned pricing": "frame",
+        "all-in pricing": "frame",
+        "partitioned pricing": "frame",
+        "assurance": "assurance",
+        "scarcity tag": "scarcity",
+        "scarcity": "scarcity",
+        "strike-through": "strike",
+        "strike": "strike",
+        "timer": "timer",
+        "social proof": "social_proof",
+        "social": "social_proof",
+        "voucher": "voucher",
+        "bundle": "bundle"
+    }
+    allowed = {"assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"}
+    out: list[str] = []
+    for b in (badges or []):
+        k = m.get(str(b).strip().lower())
+        if k in allowed and k not in out:
+            out.append(k)
+    return out
 
 # ---------------- selenium ----------------
 def _new_driver():
@@ -473,7 +498,7 @@ def _episode(
             raise
 
 # ---------------- writers ----------------
-def _write_outputs(category: str, vendor_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
+def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
 
@@ -495,8 +520,8 @@ def _write_outputs(category: str, vendor_label: str, set_id: str, gt: dict, deci
         ln_price  = p.get("ln_price", math.log(max(float(price_val), 1e-8))) if price_val is not None else None
 
         rec = {
-            "case_id": f"{RUN_ID}|{set_id}|{vendor_label}",
-            "run_id": RUN_ID, "set_id": set_id, "model": vendor_label, "category": category,
+            "case_id": f"{RUN_ID}|{set_id}|{model_label}",
+            "run_id": RUN_ID, "set_id": set_id, "model": model_label, "category": category,
             "title": p.get("title"),
             "row": int(p.get("row", 0)), "col": int(p.get("col", 0)),
             "row_top": row_top, "col1": col1, "col2": col2, "col3": col3,
@@ -527,7 +552,7 @@ def _write_outputs(category: str, vendor_label: str, set_id: str, gt: dict, deci
 
     # df_long (one row per screen)
     rows_long.append({
-        "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": vendor_label,
+        "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
         "row": int(decision.get("row", 0)), "col": int(decision.get("col", 0)),
         "frame": int(decision.get("frame", 1)) if decision.get("frame") is not None else None,
@@ -548,7 +573,7 @@ def _write_outputs(category: str, vendor_label: str, set_id: str, gt: dict, deci
     # JSONL (screen-level snapshot)
     rec = {
         "run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
-        "category": category, "set_id": set_id, "model": vendor_label,
+        "category": category, "set_id": set_id, "model": model_label,
         "groundtruth": gt, "decision": decision
     }
     with (RESULTS_DIR / "log_compare.jsonl").open("a", encoding="utf-8") as f:
@@ -581,7 +606,7 @@ def run_job_sync(payload: Dict) -> Dict:
     driver = _new_driver()
     try:
         for i in range(1, n + 1):
-            set_id, _model_label, gt, image_b64, decision = _episode(
+            set_id, model_label, gt, image_b64, decision = _episode(
                 driver=driver,
                 category=category,
                 ui_label=ui_label,
@@ -593,7 +618,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 currency=currency,
                 brand=brand,
             )
-            _write_outputs(category, ui_label, set_id, gt, decision, payload)
+            _write_outputs(category, model_label, set_id, gt, decision, payload)
             time.sleep(0.03)
     finally:
         try:
@@ -633,8 +658,11 @@ def run_job_sync(payload: Dict) -> Dict:
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
         try:
-            # Run the model (accepts the UI badge list as 2nd positional arg to optionally filter)
-            badge_table = logit_badges.run_logit(str(choice_path), badges)
+            # Map UI labels to estimator columns; exclude frame selector
+            badge_filter = _normalize_badge_filter(badges)
+
+            # Run the model (2nd arg optionally filters which badge columns to estimate)
+            badge_table = logit_badges.run_logit(str(choice_path), badge_filter or None)
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
 
@@ -642,7 +670,6 @@ def run_job_sync(payload: Dict) -> Dict:
             print("DEBUG badge_table_cols=", list(badge_table.columns))
 
             if "badge" in badge_table.columns and not badge_table.empty:
-                # preferred rich columns; keep only those that exist
                 pref_cols = [
                     "badge", "beta", "p", "sign",
                     "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
@@ -650,7 +677,6 @@ def run_job_sync(payload: Dict) -> Dict:
                 cols = [c for c in pref_cols if c in badge_table.columns]
                 df_rich = badge_table[cols].copy()
 
-                # prepend metadata columns (stable order)
                 job_meta = {
                     "job_id": job_id,
                     "timestamp": ts,
@@ -664,13 +690,10 @@ def run_job_sync(payload: Dict) -> Dict:
                 for k in list(job_meta.keys())[::-1]:
                     df_rich.insert(0, k, job_meta[k])
 
-                # write the ONE file (UTF-8 BOM so Excel shows £ correctly)
                 df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
 
-                # rows for JSON response
                 badge_rows = badge_table.to_dict("records")
 
-                # artifact pointers (compat)
                 artifacts["badges_effects"] = str(effects_path)
                 artifacts["effects_csv"] = str(effects_path)
                 artifacts["table_badges"] = str(effects_path)
