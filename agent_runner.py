@@ -140,14 +140,22 @@ def enforce_within_screen_variation(
         if n < 2:
             continue  # cannot vary with <2 alts
 
-        # binary badges: force at least one 0 and one 1 if column exists
+        # 1) binary badges: force ~50/50 within each screen if column exists
         for b in binary_badges:
             if b not in g.columns:
                 continue
-            vals = g[b].to_numpy()
-            if np.unique(vals).size == 1:
-                j = int(rng.integers(0, n))
-                df.at[idx[j], b] = 1 - int(vals[j])
+            vals = g[b].to_numpy().astype(int).copy()
+            n1 = int(vals.sum())
+            n  = len(vals)
+
+            # if no variation OR highly imbalanced (<=1 or >= n-1), rebalance to floor(n/2) ones
+            if (n1 == 0) or (n1 == n) or (n1 <= 1) or (n1 >= n - 1):
+                k = n // 2  # for 8 alts -> 4 ones, 4 zeros
+                choose = rng.choice(n, size=k, replace=False)
+                vals[:] = 0
+                vals[choose] = 1
+                df.loc[idx, b] = vals
+
 
     return df
 
@@ -800,6 +808,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
