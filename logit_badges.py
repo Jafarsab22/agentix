@@ -279,13 +279,15 @@ def _tidy_from_params(params, se, X):
     params = pd.Series(params, index=X.columns) if not isinstance(params, pd.Series) else params
     se = pd.Series(se, index=X.columns) if not isinstance(se, pd.Series) else se
 
-    # z and two-sided p
+    # z and two-sided p (as numpy), then store as Series for consistent indexing
     z = params / se.replace(0.0, np.nan)
-    pvals = 2.0 * (1.0 - (0.5 * (1.0 + (2.0 / math.sqrt(math.pi)) * np.vectorize(math.erf)((np.abs(z)) / math.sqrt(2.0)))))
+    pvals_arr = 2.0 * (1.0 - (0.5 * (1.0 + (2.0 / math.sqrt(math.pi)) *
+                                     np.vectorize(math.erf)((np.abs(z)) / math.sqrt(2.0)))))
+    pvals = pd.Series(np.asarray(pvals_arr, dtype=float), index=params.index)
 
-    # FDR
-    _, q_bh, _, _ = multipletests(pvals.values, method="fdr_bh")
-    q_bh = pd.Series(q_bh, index=params.index)
+    # FDR with numpy array input (no .values on ndarray!)
+    _, q_bh_arr, _, _ = multipletests(np.asarray(pvals, dtype=float), method="fdr_bh")
+    q_bh = pd.Series(q_bh_arr, index=params.index)
 
     # odds ratios with clipping
     CLIP = 40.0
@@ -310,7 +312,6 @@ def _tidy_from_params(params, se, X):
         "evid_score": evid
     })
     return out
-
 
 def _fit_ridge_logit(y, X, alpha=1.0):
     """
@@ -557,5 +558,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
