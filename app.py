@@ -141,9 +141,13 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     base = f"{ts}_{job_id}_badge_effects"
     csv_path = EFFECTS_DIR / f"{base}.csv"
     html_path = EFFECTS_DIR / f"{base}.html"
+    # Extended fields preserved if present in rows
     fieldnames = [
         "job_id", "timestamp", "product", "brand", "model",
-        "price", "currency", "n_iterations", "badge", "beta", "p", "sign"
+        "price", "currency", "n_iterations",
+        "badge", "beta", "se", "p", "q_bh",
+        "odds_ratio", "ci_low", "ci_high", "ame_pp",
+        "evid_score", "price_eq", "sign"
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -160,7 +164,15 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
                 "n_iterations": payload.get("n_iterations", ""),
                 "badge": r.get("badge", ""),
                 "beta": r.get("beta", ""),
-                "p": r.get("p", ""),
+                "se": r.get("se", ""),
+                "p": r.get("p", r.get("p_value", "")),
+                "q_bh": r.get("q_bh", ""),
+                "odds_ratio": r.get("odds_ratio", ""),
+                "ci_low": r.get("ci_low", ""),
+                "ci_high": r.get("ci_high", ""),
+                "ame_pp": r.get("ame_pp", ""),
+                "evid_score": r.get("evid_score", ""),
+                "price_eq": r.get("price_eq", ""),
                 "sign": r.get("sign", "0"),
             })
     def _fmt(x, nd=3):
@@ -193,14 +205,28 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     parts.append("</table>")
     parts.append("<h3 style='margin-top:18px'>Effects table</h3>")
     parts.append("<table>")
-    parts.append("<tr><th>Badge</th><th>β (effect size)</th><th>p (&lt;0.05 is significant)</th>"
-                 "<th>Effect (0=no effect; +=positive effect; -=negative effect)</th></tr>")
+    parts.append(
+        "<tr>"
+        "<th>Badge</th><th>β</th><th>SE</th><th>p</th><th>q_bh</th>"
+        "<th>Odds ratio</th><th>CI low</th><th>CI high</th>"
+        "<th>AME (pp)</th><th>Evidence</th><th>Price-eq λ</th>"
+        "<th>Effect</th>"
+        "</tr>"
+    )
     for r in rows_sorted:
         parts.append(
             "<tr>"
             f"<td>{r.get('badge','')}</td>"
             f"<td class='num'>{_fmt(r.get('beta'))}</td>"
-            f"<td class='num'>{_fmt(r.get('p'))}</td>"
+            f"<td class='num'>{_fmt(r.get('se'))}</td>"
+            f"<td class='num'>{_fmt(r.get('p', r.get('p_value')))}</td>"
+            f"<td class='num'>{_fmt(r.get('q_bh'))}</td>"
+            f"<td class='num'>{_fmt(r.get('odds_ratio'))}</td>"
+            f"<td class='num'>{_fmt(r.get('ci_low'))}</td>"
+            f"<td class='num'>{_fmt(r.get('ci_high'))}</td>"
+            f"<td class='num'>{_fmt(r.get('ame_pp'))}</td>"
+            f"<td class='num'>{_fmt(r.get('evid_score'))}</td>"
+            f"<td class='num'>{_fmt(r.get('price_eq'))}</td>"
             f"<td style='text-align:center'>{r.get('sign','0')}</td>"
             "</tr>"
         )
@@ -234,31 +260,50 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     rows = results.get("logit_table_rows") or []
 
     if rows:
+        # Keep original behaviour: sort by badge label (string-safe)
         rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
         header = "### Badge Effects\n\n"
+
+        # Extended columns if present; graceful fallback when fields are missing
         table = [
-            "| Badge | β (effect size) | p (<0.05 is significant) | Effect (0=no effect; +=positive effect; -=negative effect) |",
-            "|---|---:|---:|:---:|",
+            "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
         ]
+
         def _fmt(x, nd=3):
             try:
                 return f"{float(x):.{nd}f}"
             except Exception:
                 return "—"
+
         for r in rows_sorted:
+            beta = _fmt(r.get("beta"))
+            se = _fmt(r.get("se"))
+            pval = _fmt(r.get("p", r.get("p_value")), nd=4)
+            qbh = _fmt(r.get("q_bh"), nd=4)
+            orx = _fmt(r.get("odds_ratio"))
+            ci_l = _fmt(r.get("ci_low"))
+            ci_h = _fmt(r.get("ci_high"))
+            ame = _fmt(r.get("ame_pp"))
+            evid = _fmt(r.get("evid_score"))
+            peq = _fmt(r.get("price_eq"))
+            sgn = r.get("sign", "0")
             table.append(
-                f"| {r.get('badge','')} | {_fmt(r.get('beta'))} | {_fmt(r.get('p'))} | {r.get('sign','0')} |"
+                f"| {r.get('badge','')} | {beta} | {se} | {pval} | {qbh} | {orx} | {ci_l} | {ci_h} | {ame} | {evid} | {peq} | {sgn} |"
             )
-        # local export (optional download via Stats)
+
+        # Local export (optional download via Stats)
         csv_path, html_path = _export_badge_effects(rows_sorted, payload, job_id)
         artifacts = results.setdefault("artifacts", {})
-        if csv_path: artifacts["effects_csv"] = csv_path
-        if html_path: artifacts["effects_html"] = html_path
+        if csv_path:
+            artifacts["effects_csv"] = csv_path
+        if html_path:
+            artifacts["effects_html"] = html_path
         msg = header + "\n".join(table)
     else:
         msg = "No badge effects computed."
 
-    # Persist to Hostinger DB via PHP endpoints (best-effort)
+    # Persist to Hostinger DB via PHP endpoints (best-effort) — unchanged
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -274,6 +319,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         results.setdefault("artifacts", {})["agentix_persist_error"] = str(e)
 
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
 
 
 @_catch_and_report
@@ -461,14 +507,15 @@ def _preview_badges_effects(admin_key: str):
     except Exception as e:
         return f"<p>Could not read {path}: {e}</p>"
 
-    # Keep a slim view for the UI, but the CSV on disk still has all rich fields
-    view_cols = [c for c in ["badge", "beta", "p", "sign"] if c in df.columns]
+    preferred = [
+        "badge", "beta", "se", "p", "q_bh",
+        "odds_ratio", "ci_low", "ci_high",
+        "ame_pp", "evid_score", "price_eq", "sign"
+    ]
+    view_cols = [c for c in preferred if c in df.columns]
     if not view_cols:
-        # Fallback to all columns if expected ones aren’t present
         view_cols = list(df.columns)
 
-    # Build a compact HTML table (works with Gradio HTML/Markdown)
-    # Escape is not required here because pandas handles HTML.
     html = df[view_cols].to_html(index=False, border=1, justify="center")
     return html
 
@@ -614,6 +661,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
