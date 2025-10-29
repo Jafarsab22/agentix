@@ -474,7 +474,7 @@ def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
 def run_logit(
     df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, bytearray, Any],
     selected_badges: List[str] | None = None,
-    min_cases: int = 2,
+    min_cases: int = 2, #change default min_cases here
     use_price: bool = True
 ) -> List[Dict[str, Any]]:
     """
@@ -541,7 +541,7 @@ def main():
     parser = argparse.ArgumentParser(description="Conditional (FE) logit for AI-agent readiness.")
     parser.add_argument("--input", type=str, default="ai_agent_choices.csv", help="Input CSV with choices.")
     parser.add_argument("--output", type=str, default="logit_readiness_results.csv", help="Output CSV for tidy results.")
-    parser.add_argument("--min_screens", type=int, default=2, help="Minimum number of screens required to proceed.")
+    parser.add_argument("--min_screens", type=int, default=2, help="Minimum number of screens required to proceed.") #change default min_cases here
     args = parser.parse_args()
 
     df = pd.read_csv(args.input)
@@ -590,3 +590,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
