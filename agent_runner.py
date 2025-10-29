@@ -517,7 +517,7 @@ def _episode(
 def _ensure_dir(p: pathlib.Path): 
     p.mkdir(parents=True, exist_ok=True)
 
-def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: dict):
+def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
 
@@ -658,7 +658,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 currency=currency,
                 brand=brand,
             )
-            _write_outputs(category, ui_label, set_id, gt, decision)
+            _write_outputs(category, ui_label, set_id, gt, decision, payload)
             time.sleep(0.03)
     finally:
         try:
@@ -800,6 +800,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
