@@ -96,14 +96,15 @@ BADGE_VARS: List[str] = [
 # Human-readable labels for UI
 BADGE_LABELS: Dict[str, str] = {
     "frame": "All-in v. partitioned pricing",
-    "assurance": "Purchase assurance",
+    "assurance": "Assurance",
     "scarcity": "Scarcity tag",
-    "strike": "Strike-through tag",
-    "timer": "Countdown timer",
-    "social_proof": "Social proof",
-    "voucher": "Voucher",
-    "bundle": "Bundle",
+    "strike": "Strike-through",
+    "timer": "Timer",
+    "social_proof": "social",
+    "voucher": "voucher",
+    "bundle": "bundle",
 }
+
 
 
 # -----------------------
@@ -553,13 +554,10 @@ def run_logit(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, 
     rows = _results_to_rows(results)
 
     # Optional filter by the subset of badges (match label or key, case-insensitive)
+    # AFTER (compare by the displayed label only — which now matches the UI)
     if selected_badges:
-        want = set(s.strip().lower() for s in selected_badges)
-        def _match(name: str) -> bool:
-            key = name.strip().lower()
-            lab_to_key = {BADGE_LABELS.get(k, k).strip().lower(): k for k in BADGE_VARS}
-            return (key in lab_to_key) or (key in [k.lower() for k in BADGE_VARS])
-        rows = [r for r in rows if r.get("badge") and r["badge"].strip().lower() in want or _match(r["badge"]) and BADGE_LABELS.get(r["badge"], r["badge"]).strip().lower() in want]
+        want = {s.strip().lower() for s in selected_badges}
+        rows = [r for r in rows if r.get("badge") and r["badge"].strip().lower() in want]
 
     return rows
 
@@ -621,6 +619,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
