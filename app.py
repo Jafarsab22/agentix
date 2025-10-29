@@ -254,6 +254,10 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         fresh=True,
     )
 
+    # Ensure the latest logit_badges (and its run_logit) is used in this request
+    import importlib, logit_badges
+    logit_badges = importlib.reload(logit_badges)
+
     results = run_job_sync(payload)
 
     # Build the badge-effects table from results["logit_table_rows"]
@@ -319,6 +323,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         results.setdefault("artifacts", {})["agentix_persist_error"] = str(e)
 
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
 
 
 
@@ -661,6 +666,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
