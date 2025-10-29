@@ -274,7 +274,44 @@ def _fit_glm_logit(y, X, cov_type: str, cov_kwds: dict | None):
         res = model.fit(cov_type=cov_type, cov_kwds=(cov_kwds or {}))
     return res
 
-# --- replace the whole function ---
+def _tidy_from_params(params, se, X):
+    """Build tidy table given params and se; compute p, q_bh, OR, CI, AME, evid."""
+    params = pd.Series(params, index=X.columns) if not isinstance(params, pd.Series) else params
+    se = pd.Series(se, index=X.columns) if not isinstance(se, pd.Series) else se
+
+    # z and two-sided p
+    z = params / se.replace(0.0, np.nan)
+    pvals = 2.0 * (1.0 - (0.5 * (1.0 + (2.0 / math.sqrt(math.pi)) * np.vectorize(math.erf)((np.abs(z)) / math.sqrt(2.0)))))
+
+    # FDR
+    _, q_bh, _, _ = multipletests(pvals.values, method="fdr_bh")
+    q_bh = pd.Series(q_bh, index=params.index)
+
+    # odds ratios with clipping
+    CLIP = 40.0
+    pruned = params.clip(lower=-CLIP, upper=CLIP)
+    orx = np.exp(pruned)
+    ci_low = np.exp(pruned - 1.96 * se)
+    ci_high = np.exp(pruned + 1.96 * se)
+
+    # AME (neutral weight), evidence
+    ame_pp = 100.0 * 0.25 * params
+    evid = (params.abs() / se.replace(0.0, np.nan))
+
+    out = pd.DataFrame({
+        "beta": params,
+        "se": se,
+        "p": pvals,
+        "q_bh": q_bh,
+        "odds_ratio": orx,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "ame_pp": ame_pp,
+        "evid_score": evid
+    })
+    return out
+
+
 def _fit_ridge_logit(y, X, alpha=1.0):
     """
     Ridge-penalised logit fallback (no clusters).
@@ -282,7 +319,6 @@ def _fit_ridge_logit(y, X, alpha=1.0):
     Robust to separation and tiny samples.
     """
     logit = sm.Logit(y, X)
-    # stronger ridge for tiny samples to avoid extreme betas
     alpha_use = float(alpha)
     if X.shape[0] <= 120:
         alpha_use = max(alpha_use, 1.0)
@@ -290,13 +326,11 @@ def _fit_ridge_logit(y, X, alpha=1.0):
 
     params = pd.Series(res.params, index=X.columns)
 
-    # Compute covariance via XtWX with stabilized weights
+    # Stabilised weights
     lin = np.asarray(X @ params)
-    lin = np.clip(lin, -40.0, 40.0)                 # avoid exp overflow
+    lin = np.clip(lin, -40.0, 40.0)
     p = 1.0 / (1.0 + np.exp(-lin))
-    W = p * (1.0 - p)
-    # If separation => W≈0; lift floor a bit so covariance is finite
-    W = np.maximum(W, 1e-6)
+    W = np.maximum(p * (1.0 - p), 1e-6)
 
     Xv = X.values
     XtWX = Xv.T @ (Xv * W[:, None])
@@ -308,21 +342,19 @@ def _fit_ridge_logit(y, X, alpha=1.0):
     se = pd.Series(np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=np.inf)), index=X.columns)
     return params, se
 
-# --- replace the whole function ---
+
 def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
                        allow_product_fe: bool = True) -> pd.DataFrame:
     """
-    Try GLM(Logit) with cluster-robust SEs. If we detect a degenerate fit
-    (NaN/Inf SEs, rank deficiency, too-few clusters), fall back to ridge logit.
+    Try GLM(Logit) with cluster-robust SEs. If degenerate (few clusters, non-finite SEs/params,
+    rank deficiency), fall back to ridge and return finite statistics.
     """
-    # If very few screens, cluster SEs are not reliable: go straight to ridge
     n_clusters = pd.Series(clusters).nunique()
-    MIN_CLUSTERS = 8  # tune if you like
+    MIN_CLUSTERS = 8
     if n_clusters < MIN_CLUSTERS or np.linalg.matrix_rank(X) < min(X.shape):
         params, se = _fit_ridge_logit(y, X, alpha=1.0)
         return _tidy_from_params(params, se, X)
 
-    # Attempt GLM(Logit) with cluster-robust SEs
     try:
         model = sm.GLM(y, X, family=sm.families.Binomial())
         with warnings.catch_warnings(record=True):
@@ -332,7 +364,7 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
         params = res.params.copy()
         bse = res.bse.copy()
 
-        # Detect degeneracy and bail to ridge
+        # Degenerate? -> ridge
         if (not np.all(np.isfinite(bse))) or (not np.all(np.isfinite(params))):
             raise RuntimeError("Degenerate GLM fit (non-finite params/SEs).")
 
@@ -348,7 +380,6 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
         ci_high = np.exp(pruned + 1.96 * bse)
 
         p_hat = res.predict(X)
-        # if p_hat collapsed, keep AME finite
         weight_mean = float(np.mean(np.clip(p_hat * (1.0 - p_hat), 1e-6, 0.25)))
         ame_pp = 100.0 * weight_mean * params
 
@@ -362,7 +393,6 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
         return out
 
     except Exception:
-        # Safe fallback
         params, se = _fit_ridge_logit(y, X, alpha=1.0)
         return _tidy_from_params(params, se, X)
 
@@ -527,4 +557,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
