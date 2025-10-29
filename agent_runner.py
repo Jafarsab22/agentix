@@ -564,12 +564,28 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
               "scarcity","strike","timer","social_proof","voucher","bundle","chosen"):
         if c in df_choice.columns: 
             df_choice[c] = df_choice[c].astype(int)
+    # Map UI labels -> internal column names
+    _ui_to_key = {
+        "All-in v. partitioned pricing": "frame",   # frame handled separately by storefront
+        "Assurance": "assurance",
+        "Scarcity tag": "scarcity",
+        "Strike-through": "strike",
+        "Timer": "timer",
+        "social": "social_proof",
+        "voucher": "voucher",
+        "bundle": "bundle",
+    }
+    
+    _selected = payload.get("badges") or []
+    _selected_keys = [_ui_to_key[b] for b in _selected if b in _ui_to_key and _ui_to_key[b] != "frame"]
+    
     df_choice = enforce_within_screen_variation(
         df_choice,
         screen_col="case_id",
-        binary_badges=["assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"],
+        binary_badges=_selected_keys,   # << only what the user picked
         job_id=RUN_ID
     )
+
     agg_choice = RESULTS_DIR / "df_choice.csv"
     df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False)
 
@@ -784,6 +800,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
