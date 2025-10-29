@@ -200,12 +200,64 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series) -> pd
 # ------------------------------------------------------------
 
 def _load_df(df_or_path):
-    """Accept a pandas DataFrame or a CSV/TXT path; return DataFrame."""
+    """
+    Accept a pandas DataFrame, a filesystem path (csv/txt/parquet/json),
+    a dict carrying a path or data, a file-like object, or raw bytes.
+    Return a pandas DataFrame or raise a clear error.
+    """
+    import pathlib, io
+
+    # 1) Already a DataFrame
     if isinstance(df_or_path, pd.DataFrame):
         return df_or_path.copy()
-    if isinstance(df_or_path, str):
-        return pd.read_csv(df_or_path)
-    raise TypeError("run_logit expects a pandas DataFrame or a path to a CSV/TXT file.")
+
+    # 2) String/Path to a file
+    if isinstance(df_or_path, (str, pathlib.Path)):
+        p = pathlib.Path(df_or_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Choice file not found: {p}")
+        suf = p.suffix.lower()
+        if suf in {".csv", ".txt"}:
+            return pd.read_csv(p)
+        if suf in {".parquet"}:
+            return pd.read_parquet(p)
+        if suf in {".json"}:
+            return pd.read_json(p)
+        # default fallback: try CSV
+        return pd.read_csv(p)
+
+    # 3) Dict payloads (common in app calls)
+    if isinstance(df_or_path, dict):
+        # try common keys that may carry a path or data
+        for key in ("choice_path", "path", "file", "csv", "df", "data"):
+            if key in df_or_path:
+                try:
+                    return _load_df(df_or_path[key])
+                except Exception:
+                    pass
+        # as a last resort: if it looks like column->list mapping, build a DF
+        try:
+            return pd.DataFrame(df_or_path)
+        except Exception:
+            pass
+
+    # 4) File-like objects
+    if hasattr(df_or_path, "read"):
+        try:
+            return pd.read_csv(df_or_path)
+        except Exception:
+            df_or_path.seek(0)
+            return pd.read_json(df_or_path)
+
+    # 5) Raw bytes (assume CSV)
+    if isinstance(df_or_path, (bytes, bytearray)):
+        try:
+            return pd.read_csv(io.BytesIO(df_or_path))
+        except Exception:
+            return pd.read_json(io.BytesIO(df_or_path))
+
+    raise TypeError("run_logit got an unsupported input. Provide a DataFrame, a file path, a dict with 'choice_path', a file-like object, or CSV bytes.")
+
 
 def _results_to_rows(results_df: pd.DataFrame) -> list[dict]:
     """
@@ -269,23 +321,8 @@ def run_logit(df_or_path, selected_badges=None, min_cases: int = 10, use_price: 
     """
     API used by the app. Returns a list of dict rows for the 'Badge Effects' table.
     Keeps your modelling pipeline intact, only wraps it.
-
-    Parameters
-    ----------
-    df_or_path : DataFrame or str
-        Input data or path to CSV/TXT.
-    selected_badges : iterable or None
-        If provided, keep only these badges (match against the 'badge' name without the 'badge_' prefix).
-    min_cases : int
-        Minimum number of screens required; if not met, returns [].
-    use_price : bool
-        Kept for compatibility; modelling already includes ln_price when available.
-
-    Returns
-    -------
-    list[dict]
-        Each dict contains: badge, beta, se, p, q_bh, odds_ratio, ci_low, ci_high, ame_pp, evid_score, price_eq, sign
     """
+    # Accept the broader set of inputs
     df = _load_df(df_or_path)
     _ensure_required_columns(df)
 
@@ -300,13 +337,12 @@ def run_logit(df_or_path, selected_badges=None, min_cases: int = 10, use_price: 
     # Build design with absorbed FE and cluster groups
     y, X, clusters, _xvars = _build_design(df)
 
-    # Sample size checks
+    # Sample size guardrails (non-fatal if saturated)
     n_screens = df["screen_id"].nunique()
     n_rows = df.shape[0]
     if n_screens < min_cases:
         return []
     if X.shape[1] >= n_rows:
-        # Still proceed; app expects best-effort rows even if near-saturated
         print("Warning: predictors (including FE dummies) nearly exhaust sample size; consider clogit or reducing FE.", file=sys.stderr)
 
     # Fit and tidy (DataFrame indexed by parameter name)
@@ -378,3 +414,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
