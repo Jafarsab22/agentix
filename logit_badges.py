@@ -61,7 +61,6 @@
 # Badges: frame, assurance, scarcity, strike, timer, social_proof, voucher, bundle
 # ================================================================
 
-
 from __future__ import annotations
 
 import argparse
@@ -73,33 +72,92 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.stats.multitest import multipletests
 
+
 BADGE_VARS: List[str] = [
     "frame", "assurance", "scarcity", "strike",
     "timer", "social_proof", "voucher", "bundle"
 ]
 
+
 # -----------------------
-# I/O helpers
+# Robust I/O loader
 # -----------------------
 
-def _load_df(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]]) -> pd.DataFrame:
+def _load_df(df_or_path: Union[pd.DataFrame, str, Dict[str, Any], bytes, bytearray, Any]) -> pd.DataFrame:
     """
-    Accept a pandas DataFrame, a string path to CSV/TXT,
-    or a dict payload with 'choice_path'.
+    Accept:
+      - pandas.DataFrame
+      - str / pathlib.Path to CSV/TXT/Parquet/JSON
+      - dict payloads with a path under common keys (choice_path, path, file, csv),
+        including nested structures like payload['paths']['choice']
+      - file-like objects (with .read)
+      - raw CSV bytes / bytearray
+    Returns a pandas DataFrame or raises a clear error.
     """
+    import pathlib, io
+
+    # 1) Already a DataFrame
     if isinstance(df_or_path, pd.DataFrame):
         return df_or_path.copy()
 
+    # 2) String/Path
+    if isinstance(df_or_path, (str, pathlib.Path)):
+        p = pathlib.Path(str(df_or_path))
+        if not p.exists():
+            raise FileNotFoundError(f"Choice file not found: {p}")
+        suf = p.suffix.lower()
+        if suf in {".csv", ".txt"}:
+            return pd.read_csv(p)
+        if suf in {".parquet"}:
+            return pd.read_parquet(p)
+        if suf in {".json"}:
+            return pd.read_json(p)
+        # fallback: try CSV
+        return pd.read_csv(p)
+
+    # 3) Dict payloads
     if isinstance(df_or_path, dict):
-        cp = df_or_path.get("choice_path")
-        if isinstance(cp, str) and cp:
-            return pd.read_csv(cp)
-        raise TypeError("run_logit expects a DataFrame, a CSV path, or a dict with 'choice_path'.")
+        # direct keys
+        for k in ("choice_path", "path", "file", "csv"):
+            v = df_or_path.get(k)
+            if isinstance(v, (str, pathlib.Path)):
+                return _load_df(v)
+        # nested common containers
+        for k in ("paths", "files", "data", "payload"):
+            sub = df_or_path.get(k)
+            if isinstance(sub, dict):
+                for kk in ("choice", "choices", "path", "file", "csv"):
+                    vv = sub.get(kk)
+                    if isinstance(vv, (str, pathlib.Path)):
+                        return _load_df(vv)
+        # column→list mapping
+        try:
+            return pd.DataFrame(df_or_path)
+        except Exception:
+            pass
 
-    if isinstance(df_or_path, str):
-        return pd.read_csv(df_or_path)
+    # 4) File-like object
+    if hasattr(df_or_path, "read"):
+        try:
+            return pd.read_csv(df_or_path)
+        except Exception:
+            try:
+                df_or_path.seek(0)
+            except Exception:
+                pass
+            return pd.read_json(df_or_path)
 
-    raise TypeError("Unsupported input to run_logit.")
+    # 5) Raw bytes
+    if isinstance(df_or_path, (bytes, bytearray)):
+        bio = io.BytesIO(df_or_path)
+        try:
+            return pd.read_csv(bio)
+        except Exception:
+            bio.seek(0)
+            return pd.read_json(bio)
+
+    raise TypeError("run_logit could not find a choice file: pass a DataFrame, a file path, or a payload dict containing it.")
+
 
 # -----------------------
 # Schema + feature prep
@@ -139,8 +197,8 @@ def _make_logs(df: pd.DataFrame) -> pd.DataFrame:
 
 def _collect_badge_columns(df: pd.DataFrame) -> List[str]:
     """Return badge columns that exist and vary (at least 2 distinct values)."""
-    cols = [c for c in BADGE_VARS if c in df.columns and df[c].nunique(dropna=True) > 1]
-    return cols
+    return [c for c in BADGE_VARS if c in df.columns and df[c].nunique(dropna=True) > 1]
+
 
 # -----------------------
 # Matrix sanitisation
@@ -162,6 +220,7 @@ def _coerce_numeric(X: pd.DataFrame) -> pd.DataFrame:
     Xn = X.apply(pd.to_numeric, errors="coerce")
     Xn = Xn.fillna(0.0)
     return Xn.astype("float64")
+
 
 def _build_design(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame, pd.Series, List[str]]:
     """
@@ -211,6 +270,7 @@ def _build_design(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame, pd.Series,
 
     return y, X, clusters, x_vars_existing
 
+
 # -----------------------
 # Estimation + output
 # -----------------------
@@ -253,6 +313,7 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series) -> pd
         "evid_score": evid_score
     })
     return out
+
 
 def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -311,11 +372,12 @@ def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
     rows.sort(key=lambda r: str(r.get("badge", "")))
     return rows
 
+
 # -----------------------
 # Public API for the app
 # -----------------------
 
-def run_logit(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]],
+def run_logit(df_or_path: Union[pd.DataFrame, str, Dict[str, Any], bytes, bytearray, Any],
               selected_badges: List[str] | None = None,
               min_cases: int = 2,
               use_price: bool = True) -> List[Dict[str, Any]]:
@@ -349,6 +411,7 @@ def run_logit(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]],
         rows = [r for r in rows if str(r["badge"]).strip().lower() in want]
 
     return rows
+
 
 # -----------------------
 # CLI entrypoint
@@ -397,6 +460,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
