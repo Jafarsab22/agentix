@@ -293,8 +293,11 @@ def _tidy_from_params(params, se, X):
     CLIP = 40.0
     pruned = params.clip(lower=-CLIP, upper=CLIP)
     orx = np.exp(pruned)
-    ci_low = np.exp(pruned - 1.96 * se)
-    ci_high = np.exp(pruned + 1.96 * se)
+    
+    ci_arg_lo = np.clip(pruned - 1.96 * bse, -CLIP, CLIP)
+    ci_arg_hi = np.clip(pruned + 1.96 * bse, -CLIP, CLIP)
+    ci_low = np.exp(ci_arg_lo)
+    ci_high = np.exp(ci_arg_hi)
 
     # AME (neutral weight), evidence
     ame_pp = 100.0 * 0.25 * params
@@ -347,14 +350,17 @@ def _fit_ridge_logit(y, X, alpha=1.0):
 def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
                        allow_product_fe: bool = True) -> pd.DataFrame:
     """
-    Try GLM(Logit) with cluster-robust SEs. If degenerate (few clusters, non-finite SEs/params,
-    rank deficiency), fall back to ridge and return finite statistics.
+    Try GLM(Logit) with cluster-robust SEs. If degenerate (few clusters,
+    non-finite params/SEs, or rank deficiency), fall back to ridge and
+    return finite statistics. The returned DataFrame has attrs['fit_mode'].
     """
     n_clusters = pd.Series(clusters).nunique()
     MIN_CLUSTERS = 8
     if n_clusters < MIN_CLUSTERS or np.linalg.matrix_rank(X) < min(X.shape):
         params, se = _fit_ridge_logit(y, X, alpha=1.0)
-        return _tidy_from_params(params, se, X)
+        out = _tidy_from_params(params, se, X)
+        out.attrs["fit_mode"] = "ridge_precheck"
+        return out
 
     try:
         model = sm.GLM(y, X, family=sm.families.Binomial())
@@ -365,11 +371,9 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
         params = res.params.copy()
         bse = res.bse.copy()
 
-        # Degenerate? -> ridge
         if (not np.all(np.isfinite(bse))) or (not np.all(np.isfinite(params))):
             raise RuntimeError("Degenerate GLM fit (non-finite params/SEs).")
 
-        # Build tidy from GLM
         pvals = res.pvalues.copy()
         _, q_bh, _, _ = multipletests(pvals.values, method="fdr_bh")
         q_bh = pd.Series(q_bh, index=pvals.index)
@@ -391,11 +395,14 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series,
             "odds_ratio": odds_ratio, "ci_low": ci_low, "ci_high": ci_high,
             "ame_pp": ame_pp, "evid_score": evid_score
         })
+        out.attrs["fit_mode"] = "glm_cluster"
         return out
 
     except Exception:
         params, se = _fit_ridge_logit(y, X, alpha=1.0)
-        return _tidy_from_params(params, se, X)
+        out = _tidy_from_params(params, se, X)
+        out.attrs["fit_mode"] = "ridge_fallback"
+        return out
 
 
 # -----------------------
@@ -465,21 +472,26 @@ def run_logit(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, 
               min_cases: int = 2,
               use_price: bool = True) -> List[Dict[str, Any]]:
     """App-facing API. Returns list[dict] for the 'Badge Effects' table."""
+    # Load + schema
     df = _load_df(df_or_path)
     df = _rename_core_columns(df)
     _ensure_required_columns(df)
 
+    # Basic cleaning and typing
     df = df.dropna(subset=["chosen", "screen_id", "product", "price"]).copy()
     df["chosen"] = pd.to_numeric(df["chosen"], errors="coerce").fillna(0).astype(int)
 
+    # Derive position/log vars; harmonise frame variants
     df = _make_position_dummies(df)
     df = _make_logs(df)
     df = _harmonize_badges(df)
 
+    # Guardrail for tiny pilots
     n_screens = df["screen_id"].nunique()
     if n_screens < min_cases:
         return []
 
+    # Build design (start with product FE; if near-saturated, drop them)
     y, X_full, clusters, _ = _build_design(df, include_product_fe=True)
     near_sat = (X_full.shape[1] >= max(df.shape[0] - 2, 1))
     if near_sat:
@@ -487,19 +499,29 @@ def run_logit(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, 
     else:
         X = X_full
 
+    # Fit
     try:
         results = fit_logit_and_tidy(y, X, clusters, allow_product_fe=not near_sat)
     except Exception:
         params, se = _fit_ridge_logit(y, X, alpha=1.0)
         results = _tidy_from_params(params, se, X)
+        results.attrs["fit_mode"] = "ridge_fallback_uncaught"
 
+    # Optional debug: which path did we take?
+    fit_mode = getattr(results, "attrs", {}).get("fit_mode")
+    if fit_mode:
+        print(f"[logit] fit_mode = {fit_mode}")
+
+    # Shape rows for the app table
     rows = _results_to_rows(results)
 
+    # Optional filter to only the user-selected badge labels
     if selected_badges:
         want = {s.strip().lower() for s in selected_badges}
         rows = [r for r in rows if r.get("badge") and r["badge"].strip().lower() in want]
 
     return rows
+
 
 
 # -----------------------
@@ -558,6 +580,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
