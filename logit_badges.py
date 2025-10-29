@@ -105,8 +105,6 @@ BADGE_LABELS: Dict[str, str] = {
     "bundle": "bundle",
 }
 
-
-
 # -----------------------
 # Robust I/O loader
 # -----------------------
@@ -559,6 +557,7 @@ def run_logit(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, 
         want = {s.strip().lower() for s in selected_badges}
         rows = [r for r in rows if r.get("badge") and r["badge"].strip().lower() in want]
 
+
     return rows
 
 
@@ -619,6 +618,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
