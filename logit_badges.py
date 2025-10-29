@@ -1,354 +1,245 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-logit_badges_clean.py — Conditional logit with fixed effects, robust small‑N handling,
-continuous evidence metrics, and a backward‑compatible table for the runner.
+# ================================================================
+# CONDITIONAL (FIXED-EFFECTS) LOGIT FOR AI-AGENT READINESS SCORING
+# ================================================================
+# Purpose
+#   Estimate within-screen effects of e-commerce levers (badges, position, price,
+#   rating, reviews) on AI agents’ choices, producing a defensible table for
+#   readiness scoring and site advice.
+#
+# Identification & assumptions
+#   • One choice per screen (choice set). Outcome chosen ∈ {0,1}.
+#   • Absorb screen fixed effects (controls unobserved context) and product fixed
+#     effects (controls latent quality). This approximates conditional logit under
+#     one-choice-per-set and delivers the same β for within-screen covariates.
+#   • Covariates vary within screens (position dummies, ln_price, rating, ln_reviews,
+#     badges). SEs are cluster-robust at the screen level.
+#
+# Variables expected (column names; additional columns are ignored safely)
+#   Required:  screen_id, product, chosen, price
+#   Optional:  row, col, rating, reviews, model, badge_* (any number of badge_… columns)
+#     - row is 0 for top row, 1 for bottom row (paper style).
+#     - col is 0..3 for left→right (paper style). Baseline is bottom row and col4 (index 3).
+#
+# Reported statistics (for each coefficient)
+#   beta        : log-odds coefficient. >0 raises the odds of being chosen.
+#   se          : cluster-robust standard error (cluster = screen_id).
+#   p           : two-sided p-value for H0: beta = 0.
+#   q_bh        : Benjamini–Hochberg FDR-adjusted p-value across all reported terms.
+#   odds_ratio  : exp(beta); multiplicative effect on odds.
+#   ci_low/high : 95% CI bounds for odds_ratio.
+#   ame_pp      : average marginal effect on probability scale (percentage points).
+#                 Approximated as 100 * mean_i[p_i(1−p_i)] * beta.
+#   evid_score  : |beta| / se, a simple signal-to-noise index.
+#
+# Outputs
+#   • CSV: logit_readiness_results.csv (index=parameter name; columns as above)
+#
+# Notes
+#   • Uses absorbed dummies for FE (screen_id_*, product_*). For very large data,
+#     consider true conditional likelihood (“clogit”) or high-dimensional FE solvers.
+#   • Interactions: badge × model and position × model to capture heterogeneity.
+#   • Price-equivalent trade-offs are computed downstream in app.py.
+# ================================================================
 
-Notes & assumptions (please read):
-1) Model family and link: Binomial GLM with logit link fitted by IRLS. This is
-   equivalent to a logistic regression. We approximate a conditional-logit setup
-   by absorbing choice-set (case) and product fixed effects through categorical
-   dummies (no intercept), which yields the same estimates for the coefficients
-   of interest when each case contains exactly one picked alternative (y ∈ {0,1}).
-2) Fixed effects: We include C(case_id) and C(prod_id). This captures arbitrary
-   case- and product-level heterogeneity and aligns with the storefront’s design
-   (8 alternatives per case). Position controls are included as row/column dummies
-   when available (row ∈ {1,2}, col ∈ {1,2,3,4}). No global intercept is used.
-3) Penalisation at small N: If the number of complete cases (n_cases) is below
-   ridge_cutoff_cases (default 50), we fit a ridge‑penalised GLM to stabilise
-   estimates. Penalisation does not target fixed effects differently from other
-   regressors; it is an ℓ2 penalty on all coefficients. In the MLE regime
-   (n_cases ≥ ridge_cutoff_cases), the penalty is set to 0.
-4) Inference: p-values come from (a) robust (HC1) covariance when unpenalised,
-   or (b) the penalised Fisher information when ridge>0. For multiple badges we
-   also compute Benjamini–Hochberg FDR-adjusted q-values across the lever terms.
-   We additionally report odds ratios and 95% CIs, and a continuous evidence score
-   s_evid = -log10(q) (using p when q is not computable).
-5) Average marginal effects (AME): For a binary indicator x, the derivative of
-   the logit probability w.r.t. x at observation i is p_i*(1-p_i)*β_x. We report
-   AME_x = mean_i p_i*(1-p_i)*β_x, as percentage points (×100). This is standard
-   for small, per‑unit changes and aligns with practice in site‑level reporting.
-6) Inputs expected: Either a pandas DataFrame with the choice data or a path to
-   a CSV file. Required columns: [choice, case_id, prod_id] and at least one of
-   the lever columns in LEVER_VARS. Optional: row, col, price, ln_price. The
-   function will coerce types and create missing IDs if not present.
-7) Dropping non‑varying levers: Any lever that is constant in the analysis slice
-   is removed prior to estimation. This is deliberate and avoids singular design
-   matrices. We log which levers were dropped in the returned metadata.
-8) Backward compatibility: The primary entry point run_logit(...) returns a
-   DataFrame with columns [badge, beta, p, sign] as expected by the runner, plus
-   richer columns (se, q_bh, odds_ratio, ci_low, ci_high, ame_pp, evid_score).
-   The runner can safely ignore the extras. Column names match the existing
-   conventions ("All-in framing", "Purchase assurance", etc.).
-9) Missing data policy: Choice rows with missing in any active regressor are
-   dropped listwise. "Complete cases" are defined at the case_id level: a case
-   contributes only if it has exactly 8 alternatives and one choice==1.
-10) Reproducibility: The estimator itself is deterministic given the input.
-
-Author: Agentix (2025-10-28)
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Union
-from pathlib import Path
-
+import argparse
+import sys
+import math
 import numpy as np
 import pandas as pd
-import patsy as pt
 import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _ensure_required_columns(df: pd.DataFrame) -> None:
+    required = ["screen_id", "product", "chosen", "price"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
 
-LEVER_VARS = [
-    ("frame", "All-in framing"),
-    ("assurance", "Purchase assurance"),
-    ("scarcity", "Scarcity tag"),
-    ("strike", "Strike-through tag"),
-    ("timer", "Countdown timer"),
-    ("social_proof", "Social proof"),
-    ("voucher", "Voucher"),
-    ("bundle", "Bundle")
-]
-
-@dataclass
-class LogitResult:
-    table: pd.DataFrame
-    meta: Dict[str, Any]
-
-
-def run_logit(
-    df_or_path: Union[str, Path, pd.DataFrame],
-    selected_badges: List[str] | None = None,
-    min_cases: int = 10,
-    ridge_cutoff_cases: int = 50,
-    ridge_alpha: float = 1.0,
-    use_price: bool = False,
-) -> pd.DataFrame:
-    """Fit the conditional logit and return a tidy effects table.
-
-    Backward compatibility: the second positional argument may be a list of
-    selected badge names coming from the runner UI. This function accepts that
-    as ``selected_badges``. All other parameters are keyword-friendly.
-    """
-    # Load and normalise data
-    df = _load_df(df_or_path)
-    df = _coerce_schema(df)
-    df = _filter_complete_cases(df)
-
-    n_cases = df["case_id"].nunique()
-
-    # Map UI names → canonical labels used in LEVER_VARS
-    ui_to_label = {
-        "All-in v. partitioned pricing": "All-in framing",
-        "All-in framing": "All-in framing",
-        "Assurance": "Purchase assurance",
-        "Purchase assurance": "Purchase assurance",
-        "Scarcity": "Scarcity tag",
-        "Scarcity tag": "Scarcity tag",
-        "Strike-through": "Strike-through tag",
-        "Strike-through tag": "Strike-through tag",
-        "Timer": "Countdown timer",
-        "Countdown timer": "Countdown timer",
-        "Social proof": "Social proof",
-        "Voucher": "Voucher",
-        "Bundle": "Bundle",
-    }
-
-    # Identify varying levers
-    present: List[Tuple[str, str]] = []
-    for var, label in LEVER_VARS:
-        if var in df.columns and df[var].nunique() > 1:
-            present.append((var, label))
-
-    # Optional filtering by selected_badges from UI
-    if selected_badges:
-        want_labels = {ui_to_label.get(s, s) for s in selected_badges}
-        present = [(v, lbl) for (v, lbl) in present if lbl in want_labels]
-
-    if n_cases < min_cases or len(present) == 0:
-        return _empty_table()
-
-    # Build design formula: no intercept, FE for case & product, optional price, position controls
-    x_terms: List[str] = []
-    x_terms.extend(var for var, _ in present)
-    if use_price:
-        if "ln_price" in df.columns:
-            x_terms.append("ln_price")
-        elif "price" in df.columns:
-            x_terms.append("price")
-    # Position controls
-    for c in ["row", "col"]:
-        if c in df.columns:
-            x_terms.append(f"C({c})")
-    # Fixed effects
-    x_terms.append("C(case_id)")
-    x_terms.append("C(prod_id)")
-
-    formula = "choice ~ -1 + " + " + ".join(x_terms)
-
-    # Build design matrices
-    y, X = pt.dmatrices(formula, df, return_type="dataframe")
-
-    # Ridge or MLE
-    ridge = float(ridge_alpha) if n_cases < ridge_cutoff_cases else 0.0
-
-    if ridge > 0.0:
-        # Penalised GLM (L2) via regularized Logit
-        model = sm.Logit(y, X)
-        res = model.fit_regularized(method="l1", alpha=ridge, L1_wt=0.0, disp=False, maxiter=1000)
-        params = res.params
-        # Approximate covariance by penalised Fisher info (X'WX + 2*alpha*I)^-1
-        p_pred = res.predict()
-        W = np.asarray(p_pred * (1.0 - p_pred))
-        XtW = (X.T * W)
-        H = XtW @ X + 2.0 * ridge * np.eye(X.shape[1])
-        cov = np.linalg.pinv(H)
-        se = pd.Series(np.sqrt(np.diag(cov)), index=X.columns)
-    else:
-        model = sm.GLM(y, X, family=sm.families.Binomial(link=sm.families.links.logit()))
-        res = model.fit(cov_type="HC1", maxiter=1000)
-        params = res.params
-        se = res.bse
-
-    # Compute tidy stats for levers only (exclude FE and position controls)
-    lever_index = [col for col in X.columns if col in [v for v, _ in present]]
-    if len(lever_index) == 0:
-        return _empty_table()
-
-    out = pd.DataFrame({
-        "badge_var": lever_index,
-        "beta": params[lever_index].astype(float),
-        "se": se[lever_index].astype(float),
-    })
-    out["z"] = out["beta"] / out["se"]
-
-    # Two-sided p-values from normal approximation
-    from scipy.stats import norm
-    out["p"] = 2.0 * (1.0 - norm.cdf(np.abs(out["z"])) )
-
-    # Benjamini–Hochberg q-values
-    out = out.sort_values("p").reset_index(drop=True)
-    m = out.shape[0]
-    ranks = np.arange(1, m + 1)
-    out["q_bh"] = np.minimum.accumulate((out["p"].values * m / ranks)[::-1])[::-1]
-
-    # Evidence score and significance flags
-    eps = 1e-16
-    out["evid_score"] = -np.log10(np.maximum(out["q_bh"].fillna(out["p"]), eps))
-    out["sig_5pct"] = out["p"] < 0.05
-
-    # Odds ratios and CIs
-    out["odds_ratio"] = np.exp(out["beta"]) 
-    out["ci_low"] = np.exp(out["beta"] - 1.96 * out["se"]) 
-    out["ci_high"] = np.exp(out["beta"] + 1.96 * out["se"]) 
-
-    # AME (percentage points)
-    if ridge > 0.0:
-        p_hat = res.predict()
-    else:
-        p_hat = res.predict(res.model.exog)
-    V = np.asarray(p_hat * (1.0 - p_hat))
-    ame = {}
-    for v, _label in present:
-        if v in X.columns:
-            beta_v = params[v]
-            ame[v] = float(100.0 * np.mean(V * beta_v))
-    out["ame_pp"] = out["badge_var"].map(ame)
-
-    # Human-friendly labels and signs
-    label_map = {var: label for var, label in LEVER_VARS}
-    out["badge"] = out["badge_var"].map(label_map)
-    out["dir"] = out["beta"].apply(lambda b: "+" if b > 0 else ("-" if b < 0 else "0"))
-    out["sign"] = np.where(out["p"] >= 0.05, "0", np.where(out["beta"] > 0, "+", np.where(out["beta"] < 0, "-", "0")))
-
-    # Backward-compatible subset and enriched columns
-    ordered_cols = [
-        "badge", "beta", "p", "sign",
-        "dir", "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score",
-    ]
-    out = out[ordered_cols]
-
-    # Stable sort by badge label for predictable tables
-    out = out.sort_values("badge").reset_index(drop=True)
-
-    return out
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _empty_table() -> pd.DataFrame:
-    return pd.DataFrame(columns=[
-        "badge", "beta", "p", "sign",
-        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
-    ])
-
-
-def _load_df(df_or_path: Union[str, Path, pd.DataFrame]) -> pd.DataFrame:
-    if isinstance(df_or_path, pd.DataFrame):
-        return df_or_path.copy()
-    path = Path(df_or_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Choice file not found: {path}")
-    return pd.read_csv(path)
-
-
-def _coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Schema normalisation so runner/logit never disagree on column names.
-    Accept any of {"choice","chosen","picked","y"} as the outcome and map to "choice".
-    Create missing IDs; coerce lever dtypes; handle optional controls.
-    """
-    df = df.copy()
-
-    # --- Outcome: unify to 'choice' ---
-    if "choice" not in df.columns:
-        for cand in ("chosen", "picked", "y"):
-            if cand in df.columns:
-                df["choice"] = df[cand]
-                break
-    if "choice" not in df.columns:
-        raise KeyError("No outcome column found. Expected one of: 'choice','chosen','picked','y'.")
-    df["choice"] = pd.to_numeric(df["choice"], errors="coerce").fillna(0).astype(int)
-
-    # --- IDs ---
-    if "case_id" not in df.columns:
-        if "set_id" in df.columns:
-            df["case_id"] = df["set_id"].astype(str)
-        else:
-            df["case_id"] = "S0001"
-    if "prod_id" not in df.columns:
-        if "title" in df.columns:
-            df["prod_id"] = df["title"].astype(str)
-        else:
-            # ensure uniqueness within case if nothing else is available
-            df["prod_id"] = df.groupby("case_id").cumcount().astype(str)
-
-    # --- Levers to int ---
-    for var, _label in LEVER_VARS:
-        if var in df.columns:
-            df[var] = pd.to_numeric(df[var], errors="coerce").fillna(0).astype(int)
-
-    # --- Optional controls ---
-    for c in ["row", "col"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-    for c in ["price", "ln_price"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
+def _make_position_dummies(df: pd.DataFrame) -> pd.DataFrame:
+    """Create paper-style position dummies: row_top; col1, col2, col3 (baseline: bottom row, col4)."""
+    if "row" in df.columns:
+        df["row_top"] = (df["row"].astype(int) == 0).astype(int)
+    if "col" in df.columns:
+        ci = df["col"].astype(int)
+        df["col1"] = (ci == 0).astype(int)
+        df["col2"] = (ci == 1).astype(int)
+        df["col3"] = (ci == 2).astype(int)
     return df
 
+def _make_logs(df: pd.DataFrame) -> pd.DataFrame:
+    """Create ln_price and ln_reviews where applicable; guard against non-positive price."""
+    if (df["price"] <= 0).any():
+        raise ValueError("Found non-positive prices; ln(price) undefined. Clean or filter the data.")
+    df["ln_price"] = np.log(df["price"].astype(float))
+    if "reviews" in df.columns:
+        df["ln_reviews"] = np.log1p(df["reviews"].astype(float))
+    return df
 
-def _filter_complete_cases(df: pd.DataFrame) -> pd.DataFrame:
-    # keep only cases with 8 alternatives and exactly one choice==1
-    g = df.groupby("case_id")
-    mask = (g["choice"].transform("size") == 8) & (g["choice"].transform("sum") == 1)
-    return df.loc[mask].copy()
+def _collect_badge_columns(df: pd.DataFrame) -> list:
+    """Any column starting with badge_ is treated as a lever."""
+    return [c for c in df.columns if c.startswith("badge_")]
 
-# ---------------------------------------------------------------------------
-# Runner-side helper (optional): write full effects table to CSV with metadata
-# ---------------------------------------------------------------------------
+def _collect_model_dummies(df: pd.DataFrame) -> pd.DataFrame:
+    """Make model dummies if a 'model' column exists; return updated df."""
+    if "model" in df.columns:
+        df = pd.get_dummies(df, columns=["model"], drop_first=True)
+    return df
 
-def write_badge_effects_csv(df_badges: pd.DataFrame, badges_effects_path: Union[str, Path], job_meta: Dict[str, Any], include_legacy: bool = True, legacy_path: Union[str, Path] | None = None) -> None:
-    """Persist the full effects table plus job metadata.
+def _add_interactions(df: pd.DataFrame, badge_cols: list, model_cols: list, pos_cols: list) -> list:
+    """Create badge×model and position×model interactions; return list of interaction column names."""
+    inter_cols = []
+    for b in badge_cols:
+        for m in model_cols:
+            name = f"{b}_x_{m}"
+            df[name] = df[b] * df[m]
+            inter_cols.append(name)
+    for pvar in pos_cols:
+        if pvar in df.columns:
+            for m in model_cols:
+                name = f"{pvar}_x_{m}"
+                df[name] = df[pvar] * df[m]
+                inter_cols.append(name)
+    return inter_cols
 
-    Parameters
-    ----------
-    df_badges : DataFrame
-        Output of run_logit(...).
-    badges_effects_path : str | Path
-        Destination CSV for the rich effects table.
-    job_meta : dict
-        Keys you want to prepend as columns (e.g., job_id, timestamp, product, brand, price, currency, n_iterations).
-    include_legacy : bool
-        If True, also write a legacy 4-column CSV to legacy_path (or alongside if provided).
-    legacy_path : str | Path | None
-        Destination for the legacy file (badge,beta,p,sign). Required if include_legacy is True.
+def _build_design(df: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame, pd.Series, list]:
     """
-    badges_effects_path = Path(badges_effects_path)
-    if include_legacy and legacy_path is None:
-        raise ValueError("legacy_path must be provided when include_legacy=True")
+    Build y, X with absorbed FEs, retain original screen_id for clustering.
+    Returns: y, X, clusters, list_of_predictor_names_in_order
+    """
+    # Base levers (include position first for paper-style presentation)
+    lever_cols = []
+    for c in ["row_top", "col1", "col2", "col3"]:
+        if c in df.columns:
+            lever_cols.append(c)
+    if "ln_price" in df.columns:
+        lever_cols.append("ln_price")
+    if "rating" in df.columns:
+        lever_cols.append("rating")
+    if "ln_reviews" in df.columns:
+        lever_cols.append("ln_reviews")
 
-    # Preferred column order; keep whatever is present
-    pref = [
-        "badge", "beta", "p", "sign", "dir",
-        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"
-    ]
-    cols = [c for c in pref if c in df_badges.columns]
-    df_out = df_badges[cols].copy()
+    badge_cols = _collect_badge_columns(df)
+    df = _collect_model_dummies(df)
+    model_cols = [c for c in df.columns if c.startswith("model_")]
+    inter_cols = _add_interactions(df, badge_cols, model_cols, ["row_top", "col1", "col2", "col3"])
 
-    # Prepend metadata columns in a stable order
-    meta_keys = list(job_meta.keys())
-    for k in meta_keys[::-1]:
-        df_out.insert(0, k, job_meta[k])
+    # Keep original screen_id for clustering
+    clusters = df["screen_id"].astype(str)
 
-    badges_effects_path.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_csv(badges_effects_path, index=False)
+    # Absorb fixed effects via dummies (no intercept)
+    df_fe = pd.get_dummies(df, columns=["screen_id", "product"], drop_first=True)
 
-    if include_legacy:
-        legacy_cols = [c for c in ["badge", "beta", "p", "sign"] if c in df_badges.columns]
-        df_legacy = df_badges[legacy_cols].copy()
-        Path(legacy_path).parent.mkdir(parents=True, exist_ok=True)
-        df_legacy.to_csv(legacy_path, index=False)
+    # Assemble X variable list
+    x_vars = lever_cols + badge_cols + model_cols + inter_cols
+    fe_cols = [c for c in df_fe.columns if c.startswith("screen_id_") or c.startswith("product_")]
+
+    # Make sure all requested columns exist before selection
+    x_vars_existing = [c for c in x_vars if c in df_fe.columns]
+    X = df_fe[x_vars_existing + fe_cols]
+    y = df_fe["chosen"].astype(int)
+
+    return y, X, clusters, x_vars_existing
+
+def _check_one_choice_per_screen(df: pd.DataFrame) -> None:
+    counts = df.groupby("screen_id")["chosen"].sum()
+    ok = (counts == 1).all()
+    if not ok:
+        bad = counts[(counts != 1)]
+        print(f"Warning: {bad.shape[0]} screens violate one-choice-per-screen. Proceed with caution.", file=sys.stderr)
+
+def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series) -> pd.DataFrame:
+    """
+    Fit Binomial GLM (logit), cluster-robust SEs by screen, compute p, q_bh,
+    odds-ratios and CIs, AMEs, and evidence score. Return tidy DataFrame indexed by parameter name.
+    """
+    # Fit model without intercept because FE dummies already include baselines.
+    model = sm.GLM(y, X, family=sm.families.Binomial())
+    res = model.fit(cov_type="cluster", cov_kwds={"groups": clusters})
+
+    params = res.params.copy()
+    bse = res.bse.copy()
+    pvals = res.pvalues.copy()
+
+    # Benjamini–Hochberg FDR adjustment over all parameters
+    _, q_bh, _, _ = multipletests(pvals.values, method="fdr_bh")
+    q_bh = pd.Series(q_bh, index=pvals.index)
+
+    # Odds ratios and 95% CI on OR scale
+    odds_ratio = np.exp(params)
+    ci_low = np.exp(params - 1.96 * bse)
+    ci_high = np.exp(params + 1.96 * bse)
+
+    # Average marginal effects (approx.) — use global mean of p*(1−p)
+    p_hat = res.predict(X)
+    weight_mean = float(np.mean(p_hat * (1.0 - p_hat)))
+    ame_pp = 100.0 * weight_mean * params
+
+    evid_score = (params.abs() / bse.replace(0.0, np.nan))
+
+    out = pd.DataFrame({
+        "beta": params,
+        "se": bse,
+        "p": pvals,
+        "q_bh": q_bh,
+        "odds_ratio": odds_ratio,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "ame_pp": ame_pp,
+        "evid_score": evid_score
+    })
+    return out
+
+def main():
+    parser = argparse.ArgumentParser(description="Conditional (FE) logit for AI-agent readiness.")
+    parser.add_argument("--input", type=str, default="ai_agent_choices.csv", help="Input CSV with choices.")
+    parser.add_argument("--output", type=str, default="logit_readiness_results.csv", help="Output CSV for tidy results.")
+    parser.add_argument("--min_screens", type=int, default=10, help="Minimum number of screens required to proceed.")
+    args = parser.parse_args()
+
+    df = pd.read_csv(args.input)
+    _ensure_required_columns(df)
+
+    # Basic cleaning
+    df = df.dropna(subset=["chosen", "screen_id", "product", "price"]).copy()
+    _check_one_choice_per_screen(df)
+
+    # Create logs and paper-style position dummies
+    df = _make_logs(df)
+    df = _make_position_dummies(df)
+
+    # Build design with absorbed FE and cluster groups
+    y, X, clusters, x_vars = _build_design(df)
+
+    # Sample size checks
+    n_screens = df["screen_id"].nunique()
+    n_rows = df.shape[0]
+    if n_screens < args.min_screens:
+        raise ValueError(f"Insufficient screens for inference: {n_screens} < {args.min_screens}")
+    if X.shape[1] >= n_rows:
+        print("Warning: predictors (including FE dummies) nearly exhaust sample size; consider using a true clogit or reducing FE dimensionality.", file=sys.stderr)
+
+    # Fit and tidy
+    results = fit_logit_and_tidy(y, X, clusters)
+
+    # Persist
+    results.round(6).to_csv(args.output, index=True)
+
+    # Console summary for common levers, if present
+    show_keys = []
+    for v in ["row_top", "col1", "col2", "col3", "ln_price", "rating", "ln_reviews"]:
+        if v in results.index:
+            show_keys.append(v)
+    badge_keys = [ix for ix in results.index if ix.startswith("badge_")]
+    show_keys.extend(badge_keys)
+
+    print("Model fitted and results written to logit_readiness_results.csv")
+    if show_keys:
+        cols = ["beta", "se", "p", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score"]
+        safe_cols = [c for c in cols if c in results.columns]
+        print("=== Key Lever Effects (position, price, badges) ===")
+        print(results.loc[show_keys, safe_cols].to_string())
+
+if __name__ == "__main__":
+    main()
