@@ -50,6 +50,8 @@ from urllib.parse import quote
 import requests
 import pandas as pd
 from PIL import Image
+import numpy as np
+from hashlib import blake2b
 
 # selenium
 from selenium import webdriver
@@ -101,6 +103,54 @@ def _next_serial_for_today(path="run_serial.json") -> str:
     return f"{today}-{serial:03d}"
 
 RUN_ID = _next_serial_for_today()
+
+#enforce badges variations; the price frame between all-in v. partitioned is enforced in storefront.py file
+def _rng_from_job(job_id: str) -> np.random.Generator:
+    h = blake2b(job_id.encode("utf-8"), digest_size=8).digest()
+    seed = int.from_bytes(h, "little")
+    return np.random.default_rng(seed)
+
+def enforce_within_screen_variation(
+    df: pd.DataFrame,
+    screen_col: str = "case_id",
+    binary_badges: list[str] = None,
+    frame_pair: tuple[str, str] = ("frame_allin", "frame_partitioned"),
+    job_id: str = "job"
+) -> pd.DataFrame:
+    """
+    Ensure each screen has both levels (0/1) for every binary badge listed.
+    (The storefront already handles the 'frame' 4/4 blocking; this function
+    won’t touch 'frame' unless you add frame_* columns in the future.)
+    """
+    if binary_badges is None:
+        binary_badges = ["assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]
+
+    rng = _rng_from_job(job_id)
+    df = df.copy()
+
+    # coerce selected cols to {0,1}
+    for col in binary_badges:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).clip(0, 1)
+
+    # operate per screen
+    for sid, g in df.groupby(screen_col, sort=False):
+        idx = g.index.to_list()
+        n = len(idx)
+        if n < 2:
+            continue  # cannot vary with <2 alts
+
+        # binary badges: force at least one 0 and one 1 if column exists
+        for b in binary_badges:
+            if b not in g.columns:
+                continue
+            vals = g[b].to_numpy()
+            if np.unique(vals).size == 1:
+                j = int(rng.integers(0, n))
+                df.at[idx[j], b] = 1 - int(vals[j])
+
+    return df
+
 
 # ---------------- models ----------------
 MODEL_MAP = {
@@ -514,6 +564,12 @@ def _write_outputs(category: str, vendor: str, set_id: str, gt: dict, decision: 
               "scarcity","strike","timer","social_proof","voucher","bundle","chosen"):
         if c in df_choice.columns: 
             df_choice[c] = df_choice[c].astype(int)
+    df_choice = enforce_within_screen_variation(
+        df_choice,
+        screen_col="case_id",
+        binary_badges=["assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"],
+        job_id=RUN_ID
+    )
     agg_choice = RESULTS_DIR / "df_choice.csv"
     df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False)
 
@@ -728,6 +784,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
