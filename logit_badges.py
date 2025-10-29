@@ -51,6 +51,10 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.stats.multitest import multipletests
 
+# -----------------------
+# Existing helper methods
+# -----------------------
+
 def _ensure_required_columns(df: pd.DataFrame) -> None:
     required = ["screen_id", "product", "chosen", "price"]
     missing = [c for c in required if c not in df.columns]
@@ -190,6 +194,137 @@ def fit_logit_and_tidy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series) -> pd
         "evid_score": evid_score
     })
     return out
+
+# ------------------------------------------------------------
+# NEW: minimal compatibility layer for the app (API function)
+# ------------------------------------------------------------
+
+def _load_df(df_or_path):
+    """Accept a pandas DataFrame or a CSV/TXT path; return DataFrame."""
+    if isinstance(df_or_path, pd.DataFrame):
+        return df_or_path.copy()
+    if isinstance(df_or_path, str):
+        return pd.read_csv(df_or_path)
+    raise TypeError("run_logit expects a pandas DataFrame or a path to a CSV/TXT file.")
+
+def _results_to_rows(results_df: pd.DataFrame) -> list[dict]:
+    """
+    Convert the tidy results frame into the list of row dicts expected by the app:
+    includes only badge_* rows (UI is the 'Badge Effects' table), but carries
+    extended stats when available. Falls back gracefully if a field is missing.
+    """
+    rows = []
+    idx = list(results_df.index.astype(str))
+    # Optional price-equivalents if ln_price exists
+    b_price = None
+    if "ln_price" in idx and "beta" in results_df.columns and pd.notna(results_df.loc["ln_price", "beta"]):
+        try:
+            b_price = float(results_df.loc["ln_price", "beta"])
+        except Exception:
+            b_price = None
+
+    for name, row in results_df.iterrows():
+        if not str(name).startswith("badge_"):
+            continue
+        badge_label = str(name).replace("badge_", "")
+        beta = float(row.get("beta", np.nan)) if pd.notna(row.get("beta", np.nan)) else np.nan
+        se = float(row.get("se", np.nan)) if "se" in row else np.nan
+        p = float(row.get("p", np.nan)) if "p" in row else np.nan
+        q_bh = float(row.get("q_bh", np.nan)) if "q_bh" in row else np.nan
+        orx = float(row.get("odds_ratio", np.nan)) if "odds_ratio" in row else np.nan
+        ci_low = float(row.get("ci_low", np.nan)) if "ci_low" in row else np.nan
+        ci_high = float(row.get("ci_high", np.nan)) if "ci_high" in row else np.nan
+        ame_pp = float(row.get("ame_pp", np.nan)) if "ame_pp" in row else np.nan
+        evid = float(row.get("evid_score", np.nan)) if "evid_score" in row else np.nan
+        price_eq = np.nan
+        if b_price is not None and np.isfinite(b_price) and b_price != 0.0 and np.isfinite(beta):
+            try:
+                price_eq = float(np.exp(-beta / b_price))
+            except Exception:
+                price_eq = np.nan
+        sign = "0"
+        if np.isfinite(p) and p < 0.05 and np.isfinite(beta):
+            sign = "+" if beta > 0 else ("-" if beta < 0 else "0")
+
+        rows.append({
+            "badge": badge_label,
+            "beta": beta,
+            "se": se,
+            "p": p,
+            "q_bh": q_bh,
+            "odds_ratio": orx,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "ame_pp": ame_pp,
+            "evid_score": evid,
+            "price_eq": price_eq,
+            "sign": sign
+        })
+
+    # Stable alpha sort by badge label for predictable UI
+    rows.sort(key=lambda r: str(r.get("badge", "")))
+    return rows
+
+def run_logit(df_or_path, selected_badges=None, min_cases: int = 10, use_price: bool = True) -> list[dict]:
+    """
+    API used by the app. Returns a list of dict rows for the 'Badge Effects' table.
+    Keeps your modelling pipeline intact, only wraps it.
+
+    Parameters
+    ----------
+    df_or_path : DataFrame or str
+        Input data or path to CSV/TXT.
+    selected_badges : iterable or None
+        If provided, keep only these badges (match against the 'badge' name without the 'badge_' prefix).
+    min_cases : int
+        Minimum number of screens required; if not met, returns [].
+    use_price : bool
+        Kept for compatibility; modelling already includes ln_price when available.
+
+    Returns
+    -------
+    list[dict]
+        Each dict contains: badge, beta, se, p, q_bh, odds_ratio, ci_low, ci_high, ame_pp, evid_score, price_eq, sign
+    """
+    df = _load_df(df_or_path)
+    _ensure_required_columns(df)
+
+    # Basic cleaning
+    df = df.dropna(subset=["chosen", "screen_id", "product", "price"]).copy()
+    _check_one_choice_per_screen(df)
+
+    # Create logs and paper-style position dummies
+    df = _make_logs(df)
+    df = _make_position_dummies(df)
+
+    # Build design with absorbed FE and cluster groups
+    y, X, clusters, _xvars = _build_design(df)
+
+    # Sample size checks
+    n_screens = df["screen_id"].nunique()
+    n_rows = df.shape[0]
+    if n_screens < min_cases:
+        return []
+    if X.shape[1] >= n_rows:
+        # Still proceed; app expects best-effort rows even if near-saturated
+        print("Warning: predictors (including FE dummies) nearly exhaust sample size; consider clogit or reducing FE.", file=sys.stderr)
+
+    # Fit and tidy (DataFrame indexed by parameter name)
+    results = fit_logit_and_tidy(y, X, clusters)
+
+    # Convert to app rows (badges only for this table)
+    rows = _results_to_rows(results)
+
+    # Optional filter by selected badge names (without 'badge_' prefix)
+    if selected_badges:
+        want = set(str(b).strip().lower() for b in selected_badges)
+        rows = [r for r in rows if str(r.get("badge", "")).strip().lower() in want]
+
+    return rows
+
+# -----------------------
+# Original CLI entrypoint
+# -----------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Conditional (FE) logit for AI-agent readiness.")
