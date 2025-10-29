@@ -277,31 +277,32 @@ def _fit_glm_logit(y, X, cov_type: str, cov_kwds: dict | None):
 def _tidy_from_params(params, se, X):
     """Build tidy table given params and se; compute p, q_bh, OR, CI, AME, evid."""
     params = pd.Series(params, index=X.columns) if not isinstance(params, pd.Series) else params
-    se = pd.Series(se, index=X.columns) if not isinstance(se, pd.Series) else se
+    se     = pd.Series(se,     index=X.columns) if not isinstance(se,     pd.Series) else se
 
-    # z and two-sided p (as numpy), then store as Series for consistent indexing
+    # z and two-sided p
     z = params / se.replace(0.0, np.nan)
     pvals_arr = 2.0 * (1.0 - (0.5 * (1.0 + (2.0 / math.sqrt(math.pi)) *
                                      np.vectorize(math.erf)((np.abs(z)) / math.sqrt(2.0)))))
     pvals = pd.Series(np.asarray(pvals_arr, dtype=float), index=params.index)
 
-    # FDR with numpy array input (no .values on ndarray!)
+    # Benjamini–Hochberg on numpy array
     _, q_bh_arr, _, _ = multipletests(np.asarray(pvals, dtype=float), method="fdr_bh")
     q_bh = pd.Series(q_bh_arr, index=params.index)
 
-    # odds ratios with clipping
-    CLIP = 40.0
+    # Odds ratios with clipping to avoid overflow
+    CLIP = 40.0  # exp(±40) ≈ 2.35e17
     pruned = params.clip(lower=-CLIP, upper=CLIP)
     orx = np.exp(pruned)
-    
-    ci_arg_lo = np.clip(pruned - 1.96 * bse, -CLIP, CLIP)
-    ci_arg_hi = np.clip(pruned + 1.96 * bse, -CLIP, CLIP)
-    ci_low = np.exp(ci_arg_lo)
+
+    # CI on OR scale with clipping (use `se` here!)
+    ci_arg_lo = np.clip(pruned - 1.96 * se, -CLIP, CLIP)
+    ci_arg_hi = np.clip(pruned + 1.96 * se, -CLIP, CLIP)
+    ci_low  = np.exp(ci_arg_lo)
     ci_high = np.exp(ci_arg_hi)
 
     # AME (neutral weight), evidence
     ame_pp = 100.0 * 0.25 * params
-    evid = (params.abs() / se.replace(0.0, np.nan))
+    evid   = (params.abs() / se.replace(0.0, np.nan))
 
     out = pd.DataFrame({
         "beta": params,
@@ -580,6 +581,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
