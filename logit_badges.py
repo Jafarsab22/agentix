@@ -84,25 +84,81 @@ BADGE_VARS: List[str] = [
 # I/O helpers (minimal)
 # -----------------------
 
-def _load_df(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]]) -> pd.DataFrame:
+def _load_df(df_or_path):
     """
-    Accept a pandas DataFrame or a string path to CSV/TXT.
-    Also accepts a dict carrying 'choice_path' (string path) as used by the app.
+    Accept:
+      - pandas.DataFrame
+      - str / pathlib.Path to CSV/TXT/Parquet/JSON
+      - dict payloads (e.g., the app's 'payload') with a path under common keys,
+        including nested structures (choice_path, path, file, csv, data, paths.choice, etc.)
+      - file-like objects and raw CSV bytes
+
+    Returns a pandas DataFrame or raises a clear error.
     """
+    import pathlib, io, json
+
+    # 1) Already a DataFrame
     if isinstance(df_or_path, pd.DataFrame):
         return df_or_path.copy()
 
+    # 2) String/Path
+    if isinstance(df_or_path, (str, pathlib.Path)):
+        p = pathlib.Path(str(df_or_path))
+        if not p.exists():
+            raise FileNotFoundError(f"Choice file not found: {p}")
+        suf = p.suffix.lower()
+        if suf in {".csv", ".txt"}:
+            return pd.read_csv(p)
+        if suf in {".parquet"}:
+            return pd.read_parquet(p)
+        if suf in {".json"}:
+            return pd.read_json(p)
+        # default fallback: try CSV
+        return pd.read_csv(p)
+
+    # 3) Dict payloads (common in the app)
     if isinstance(df_or_path, dict):
-        cp = df_or_path.get("choice_path")
-        if isinstance(cp, str) and len(cp) > 0:
-            return pd.read_csv(cp)
-        raise TypeError("run_logit expected dict with 'choice_path' (str).")
+        # direct keys first
+        direct_keys = ("choice_path", "path", "file", "csv")
+        for k in direct_keys:
+            v = df_or_path.get(k)
+            if isinstance(v, (str, pathlib.Path)):
+                return _load_df(v)
+        # nested common structures, e.g., payload["paths"]["choice"]
+        for k in ("paths", "files", "data"):
+            v = df_or_path.get(k)
+            if isinstance(v, dict):
+                for kk in ("choice", "choices", "path", "file", "csv"):
+                    vv = v.get(kk)
+                    if isinstance(vv, (str, pathlib.Path)):
+                        return _load_df(vv)
+        # if dict looks like column→list mapping, try building a DataFrame
+        try:
+            return pd.DataFrame(df_or_path)
+        except Exception:
+            pass
 
-    if isinstance(df_or_path, str):
-        return pd.read_csv(df_or_path)
+    # 4) File-like
+    if hasattr(df_or_path, "read"):
+        try:
+            return pd.read_csv(df_or_path)
+        except Exception:
+            try:
+                df_or_path.seek(0)
+            except Exception:
+                pass
+            return pd.read_json(df_or_path)
 
-    raise TypeError("run_logit expects a pandas DataFrame, a CSV/TXT path (str), or a dict with 'choice_path'.")
+    # 5) Raw bytes
+    if isinstance(df_or_path, (bytes, bytearray)):
+        bio = io.BytesIO(df_or_path)
+        try:
+            return pd.read_csv(bio)
+        except Exception:
+            bio.seek(0)
+            return pd.read_json(bio)
 
+    raise TypeError("run_logit could not find a choice file: pass a DataFrame, a file path, or a payload dict containing it.")
 
 # -----------------------
 # Schema + feature prep
@@ -325,46 +381,32 @@ def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 def run_logit(df_or_path: Union[pd.DataFrame, str, Dict[str, Any]],
               selected_badges: List[str] | None = None,
-              min_cases: int = 5,
+              min_cases: int = 2,  # was 5/10; allow small pilot runs
               use_price: bool = True) -> List[Dict[str, Any]]:
-    """
-    App-facing API. Returns list[dict] for the 'Badge Effects' table.
-    Minimal, explicit schema: only maps case_id->screen_id and title->product.
-    """
     df = _load_df(df_or_path)
     df = _rename_core_columns(df)
     _ensure_required_columns(df)
-
-    # Basic cleaning
     df = df.dropna(subset=["chosen", "screen_id", "product", "price"]).copy()
     df["chosen"] = pd.to_numeric(df["chosen"], errors="coerce").fillna(0).astype(int)
-
-    # Derive position/log vars if needed
     df = _make_position_dummies(df)
     df = _make_logs(df)
 
-    # Guardrails
     n_screens = df["screen_id"].nunique()
     if n_screens < min_cases:
         return []
 
-    # Build, fit, tidy
     y, X, clusters, _xvars = _build_design(df)
     if X.shape[1] >= df.shape[0]:
         print("Warning: predictors incl. FE nearly exhaust sample size; inference may be unstable.", file=sys.stderr)
 
     results = fit_logit_and_tidy(y, X, clusters)
-
-    # Convert to app rows (badges only)
     rows = _results_to_rows(results)
 
-    # Optional filter by a subset of badges
     if selected_badges:
         want = set(s.strip().lower() for s in selected_badges)
         rows = [r for r in rows if str(r["badge"]).strip().lower() in want]
 
     return rows
-
 
 # -----------------------
 # CLI entrypoint (optional)
@@ -416,3 +458,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
