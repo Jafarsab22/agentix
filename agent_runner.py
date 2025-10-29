@@ -128,6 +128,30 @@ SCHEMA_JSON = {
     "required": ["chosen_title", "row", "col"],
     "additionalProperties": False
 }
+# ---- Normalise UI badge labels -> estimator column keys ----
+def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
+    mapping = {
+        "all-in v. partitioned pricing": "frame",
+        "all-in pricing": "frame",
+        "partitioned pricing": "frame",
+        "assurance": "assurance",
+        "scarcity tag": "scarcity",
+        "scarcity": "scarcity",
+        "strike-through": "strike",
+        "strike": "strike",
+        "timer": "timer",
+        "social proof": "social_proof",
+        "social": "social_proof",
+        "voucher": "voucher",
+        "bundle": "bundle",
+    }
+    allowed = {"assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"}
+    out: list[str] = []
+    for b in (badges or []):
+        k = mapping.get(str(b).strip().lower())
+        if k in allowed and k not in out:
+            out.append(k)
+    return out
 
 # ---- normalise UI badge labels → estimator column keys (non-frame only) ----
 def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
@@ -658,17 +682,16 @@ def run_job_sync(payload: Dict) -> Dict:
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
         try:
-            # Map UI labels to estimator columns; exclude frame selector
+            # Run the model with a normalised badge filter
             badge_filter = _normalize_badge_filter(badges)
-
-            # Run the model (2nd arg optionally filters which badge columns to estimate)
+            print("DEBUG badge_filter=", badge_filter)
             badge_table = logit_badges.run_logit(str(choice_path), badge_filter or None)
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
-
+    
             print("DEBUG badge_table_shape=", tuple(badge_table.shape))
             print("DEBUG badge_table_cols=", list(badge_table.columns))
-
+    
             if "badge" in badge_table.columns and not badge_table.empty:
                 pref_cols = [
                     "badge", "beta", "p", "sign",
@@ -676,7 +699,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 ]
                 cols = [c for c in pref_cols if c in badge_table.columns]
                 df_rich = badge_table[cols].copy()
-
+    
                 job_meta = {
                     "job_id": job_id,
                     "timestamp": ts,
@@ -689,11 +712,10 @@ def run_job_sync(payload: Dict) -> Dict:
                 }
                 for k in list(job_meta.keys())[::-1]:
                     df_rich.insert(0, k, job_meta[k])
-
+    
                 df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
-
                 badge_rows = badge_table.to_dict("records")
-
+    
                 artifacts["badges_effects"] = str(effects_path)
                 artifacts["effects_csv"] = str(effects_path)
                 artifacts["table_badges"] = str(effects_path)
@@ -703,6 +725,7 @@ def run_job_sync(payload: Dict) -> Dict:
             print("[logit] skipped due to error:", repr(e), flush=True)
     else:
         print("DEBUG choice file missing or empty")
+
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
     return {
@@ -743,3 +766,4 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
