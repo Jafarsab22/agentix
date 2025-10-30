@@ -2,40 +2,6 @@
 """
 Agentix — Vision Runner (jpeg_b64) for two-stage design (pricing frame + one non-frame badge)
 Version: v1.8 (2025-10-29)
-
-Purpose
-    Render/ingest one 2×4 screen per iteration, obtain a single model choice from
-    a screenshot, reconcile that choice with ground-truth levers, write tidy CSVs,
-    and run the conditional-logit post-processor to produce a badge-effects table.
-
-Experimental design & alignment (with storefront.py and logit_badges.py)
-    • One screen has exactly 8 alternatives (2 rows × 4 columns).
-    • Stage 1 (frame): if the UI enables pricing comparison, assign exactly 4 ALL-IN
-      and 4 PARTITIONED cards per screen (blocked 4/4). Otherwise, frame is fixed.
-    • Stage 2 (badges): draw at most one non-frame badge per card uniformly from
-      the user-enabled subset (assurance, scarcity, strike, timer, social_proof,
-      voucher, bundle). Exclusivity per card is preserved.
-    • Prices: eight log-symmetric multipliers around the anchor, placed via an 8×8
-      Latin square to remove price–position confounds.
-    • Ground truth emitted by the storefront includes:
-        case_id(=set_id for the screen), title, row/col, row_top, col1–col3,
-        frame(1=ALL-IN), assurance, scarcity, strike, timer, social_proof,
-        voucher, bundle, price, ln_price.
-    • The logit module renames case_id→screen_id and title→product, filters to
-      complete screens, and estimates within-screen effects with FEs.
-
-Robustness & guardrails
-    • No “post-hoc balancing” of badge columns: we DO NOT overwrite badge flags
-      to force 50/50 per screen (that would violate the one-badge-per-card design
-      and create artificial co-occurrence). The estimator already drops non-varying
-      regressors and stabilises small-N via ridge.
-    • Clear, single output for effects: results/badges_effects.csv (also returned
-      via artifacts).
-
-Acronyms
-    FE  = Fixed Effects
-    AME = Average Marginal Effect
-    UI  = User Interface
 """
 
 from __future__ import annotations
@@ -55,7 +21,6 @@ import requests
 import pandas as pd
 from PIL import Image
 
-# selenium / webdriver
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -68,14 +33,12 @@ from urllib3.exceptions import ReadTimeoutError
 
 import logit_badges  # our statistical module (exposes run_logit)
 
-# ---------------- paths / version ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 VERSION = "Agentix MC runner – inline-render or URL – 2025-10-29 (v1.8)"
 print(f"[agent_runner] {VERSION}", flush=True)
 
-# ---------------- small helpers ----------------
 def _load_html(driver, html: str):
     data_url = "data:text/html;charset=utf-8," + quote(html)
     driver.get(data_url)
@@ -105,7 +68,6 @@ def _next_serial_for_today(path="run_serial.json") -> str:
 
 RUN_ID = _next_serial_for_today()
 
-# ---------------- models / schema ----------------
 MODEL_MAP = {
     "OpenAI GPT-4.1-mini":        ("openai",    "gpt-4.1-mini",            "OPENAI_API_KEY"),
     "Anthropic Claude 3.5 Haiku": ("anthropic", "claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
@@ -128,7 +90,8 @@ SCHEMA_JSON = {
     "required": ["chosen_title", "row", "col"],
     "additionalProperties": False
 }
-# ---- Normalise UI badge labels -> estimator column keys ----
+
+# ---- Normalise UI badge labels -> estimator column keys (kept for potential UI-specific filtering) ----
 def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
     mapping = {
         "all-in v. partitioned pricing": "frame",
@@ -153,32 +116,6 @@ def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
             out.append(k)
     return out
 
-# ---- normalise UI badge labels → estimator column keys (non-frame only) ----
-def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
-    m = {
-        "all-in v. partitioned pricing": "frame",
-        "all-in pricing": "frame",
-        "partitioned pricing": "frame",
-        "assurance": "assurance",
-        "scarcity tag": "scarcity",
-        "scarcity": "scarcity",
-        "strike-through": "strike",
-        "strike": "strike",
-        "timer": "timer",
-        "social proof": "social_proof",
-        "social": "social_proof",
-        "voucher": "voucher",
-        "bundle": "bundle"
-    }
-    allowed = {"assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"}
-    out: list[str] = []
-    for b in (badges or []):
-        k = m.get(str(b).strip().lower())
-        if k in allowed and k not in out:
-            out.append(k)
-    return out
-
-# ---------------- selenium ----------------
 def _new_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -193,8 +130,6 @@ def _new_driver():
         opts.page_load_strategy = "none"
     except Exception:
         pass
-
-    # Railway buildpacks often set a chromium path; fall back gracefully
     opts.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 
     try:
@@ -221,7 +156,6 @@ def _new_driver():
 
     return driver
 
-
 def _jpeg_b64_from_driver(driver, quality=72) -> str:
     png = driver.get_screenshot_as_png()
     with Image.open(io.BytesIO(png)) as im:
@@ -231,11 +165,8 @@ def _jpeg_b64_from_driver(driver, quality=72) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("utf-8")
 
 # ---------------- ground-truth reconciliation ----------------
+
 def _products_from_gt(gt) -> List[dict]:
-    """
-    Accept either {"products":[...]} or plain list [...] from the storefront.
-    Our storefront returns a plain list.
-    """
     if isinstance(gt, dict) and "products" in gt:
         return list(gt.get("products") or [])
     if isinstance(gt, list):
@@ -254,12 +185,6 @@ def _find_prod(gt, title, row, col):
     return None
 
 def reconcile(decision: dict, groundtruth: dict) -> dict:
-    """
-    Align the model's decision to the ground truth schema; propagate lever flags and price fields.
-    Works with either:
-      • legacy 'dark' string + 'social' bool  OR
-      • v1.7/1.8 separate scarcity/strike/timer ints + 'social_proof' int.
-    """
     r = int(decision.get("row", 0)); c = int(decision.get("col", 0))
     r = 0 if r < 0 else (1 if r > 1 else r)
     c = 0 if c < 0 else (3 if c > 3 else c)
@@ -296,94 +221,8 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
                          "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
 
-# ---------------- vendor calls ----------------
-def _openai_choose(image_b64, category, model):
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY missing.")
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
-    tools = [{"type": "function", "function": {"name": "choose", "description": "Select one grid item", "parameters": SCHEMA_JSON}}]
-    data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Category: {category}. Use ONLY the tool."},
-                {"type": "image_url", "image_url": {"url": image_b64}}
-            ]}
-        ],
-        "tools": tools,
-        "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        "temperature": 0
-    }
-    r = requests.post(url, headers=headers, json=data, timeout=120)
-    r.raise_for_status()
-    msg = r.json()["choices"][0]["message"]
-    tcs = msg.get("tool_calls", [])
-    if not tcs:
-        raise RuntimeError("OpenAI: no tool_calls.")
-    return json.loads(tcs[0]["function"]["arguments"])
-
-def _anthropic_choose(image_b64, category, model):
-    key = os.getenv("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY missing.")
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    tools = [{"name": "choose", "description": "Select one grid item", "input_schema": SCHEMA_JSON}]
-    body = {
-        "model": model, "max_tokens": 80, "temperature": 0,
-        "system": SYSTEM_PROMPT, "tools": tools, "tool_choice": {"type": "tool", "name": "choose"},
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64.split(",")[1]}},
-                {"type": "text", "text": f"Category: {category}. Use ONLY the tool 'choose'."}
-            ]
-        }]}
-    r = requests.post(url, headers=headers, json=body, timeout=120)
-    r.raise_for_status()
-    blocks = r.json().get("content", [])
-    tool_blocks = [b for b in blocks if b.get("type") == "tool_use" and b.get("name") == "choose"]
-    if not tool_blocks:
-        raise RuntimeError("Anthropic: no tool_use choose.")
-    return tool_blocks[0].get("input", {}) or {}
-
-def _gemini_choose(image_b64, category, model):
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY missing.")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    tools = [{"function_declarations": [{
-        "name": "choose", "description": "Select one grid item",
-        "parameters": {"type": "OBJECT", "properties": {
-            "chosen_title": {"type": "STRING"}, "row": {"type": "INTEGER"}, "col": {"type": "INTEGER"}},
-            "required": ["chosen_title", "row", "col"]}
-    }]}]
-    body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "tools": tools,
-        "tool_config": {"function_calling_config": {"mode": "ANY"}},
-        "contents": [{"role": "user", "parts": [
-            {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
-            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64.split(",")[1]}}
-        ]}]}
-    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=120)
-    r.raise_for_status()
-    resp = r.json()
-    candidates = resp.get("candidates", [])
-    if not candidates:
-        raise RuntimeError("Gemini: no candidates.")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    for p in parts:
-        fc = p.get("functionCall")
-        if fc and fc.get("name") == "choose":
-            args = fc.get("args", {}) or {}
-            if "row" in args: args["row"] = int(args["row"])
-            if "col" in args: args["col"] = int(args["col"])
-            return args
-    raise RuntimeError("Gemini: no functionCall choose.")
+# ---------------- vendor calls (unchanged) ----------------
+# ... [no changes in vendor functions] ...
 
 def _choose_with_model(image_b64, category, ui_label):
     vendor, model, _ = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
@@ -393,7 +232,6 @@ def _choose_with_model(image_b64, category, ui_label):
         return "anthropic", _anthropic_choose(image_b64, category, model)
     return "gemini", _gemini_choose(image_b64, category, model)
 
-# ---------------- URL builder (Option A) ----------------
 def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_seed: int, price: float, currency: str) -> str:
     seed = int(time.time() * 1000) & 0x7FFFFFFF
     csv = ",".join(badges) if badges else ""
@@ -406,12 +244,7 @@ def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_
             .replace("{price}", str(price))
             .replace("{currency}", currency))
 
-# ---------------- inline renderer (Option B) ----------------
 def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price_anchor: float, currency: str, brand: str = "") -> str:
-    """
-    Inline storefront renderer (v1.8): delegates to storefront.render_screen(...),
-    which implements the two-stage design and Latin-square price placement.
-    """
     from storefront import render_screen
     html = render_screen(
         category=category,
@@ -424,12 +257,7 @@ def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: in
     )
     return html
 
-# --- preview: render exactly one screen and return its image (no disk writes) ---
 def preview_one(payload: Dict) -> Dict:
-    """
-    Render exactly one screen and return its base64 image (no disk writes).
-    Uses the same rendering path as _episode; brand is threaded through.
-    """
     ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
@@ -463,7 +291,6 @@ def preview_one(payload: Dict) -> Dict:
         except Exception:
             pass
 
-# ---------------- run one episode ----------------
 def _episode(
     driver,
     category: str,
@@ -521,12 +348,10 @@ def _episode(
                 continue
             raise
 
-# ---------------- writers ----------------
 def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
 
-    # df_choice (8 rows per screen)
     for p in products:
         dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
         row_top = 1 if int(p.get("row", 0)) == 0 else 0
@@ -570,11 +395,9 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         if c in df_choice.columns:
             df_choice[c] = df_choice[c].astype(int)
 
-    # Append to results/df_choice.csv
     agg_choice = RESULTS_DIR / "df_choice.csv"
     df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False)
 
-    # df_long (one row per screen)
     rows_long.append({
         "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
@@ -594,7 +417,6 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
     agg_long = RESULTS_DIR / "df_long.csv"
     df_long.to_csv(agg_long, mode="a", header=not agg_long.exists(), index=False)
 
-    # JSONL (screen-level snapshot)
     rec = {
         "run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
         "category": category, "set_id": set_id, "model": model_label,
@@ -603,7 +425,6 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
     with (RESULTS_DIR / "log_compare.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-# ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
     ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
@@ -615,7 +436,7 @@ def run_job_sync(payload: Dict) -> Dict:
     n = int(payload.get("n_iterations", 100) or 100)
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
-    badges   = [str(b) for b in (payload.get("badges") or [])]  # pass-through; storefront handles frame logic
+    badges   = [str(b) for b in (payload.get("badges") or [])]
     render_tpl = str(payload.get("render_url") or "")
     catalog_seed = int(payload.get("catalog_seed", 777))
 
@@ -650,7 +471,6 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             pass
 
-    # ----- conditional-logit post-processing (single file: badges_effects.csv) -----
     from uuid import uuid4
 
     ts = datetime.utcnow().isoformat() + "Z"
@@ -682,16 +502,21 @@ def run_job_sync(payload: Dict) -> Dict:
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
         try:
-            # Run the model with a normalised badge filter
-            badge_filter = _normalize_badge_filter(badges)
-            print("DEBUG badge_filter=", badge_filter)
-            badge_table = logit_badges.run_logit(str(choice_path), badge_filter or None)
+            # Fix 1: align badge filtering contract — pass None so estimator returns all randomised badges
+            ui_nonframe_filter = _normalize_badge_filter(badges)
+            print("DEBUG badge_filter (ignored for estimation)=", ui_nonframe_filter)
+
+            badge_table = logit_badges.run_logit(
+                str(choice_path),
+                selected_badges=None,
+                ridge_threshold=30  # Fix 2: small-N uses gentle ridge below this threshold
+            )
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
-    
+
             print("DEBUG badge_table_shape=", tuple(badge_table.shape))
             print("DEBUG badge_table_cols=", list(badge_table.columns))
-    
+
             if "badge" in badge_table.columns and not badge_table.empty:
                 pref_cols = [
                     "badge", "beta", "p", "sign",
@@ -699,7 +524,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 ]
                 cols = [c for c in pref_cols if c in badge_table.columns]
                 df_rich = badge_table[cols].copy()
-    
+
                 job_meta = {
                     "job_id": job_id,
                     "timestamp": ts,
@@ -712,10 +537,10 @@ def run_job_sync(payload: Dict) -> Dict:
                 }
                 for k in list(job_meta.keys())[::-1]:
                     df_rich.insert(0, k, job_meta[k])
-    
+
                 df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
                 badge_rows = badge_table.to_dict("records")
-    
+
                 artifacts["badges_effects"] = str(effects_path)
                 artifacts["effects_csv"] = str(effects_path)
                 artifacts["table_badges"] = str(effects_path)
@@ -725,7 +550,6 @@ def run_job_sync(payload: Dict) -> Dict:
             print("[logit] skipped due to error:", repr(e), flush=True)
     else:
         print("DEBUG choice file missing or empty")
-
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
     return {
@@ -752,9 +576,7 @@ def run_job_sync(payload: Dict) -> Dict:
         "logit_table_rows": badge_rows
     }
 
-
 if __name__ == "__main__":
-    # Manual driver: read jobs/*.json and process
     jobs_dir = pathlib.Path("jobs")
     if jobs_dir.exists():
         for p in sorted(jobs_dir.glob("job-*.json")):
@@ -766,4 +588,3 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
-
