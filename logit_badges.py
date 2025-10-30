@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-logit_badges — v1.13 (2025-10-30)
+logit_badges — v1.14 (2025-10-30)
 
 Purpose
     Estimate within-screen (conditional) logit effects for an 8-alternative choice
-    design with page fixed effects, handling small-N runs robustly.
+    design with page AND product fixed effects, handling small-N runs robustly.
 
 Key assumptions
     • Input: results/df_choice.csv produced by the runner (8 rows per screen).
-    • Screen FE via case_id dummies; optional product FE when N is adequate.
+    • Screen FE via case_id dummies; product FE via title dummies (always included if present).
     • Position controls: row_top, col1, col2, col3 (baseline = bottom row, Column 4).
     • Attribute: ln_price computed from price if present and > 0 (guarded).
     • Badges estimated independently: frame, assurance, scarcity, strike, timer,
       social_proof, voucher, bundle. Any non-varying regressor is dropped.
-    • Small-N stability: below MIN_CASES (default 10) we use ridge-IRLS with page FE;
-      for larger N we still default to ridge-IRLS (fast & stable). Product FE added
-      only when N >= MIN_CASES.
+    • Small-N stability: ridge-IRLS with numeric guards; no MLE branch (penalised estimator is default).
 
 Returns
     pandas.DataFrame with columns:
@@ -37,6 +35,7 @@ Usage
     tbl = run_logit("results/df_choice.csv", badge_filter=["frame","assurance","scarcity"])
 """
 
+
 from __future__ import annotations
 
 import math
@@ -45,9 +44,6 @@ import pandas as pd
 from scipy.special import expit
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
-import matplotlib
-matplotlib.use("Agg")  # safe for headless servers
-import matplotlib.pyplot as plt
 
 # ----------------- knobs -----------------
 MIN_CASES = 10
@@ -124,7 +120,7 @@ def _is_var(col: pd.Series) -> bool:
         return False
 
 def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-    # ensure numeric dummies exist for positions if provided as bools/strings
+    # ensure numeric dummies exist for positions/badges even if given as strings/bools
     for c in POS_COLS + BADGE_KEYS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(float)
@@ -135,15 +131,18 @@ def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
         pr = pr.where(pr > 0)
         if pr.notna().any():
             df["ln_price"] = np.log(pr).fillna(0.0)
+
+    # enforce string type for product id used in FEs
+    if "title" in df.columns:
+        df["title"] = df["title"].astype(str).fillna("")
     return df
 
 def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int):
+    # main regressors: position, attribute(s), badges
     cols = [c for c in POS_COLS if c in df.columns]
-    # attribute
     if "ln_price" in df.columns and _is_var(df["ln_price"]):
         cols.append("ln_price")
 
-    # badges
     targets = BADGE_KEYS if not badge_filter else [b for b in badge_filter if b in BADGE_KEYS]
     dropped = []
     for b in targets:
@@ -156,17 +155,17 @@ def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int
 
     X_main = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(np.float64)
 
+    # fixed effects: ALWAYS include page FE and product FE (if title exists)
     d_case = pd.get_dummies(df["case_id"], drop_first=True, dtype=np.float64)
-    d_prod = None
-    if n_cases >= MIN_CASES and "title" in df.columns:
+    if "title" in df.columns:
         d_prod = pd.get_dummies(df["title"], drop_first=True, dtype=np.float64)
-
-    if d_prod is not None:
         X = pd.concat([X_main, d_case, d_prod], axis=1)
         fe_cols = d_case.shape[1] + d_prod.shape[1]
+        print(f"[logit] product FEs included: {d_prod.shape[1]} dummies", flush=True)
     else:
         X = pd.concat([X_main, d_case], axis=1)
         fe_cols = d_case.shape[1]
+        print("[logit] product FEs skipped (no 'title' column)", flush=True)
 
     X = X.astype(np.float64)
     y = pd.to_numeric(df["chosen"], errors="coerce").fillna(0.0).astype(np.float64).values
@@ -272,52 +271,71 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
 
     return table
 
-# ----------------- heat-map generator -----------------
-def save_position_heatmap(path_csv: str, out_png_path: str, title: str | None = None) -> str:
+
+# ----------------- probability-based heat-map (darker = higher selection) -----------------
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+def save_position_heatmap(path_csv: str,
+                          out_png_path: str,
+                          title: str | None = None) -> str:
     """
-    Create a 2×4 heat-map of selection rates by (row, col), saving to PNG.
-    Row labels: Row 1 (top), Row 2 (bottom). Columns: 1..4.
+    Render a 2×4 heat-map of MODEL-IMPLIED selection probabilities by (row, col).
+    Steps: rebuild design X with the same helpers used in run_logit(), fit ridge logit,
+    compute \hat p for every alternative, then average \hat p within each grid cell.
+    Darker shades indicate higher predicted selection.
+
+    Rows: Row 1 (top, index 0), Row 2 (bottom, index 1).
+    Columns: 1..4 (indices 0..3).
     """
+    # Load & prep exactly as in run_logit()
     df = pd.read_csv(path_csv)
+    df = _prepare_df(df)
+    df = _complete_screens(df)
 
-    # keep only complete 8-alt screens
-    counts = df.groupby("case_id").size()
-    keep = counts[counts == 8].index
-    df = df[df["case_id"].isin(keep)].copy()
+    # Rebuild design and fit the same penalised logit
+    n_cases = int(df["case_id"].nunique())
+    X, y, cols, fe_cols = _build_design(df, badge_filter=None, n_cases=n_cases)
+    alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
+    beta, cov, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
 
-    # numeric guards
-    df["row"] = pd.to_numeric(df["row"], errors="coerce").fillna(-1).astype(int)
-    df["col"] = pd.to_numeric(df["col"], errors="coerce").fillna(-1).astype(int)
-    df["chosen"] = pd.to_numeric(df["chosen"], errors="coerce").fillna(0.0).astype(float)
-
-    # mean chosen by cell; fill missing with 0
+    # Aggregate model-implied probabilities by grid cell
+    df = df.copy()
+    df["p_hat"] = p_hat
     mat = np.zeros((2, 4), dtype=float)
-    g = df.groupby(["row","col"])["chosen"].mean()
+    g = df.groupby(["row", "col"])["p_hat"].mean()
     for (r, c), v in g.items():
-        if 0 <= int(r) <= 1 and 0 <= int(c) <= 3:
-            mat[int(r), int(c)] = float(v)
+        r = int(r); c = int(c)
+        if 0 <= r <= 1 and 0 <= c <= 3:
+            mat[r, c] = float(v)
 
-    fig, ax = plt.subplots(figsize=(6.2, 3.2), dpi=144)
-    #im = ax.imshow(mat, vmin=0.0, vmax=1.0)
-    im = ax.imshow(mat, cmap="viridis_r", vmin=0.0, vmax=1.0)
+    # Plot (darker = higher)
+    fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
+    im = ax.imshow(mat, cmap="Greys_r", vmin=0.0, vmax=1.0)
 
+    # Annotate with percentages
     for r in range(2):
         for c in range(4):
-            ax.text(c, r, f"{100.0*mat[r,c]:.1f}%", ha="center", va="center", fontsize=9)
+            ax.text(c, r, f"{100.0 * mat[r, c]:.1f}%", ha="center", va="center", fontsize=9)
 
-    ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1","Col 2","Col 3","Col 4"])
-    ax.set_yticks([0,1]);    ax.set_yticklabels(["Row 1","Row 2"])
-    ax.set_xlabel("Column"); ax.set_ylabel("Row")
-    if title:
-        ax.set_title(title, fontsize=11)
+    # Axes, labels, title
+    ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"])
+    ax.set_yticks([0, 1]);    ax.set_yticklabels(["Row 1", "Row 2"])
+    ax.set_xlabel("Column");  ax.set_ylabel("Row")
+    ax.set_title(title or "Webpage heatmap of AI shopping agents", fontsize=11)
 
+    # Colorbar + light grid
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.set_ylabel("Selection rate", rotation=270, labelpad=12)
+    cbar.ax.set_ylabel("Model-implied selection probability", rotation=270, labelpad=12)
+    ax.set_xticks(np.arange(-.5, 4, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, 2, 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6, alpha=0.6)
+    ax.tick_params(which="minor", bottom=False, left=False)
 
     fig.tight_layout()
     fig.savefig(out_png_path)
     plt.close(fig)
     return out_png_path
-
-
-
