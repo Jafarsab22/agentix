@@ -264,11 +264,8 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     rows = results.get("logit_table_rows") or []
 
     if rows:
-        # Keep original behaviour: sort by badge label (string-safe)
         rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
         header = "### Badge Effects\n\n"
-
-        # Extended columns if present; graceful fallback when fields are missing
         table = [
             "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
@@ -303,7 +300,21 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
             artifacts["effects_csv"] = csv_path
         if html_path:
             artifacts["effects_html"] = html_path
-        msg = header + "\n".join(table)
+
+        # NEW: inline position heat-map if available (supports both keys)
+        # Your exact snippet semantics are preserved.
+        hm_path = results.get("artifacts", {}).get("position_heatmap", "") or results.get("artifacts", {}).get("position_heatmap_png", "")
+        if hm_path:
+            try:
+                with open(hm_path, "rb") as _f:
+                    import base64 as _b64
+                    _b = _b64.b64encode(_f.read()).decode("utf-8")
+                img_tag = f'\n\n<img alt="Position heat-map" src="data:image/png;base64,{_b}" style="max-width:420px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
+                msg = header + "\n".join(table) + img_tag
+            except Exception:
+                msg = header + "\n".join(table)
+        else:
+            msg = header + "\n".join(table)
     else:
         msg = "No badge effects computed."
 
@@ -323,8 +334,6 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         results.setdefault("artifacts", {})["agentix_persist_error"] = str(e)
 
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
-
-
 
 
 @_catch_and_report
@@ -666,6 +675,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
