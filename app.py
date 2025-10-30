@@ -254,71 +254,89 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         fresh=True,
     )
 
-    # Ensure the latest logit_badges (and its run_logit) is used in this request
     import importlib, logit_badges
     logit_badges = importlib.reload(logit_badges)
 
     results = run_job_sync(payload)
 
-    # Build the badge-effects table from results["logit_table_rows"]
     rows = results.get("logit_table_rows") or []
+    model_caption = f"{payload.get('product','')} · {payload.get('model','')}"
+
+    def _fmt(x, nd=3):
+        try:
+            return f"{float(x):.{nd}f}"
+        except Exception:
+            return "—"
 
     if rows:
-        rows_sorted = sorted(rows, key=lambda r: str(r.get("badge", "")))
-        header = "### Badge Effects\n\n"
-        table = [
-            "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        # Canonical ordering per section
+        pos_order = ["Row 1", "Column 1", "Column 2", "Column 3"]
+        badge_order = [
+            "All-in framing", "Assurance", "Scarcity tag",
+            "Strike-through", "Timer", "Social proof", "Voucher", "Bundle"
         ]
+        attr_order = ["ln(price)"]
 
-        def _fmt(x, nd=3):
-            try:
-                return f"{float(x):.{nd}f}"
-            except Exception:
-                return "—"
+        # Partition rows into sections
+        pos_rows = [r for r in rows if str(r.get("badge","")) in pos_order]
+        badge_rows = [r for r in rows if str(r.get("badge","")) in badge_order]
+        attr_rows = [r for r in rows if str(r.get("badge","")) in attr_order]
 
-        for r in rows_sorted:
-            beta = _fmt(r.get("beta"))
-            se = _fmt(r.get("se"))
-            pval = _fmt(r.get("p", r.get("p_value")), nd=4)
-            qbh = _fmt(r.get("q_bh"), nd=4)
-            orx = _fmt(r.get("odds_ratio"))
-            ci_l = _fmt(r.get("ci_low"))
-            ci_h = _fmt(r.get("ci_high"))
-            ame = _fmt(r.get("ame_pp"))
-            evid = _fmt(r.get("evid_score"))
-            peq = _fmt(r.get("price_eq"))
-            sgn = r.get("sign", "0")
-            table.append(
-                f"| {r.get('badge','')} | {beta} | {se} | {pval} | {qbh} | {orx} | {ci_l} | {ci_h} | {ame} | {evid} | {peq} | {sgn} |"
-            )
+        # Sort within section
+        pos_rows.sort(key=lambda r: pos_order.index(r.get("badge")) if r.get("badge") in pos_order else 999)
+        badge_rows.sort(key=lambda r: badge_order.index(r.get("badge")) if r.get("badge") in badge_order else 999)
+        attr_rows.sort(key=lambda r: attr_order.index(r.get("badge")) if r.get("badge") in attr_order else 999)
 
-        # Local export (optional download via Stats)
-        csv_path, html_path = _export_badge_effects(rows_sorted, payload, job_id)
+        def _mk_table(section_title, section_rows):
+            if not section_rows:
+                return ""
+            lines = [
+                f"#### {section_title}\n",
+                "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+            ]
+            for r in section_rows:
+                lines.append(
+                    f"| {r.get('badge','')} | "
+                    f"{_fmt(r.get('beta'))} | {_fmt(r.get('se'))} | "
+                    f"{_fmt(r.get('p', r.get('p_value')), 4)} | {_fmt(r.get('q_bh'), 4)} | "
+                    f"{_fmt(r.get('odds_ratio'))} | {_fmt(r.get('ci_low'))} | {_fmt(r.get('ci_high'))} | "
+                    f"{_fmt(r.get('ame_pp'))} | {_fmt(r.get('evid_score'))} | {_fmt(r.get('price_eq'))} | "
+                    f"{r.get('sign','0')} |"
+                )
+            return "\n".join(lines) + "\n"
+
+        header = f"### Badge Effects\n\n*{model_caption}*\n\n"
+        msg_sections = []
+        msg_sections.append(_mk_table("Position effects", pos_rows))
+        msg_sections.append(_mk_table("Badge/lever effects", badge_rows))
+        if attr_rows:
+            msg_sections.append(_mk_table("Attribute effects", attr_rows))
+
+        # Export CSV/HTML for local download
+        csv_path, html_path = _export_badge_effects(pos_rows + badge_rows + attr_rows, payload, job_id)
         artifacts = results.setdefault("artifacts", {})
         if csv_path:
             artifacts["effects_csv"] = csv_path
         if html_path:
             artifacts["effects_html"] = html_path
 
-        # NEW: inline position heat-map if available (supports both keys)
-        # Your exact snippet semantics are preserved.
+        # Inline heat-map if available
         hm_path = results.get("artifacts", {}).get("position_heatmap", "") or results.get("artifacts", {}).get("position_heatmap_png", "")
         if hm_path:
             try:
                 with open(hm_path, "rb") as _f:
                     import base64 as _b64
                     _b = _b64.b64encode(_f.read()).decode("utf-8")
-                img_tag = f'\n\n<img alt="Position heat-map" src="data:image/png;base64,{_b}" style="max-width:420px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
-                msg = header + "\n".join(table) + img_tag
+                img_tag = f'\n\n<img alt="Position heat-map" src="data:image/png;base64,{_b}" style="max-width:520px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
+                msg = header + "".join(msg_sections) + img_tag
             except Exception:
-                msg = header + "\n".join(table)
+                msg = header + "".join(msg_sections)
         else:
-            msg = header + "\n".join(table)
+            msg = header + "".join(msg_sections)
     else:
         msg = "No badge effects computed."
 
-    # Persist to Hostinger DB via PHP endpoints (best-effort) — unchanged
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -675,6 +693,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
