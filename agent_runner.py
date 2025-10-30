@@ -1,7 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-Agentix — Vision Runner (jpeg_b64) for two-stage design (pricing frame + one non-frame badge)
-Version: v1.8 (2025-10-29)
+Agentix — Vision Runner (jpeg_b64) for two-stage design
+Version: v1.9 (2025-10-30)
+
+Key assumptions and alignment
+    1) One choice per screen; each screen has exactly 8 alternatives (2×4).
+    2) Frame is assigned independently of non-frame badges. If the UI selects the
+       frame comparison, we block 4 ALL-IN and 4 PARTITIONED per screen; otherwise
+       frame is fixed. This matches storefront.render_screen(...).
+    3) Exactly one non-frame visual badge per card, drawn from the enabled set
+       with a balanced per-screen allocation that includes a true “none” cell.
+    4) Prices follow eight log-symmetric levels around the anchor and are placed
+       with an 8×8 Latin square to remove price–position confounds.
+    5) Ground truth is a plain list of 8 dicts under the hidden #groundtruth div
+       in the HTML (no wrapper object); keys match the logit module:
+       case_id/set_id, title, row/col, row_top, col1–col3, frame, assurance,
+       scarcity, strike, timer, social_proof, voucher, bundle, price, ln_price.
+    6) Post-processing uses logit_badges.run_logit(...) which renames case_id→
+       screen_id and absorbs screen FEs; product FEs are included unless near-
+       saturated. We never “post-hoc balance” columns in the runner.
+
+Why this fixes the crash
+    The previous file called _openai_choose / _anthropic_choose / _gemini_choose
+    but those symbols weren’t defined in that module. This revision uses
+    call_openai / call_anthropic / call_gemini (your Colab convention) and
+    routes through _choose_with_model which dispatches to those functions.
+
+Env & I/O
+    • Requires one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
+      (the app currently exposes “OpenAI GPT-4.1-mini” in the dropdown).
+    • Writes results/df_choice.csv, results/df_long.csv, results/log_compare.jsonl,
+      and results/badges_effects.csv. Returns rows for the UI table.
 """
 
 from __future__ import annotations
@@ -21,25 +50,29 @@ import requests
 import pandas as pd
 from PIL import Image
 
+# selenium / webdriver
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 from urllib3.exceptions import ReadTimeoutError
 
-import logit_badges  # our statistical module (exposes run_logit)
+import logit_badges  # exposes run_logit
 
+# ---------------- paths / version ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "Agentix MC runner – inline-render or URL – 2025-10-29 (v1.8)"
+VERSION = "Agentix MC runner – inline-render or URL – 2025-10-30 (v1.9)"
 print(f"[agent_runner] {VERSION}", flush=True)
 
+# ---------------- small helpers ----------------
 def _load_html(driver, html: str):
+    from urllib.parse import quote
     data_url = "data:text/html;charset=utf-8," + quote(html)
     driver.get(data_url)
 
@@ -68,6 +101,7 @@ def _next_serial_for_today(path="run_serial.json") -> str:
 
 RUN_ID = _next_serial_for_today()
 
+# ---------------- models / schema ----------------
 MODEL_MAP = {
     "OpenAI GPT-4.1-mini":        ("openai",    "gpt-4.1-mini",            "OPENAI_API_KEY"),
     "Anthropic Claude 3.5 Haiku": ("anthropic", "claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
@@ -91,7 +125,7 @@ SCHEMA_JSON = {
     "additionalProperties": False
 }
 
-# ---- Normalise UI badge labels -> estimator column keys (kept for potential UI-specific filtering) ----
+# ---- Badge filter (non-frame only, for post-estimation table) ----
 def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
     mapping = {
         "all-in v. partitioned pricing": "frame",
@@ -116,6 +150,7 @@ def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
             out.append(k)
     return out
 
+# ---------------- selenium ----------------
 def _new_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -130,7 +165,11 @@ def _new_driver():
         opts.page_load_strategy = "none"
     except Exception:
         pass
-    opts.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+
+    # Railway often provides a Chromium binary
+    bin_hint = os.getenv("CHROME_BIN")
+    if bin_hint:
+        opts.binary_location = bin_hint
 
     try:
         service = Service()
@@ -165,7 +204,6 @@ def _jpeg_b64_from_driver(driver, quality=72) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("utf-8")
 
 # ---------------- ground-truth reconciliation ----------------
-
 def _products_from_gt(gt) -> List[dict]:
     if isinstance(gt, dict) and "products" in gt:
         return list(gt.get("products") or [])
@@ -221,17 +259,118 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
                          "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
 
-# ---------------- vendor calls (unchanged) ----------------
-# ... [no changes in vendor functions] ...
+# ---------------- vendor calls (Colab-conform) ----------------
+def call_openai(image_b64: str, category: str, model_name: str):
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY missing.")
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
+    tools = [{"type": "function", "function": {"name": "choose", "description": "Select one grid item", "parameters": SCHEMA_JSON}}]
+    data = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": f"Category: {category}. Use ONLY the tool."},
+                {"type": "image_url", "image_url": {"url": image_b64}}
+            ]}
+        ],
+        "tools": tools,
+        "tool_choice": {"type": "function", "function": {"name": "choose"}},
+        "temperature": 0
+    }
+    r = requests.post(url, headers=headers, json=data, timeout=120)
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+    tcs = msg.get("tool_calls", [])
+    if not tcs:
+        raise RuntimeError("OpenAI: no tool_calls.")
+    return json.loads(tcs[0]["function"]["arguments"])
+
+def _post_with_retries(url, headers, payload, timeout=120, max_attempts=6, backoff_base=0.75, backoff_cap=12.0):
+    import random as _random
+    sess = requests.Session()
+    last = None
+    for attempt in range(1, max_attempts + 1):
+        last = sess.post(url, headers=headers, json=payload, timeout=timeout)
+        if last.status_code < 400:
+            return last
+        if last.status_code in (429, 529) or (500 <= last.status_code < 600):
+            sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+            sleep_s *= _random.uniform(0.5, 1.5)
+            time.sleep(sleep_s); continue
+        break
+    raise RuntimeError(f"Anthropic error {getattr(last, 'status_code', 'NA')}: {getattr(last, 'text', '')[:400]}")
+
+def call_anthropic(image_b64: str, category: str, model_name: str):
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY missing.")
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    tools = [{"name": "choose", "description": "Select one grid item", "input_schema": SCHEMA_JSON}]
+    body = {
+        "model": model_name, "max_tokens": 80, "temperature": 0,
+        "system": SYSTEM_PROMPT, "tools": tools, "tool_choice": {"type": "tool", "name": "choose"},
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64.split(",")[1]}},
+                {"type": "text", "text": f"Category: {category}. Use ONLY the tool 'choose'."}
+            ]
+        }]}
+    r = _post_with_retries(url, headers, body, timeout=120)
+    blocks = r.json().get("content", [])
+    tool_blocks = [b for b in blocks if b.get("type") == "tool_use" and b.get("name") == "choose"]
+    if not tool_blocks:
+        raise RuntimeError("Anthropic: no tool_use choose.")
+    return tool_blocks[0].get("input", {}) or {}
+
+def call_gemini(image_b64: str, category: str, model_name: str):
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY missing.")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+    tools = [{"function_declarations": [{
+        "name": "choose", "description": "Select one grid item",
+        "parameters": {"type": "OBJECT", "properties": {
+            "chosen_title": {"type": "STRING"}, "row": {"type": "INTEGER"}, "col": {"type": "INTEGER"}},
+            "required": ["chosen_title", "row", "col"]}
+    }]}]
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "tools": tools,
+        "tool_config": {"function_calling_config": {"mode": "ANY"}},
+        "contents": [{"role": "user", "parts": [
+            {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
+            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64.split(",")[1]}}
+        ]}]}
+    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=120)
+    r.raise_for_status()
+    resp = r.json()
+    candidates = resp.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini: no candidates.")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    for p in parts:
+        fc = p.get("functionCall")
+        if fc and fc.get("name") == "choose":
+            args = fc.get("args", {}) or {}
+            if "row" in args: args["row"] = int(args["row"])
+            if "col" in args: args["col"] = int(args["col"])
+            return args
+    raise RuntimeError("Gemini: no functionCall choose.")
 
 def _choose_with_model(image_b64, category, ui_label):
     vendor, model, _ = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
     if vendor == "openai":
-        return "openai", _openai_choose(image_b64, category, model)
+        return "openai", call_openai(image_b64, category, model)
     if vendor == "anthropic":
-        return "anthropic", _anthropic_choose(image_b64, category, model)
-    return "gemini", _gemini_choose(image_b64, category, model)
+        return "anthropic", call_anthropic(image_b64, category, model)
+    return "gemini", call_gemini(image_b64, category, model)
 
+# ---------------- URL builder (Option A) ----------------
 def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_seed: int, price: float, currency: str) -> str:
     seed = int(time.time() * 1000) & 0x7FFFFFFF
     csv = ",".join(badges) if badges else ""
@@ -244,6 +383,7 @@ def _build_url(tpl: str, category: str, set_id: str, badges: List[str], catalog_
             .replace("{price}", str(price))
             .replace("{currency}", currency))
 
+# ---------------- inline renderer (Option B) ----------------
 def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: int, price_anchor: float, currency: str, brand: str = "") -> str:
     from storefront import render_screen
     html = render_screen(
@@ -257,6 +397,7 @@ def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: in
     )
     return html
 
+# --- preview: render exactly one screen and return its image (no disk writes) ---
 def preview_one(payload: Dict) -> Dict:
     ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     category = str(payload.get("product") or "product")
@@ -291,6 +432,7 @@ def preview_one(payload: Dict) -> Dict:
         except Exception:
             pass
 
+# ---------------- run one episode ----------------
 def _episode(
     driver,
     category: str,
@@ -348,10 +490,12 @@ def _episode(
                 continue
             raise
 
+# ---------------- writers ----------------
 def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
 
+    # df_choice (8 rows per screen)
     for p in products:
         dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
         row_top = 1 if int(p.get("row", 0)) == 0 else 0
@@ -395,9 +539,11 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         if c in df_choice.columns:
             df_choice[c] = df_choice[c].astype(int)
 
+    # Append to results/df_choice.csv
     agg_choice = RESULTS_DIR / "df_choice.csv"
     df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False)
 
+    # df_long (one row per screen)
     rows_long.append({
         "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
@@ -417,6 +563,7 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
     agg_long = RESULTS_DIR / "df_long.csv"
     df_long.to_csv(agg_long, mode="a", header=not agg_long.exists(), index=False)
 
+    # JSONL (screen-level snapshot)
     rec = {
         "run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
         "category": category, "set_id": set_id, "model": model_label,
@@ -425,6 +572,7 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
     with (RESULTS_DIR / "log_compare.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+# ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
     ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
     vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
@@ -471,6 +619,7 @@ def run_job_sync(payload: Dict) -> Dict:
         except Exception:
             pass
 
+    # ----- conditional-logit post-processing (single file: badges_effects.csv) -----
     from uuid import uuid4
 
     ts = datetime.utcnow().isoformat() + "Z"
@@ -502,15 +651,9 @@ def run_job_sync(payload: Dict) -> Dict:
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
         try:
-            # Fix 1: align badge filtering contract — pass None so estimator returns all randomised badges
-            ui_nonframe_filter = _normalize_badge_filter(badges)
-            print("DEBUG badge_filter (ignored for estimation)=", ui_nonframe_filter)
-
-            badge_table = logit_badges.run_logit(
-                str(choice_path),
-                selected_badges=None,
-                ridge_threshold=30  # Fix 2: small-N uses gentle ridge below this threshold
-            )
+            badge_filter = _normalize_badge_filter(badges)
+            print("DEBUG badge_filter=", badge_filter)
+            badge_table = logit_badges.run_logit(str(choice_path), badge_filter or None)
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
 
@@ -576,7 +719,9 @@ def run_job_sync(payload: Dict) -> Dict:
         "logit_table_rows": badge_rows
     }
 
+
 if __name__ == "__main__":
+    # Manual driver: read jobs/*.json and process
     jobs_dir = pathlib.Path("jobs")
     if jobs_dir.exists():
         for p in sorted(jobs_dir.glob("job-*.json")):
