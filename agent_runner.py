@@ -142,7 +142,7 @@ def _normalize_badge_filter(badges: Iterable[str]) -> list[str]:
         "voucher": "voucher",
         "bundle": "bundle",
     }
-    allowed = {"assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"}
+    allowed = {"frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"}
     out: list[str] = []
     for b in (badges or []):
         k = mapping.get(str(b).strip().lower())
@@ -740,4 +740,5 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
