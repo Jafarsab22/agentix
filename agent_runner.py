@@ -651,9 +651,16 @@ def run_job_sync(payload: Dict) -> Dict:
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
         try:
-            badge_filter = _normalize_badge_filter(badges)
-            print("DEBUG badge_filter=", badge_filter)
-            badge_table = logit_badges.run_logit(str(choice_path), badge_filter or None)
+            # Map internal keys -> human-readable labels expected by logit_badges.run_logit
+            internal_keys = _normalize_badge_filter(badges)
+            label_map = getattr(logit_badges, "BADGE_LABELS", {})
+            label_filter = [label_map.get(k, k) for k in internal_keys]
+            
+            print("DEBUG badge_filter_internal=", internal_keys)
+            print("DEBUG badge_filter_labels=", label_filter)
+            
+            badge_table = logit_badges.run_logit(str(choice_path), None)
+
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
 
@@ -733,3 +740,4 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
