@@ -241,6 +241,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     if err:
         return err, "{}"
 
+    import uuid
     job_id = f"job-preview-{uuid.uuid4().hex[:8]}"
     payload = _build_payload(
         job_id=job_id,
@@ -266,7 +267,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     def _fmt(x, nd=3):
         try:
             v = float(x)
-            if v != v:  # NaN
+            if v != v:
                 return "—"
             return f"{v:.{nd}f}"
         except Exception:
@@ -274,8 +275,10 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
     def _effect_symbol(s):
         s = (s or "0").strip()
-        if s in ("↑", "+"):  return "+"
-        if s in ("↓", "-"):  return "-"
+        if s in ("↑", "+"):
+            return "+"
+        if s in ("↓", "-"):
+            return "-"
         return "0"
 
     # Partition rows into sections (robust to older payloads without 'section')
@@ -294,42 +297,35 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         sec_map[sec].append(r)
 
     # Order within each section
-    order_pos   = {"Row 1": 0, "Column 1": 1, "Column 2": 2, "Column 3": 3}
-    order_attr  = {"ln(price)": 0}
-    pref_cols = [
-        "badge", "beta", "se", "p", "q_bh",
-        "odds_ratio", "ci_low", "ci_high",
-        "ame_pp", "evid_score", "price_eq", "sign"
-    ]
+    order_pos = {"Row 1": 0, "Column 1": 1, "Column 2": 2, "Column 3": 3}
+    order_attr = {"ln(price)": 0}
 
     def _render_section(title, rlist):
         if not rlist:
             return ""
         if title == "Position effects":
-            rlist = sorted(rlist, key=lambda r: order_pos.get(str(r.get("badge","")), 99))
+            rlist = sorted(rlist, key=lambda r: order_pos.get(str(r.get("badge", "")), 99))
         elif title == "Attribute effects":
-            rlist = sorted(rlist, key=lambda r: order_attr.get(str(r.get("badge","")), 99))
-        # Header
+            rlist = sorted(rlist, key=lambda r: order_attr.get(str(r.get("badge", "")), 99))
         lines = [
             f"\n\n{title}\n",
             "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
         ]
-        # Rows
         for r in rlist:
-            beta = _fmt(r.get("beta"))
-            se   = _fmt(r.get("se"))
-            pval = _fmt(r.get("p"), nd=4)
-            qbh  = _fmt(r.get("q_bh"), nd=4)
-            orx  = _fmt(r.get("odds_ratio"))
-            ci_l = _fmt(r.get("ci_low"))
-            ci_h = _fmt(r.get("ci_high"))
-            ame  = _fmt(r.get("ame_pp"))
-            evid = _fmt(r.get("evid_score"))
-            peq  = _fmt(r.get("price_eq"))
-            sgn  = _effect_symbol(r.get("sign"))
             lines.append(
-                f"| {r.get('badge','')} | {beta} | {se} | {pval} | {qbh} | {orx} | {ci_l} | {ci_h} | {ame} | {evid} | {peq} | {sgn} |"
+                f"| {r.get('badge','')} | "
+                f"{_fmt(r.get('beta'))} | "
+                f"{_fmt(r.get('se'))} | "
+                f"{_fmt(r.get('p'), nd=4)} | "
+                f"{_fmt(r.get('q_bh'), nd=4)} | "
+                f"{_fmt(r.get('odds_ratio'))} | "
+                f"{_fmt(r.get('ci_low'))} | "
+                f"{_fmt(r.get('ci_high'))} | "
+                f"{_fmt(r.get('ame_pp'))} | "
+                f"{_fmt(r.get('evid_score'))} | "
+                f"{_fmt(r.get('price_eq'))} | "
+                f"{_effect_symbol(r.get('sign'))} |"
             )
         return "\n".join(lines)
 
@@ -342,11 +338,29 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     if rows:
         header = "### Badge Effects\n\n" + title_block
         msg_parts = [header]
-        msg_parts.append(_render_section("Position effects",     sec_map.get("Position effects", [])))
-        msg_parts.append(_render_section("Badge/lever effects",  sec_map.get("Badge/lever effects", [])))
-        msg_parts.append(_render_section("Attribute effects",    sec_map.get("Attribute effects", [])))
+        msg_parts.append(_render_section("Position effects", sec_map.get("Position effects", [])))
+        msg_parts.append(_render_section("Badge/lever effects", sec_map.get("Badge/lever effects", [])))
+        msg_parts.append(_render_section("Attribute effects", sec_map.get("Attribute effects", [])))
 
-        # Local export (CSV/HTML)
+        # ---- Glossary (placed immediately after Attribute effects) ----
+        glossary_md = (
+            "\n\n*Glossary*\n\n"
+            "| Column | Meaning |\n"
+            "|---|---|\n"
+            "| β | Log-odds coefficient for the lever (positive increases choice odds). |\n"
+            "| SE | Standard error of β. |\n"
+            "| p | Two-sided p-value for H₀: β = 0. |\n"
+            "| q_bh | Benjamini–Hochberg FDR-adjusted p across the displayed rows. |\n"
+            "| Odds ratio | exp(β); multiplicative change in odds. |\n"
+            "| CI low / CI high | 95% confidence interval bounds for the odds ratio. |\n"
+            "| AME (pp) | Average marginal effect in percentage points. |\n"
+            "| Evidence | 1 − p (compact signal strength in [0,1]). |\n"
+            "| Price-eq λ | Effect scaled by |β_price|; blank for ln(price). |\n"
+            "| Effect | Sign of β at p < .05: +, −, else 0. |\n"
+        )
+        msg_parts.append(glossary_md)
+
+        # Local export (CSV/HTML) – unchanged
         csv_path, html_path = _export_badge_effects(rows, payload, job_id)
         artifacts = results.setdefault("artifacts", {})
         if csv_path:
@@ -354,7 +368,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         if html_path:
             artifacts["effects_html"] = html_path
 
-        # Inline heat-map if the runner produced one
+        # Inline heat-map (if produced by the runner) with caption
         hm_path = artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
         if hm_path:
             try:
@@ -362,8 +376,10 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
                     import base64 as _b64
                     _b = _b64.b64encode(_f.read()).decode("utf-8")
                 msg_parts.append(
-                    f'\n\n<img alt="Position heat-map" src="data:image/png;base64,{_b}" '
-                    f'style="max-width:520px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
+                    f'\n\n<img alt="Webpage heatmap of AI shopping agents" '
+                    f'src="data:image/png;base64,{_b}" '
+                    f'style="max-width:560px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
+                    f"\n*Webpage heatmap of AI shopping agents*\n"
                 )
             except Exception:
                 pass
@@ -372,7 +388,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     else:
         msg = "No badge effects computed."
 
-    # Persist to Hostinger DB (best-effort)
+    # Persist to Hostinger DB (best-effort) — unchanged
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -387,7 +403,9 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     except Exception as e:
         results.setdefault("artifacts", {})["agentix_persist_error"] = str(e)
 
+    import json
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
 
 
 
@@ -730,6 +748,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
