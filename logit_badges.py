@@ -21,7 +21,17 @@ Returns
     pandas.DataFrame with columns:
       ['section','badge','beta','se','p','q_bh','odds_ratio','ci_low','ci_high',
        'ame_pp','evid_score','price_eq','sign']
-
+Glossary:
+    β (beta): Estimated log-odds coefficient for the regressor (relative to the baseline cell, with screen/product FEs).
+    SE: Standard error of β (from the penalised Fisher information when ridge-IRLS is used).
+    p: Two-sided p-value for H₀: β = 0.
+    q_bh: Benjamini–Hochberg FDR–adjusted p-value across the reported effects.
+    Odds ratio: exp(β). For a binary lever, the multiplicative change in choice odds when it turns on (0→1); for ln(price), per one log-unit increase (≈ ×2.718 in price).
+    CI low / CI high: 95% confidence interval bounds for the odds ratio.
+    AME (pp): Average marginal effect on choice probability, in percentage points, averaged over observed screens.
+    Evidence: 1 − p, a 0–1 summary score for visual ranking (not a substitute for p/q_bh).
+    Price-eq λ: |β / β_price|, the log-price change that would have the same utility impact as the lever; to express as an equivalent % price change use exp(λ) − 1.
+    Effect: Sign flag—“+” if p < 0.05 and β > 0; “−” if p < 0.05 and β < 0; “0” otherwise.
 Usage
     from logit_badges import run_logit
     tbl = run_logit("results/df_choice.csv", badge_filter=["frame","assurance","scarcity"])
@@ -308,5 +318,6 @@ def save_position_heatmap(path_csv: str, out_png_path: str, title: str | None = 
     fig.savefig(out_png_path)
     plt.close(fig)
     return out_png_path
+
 
 
