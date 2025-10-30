@@ -689,21 +689,76 @@ def run_job_sync(payload: Dict) -> Dict:
                 artifacts["badges_effects"] = str(effects_path)
                 artifacts["effects_csv"] = str(effects_path)
                 artifacts["table_badges"] = str(effects_path)
-
-                # --- Position heat-map artifact ---
-                try:
-                    from logit_badges import save_position_heatmap
-                    hm_path = RESULTS_DIR / f"position_heatmap_{job_id}.png"
-                    save_position_heatmap(str(choice_path), str(hm_path), title=f"{category} · {ui_label}")
-                    artifacts["position_heatmap"] = str(hm_path)
-                except Exception as e:
-                    print("[logit] heatmap generation failed:", repr(e), flush=True)
             else:
                 print("DEBUG empty_or_missing_badge_table")
         except Exception as e:
             print("[logit] skipped due to error:", repr(e), flush=True)
     else:
         print("DEBUG choice file missing or empty")
+
+    # ----- NEW: position heat-map (dark = high selection rate) -----
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        dfc = pd.read_csv(choice_path)
+        dfc = dfc[pd.to_numeric(dfc.get("chosen", 0), errors="coerce").fillna(0).astype(int).between(0, 1)]
+        sel = dfc[dfc["chosen"] == 1].copy()
+        # 2×4 grid, rows 0/1, cols 0..3
+        mat = np.zeros((2, 4), dtype=float)
+        tot = max(1, len(sel))
+        for _, r in sel.iterrows():
+            rr = int(r.get("row", 0)); cc = int(r.get("col", 0))
+            if 0 <= rr <= 1 and 0 <= cc <= 3:
+                mat[rr, cc] += 1.0
+        mat = mat / tot
+
+        fig, ax = plt.subplots(figsize=(6.2, 3.2), dpi=160)
+        im = ax.imshow(mat, cmap="Greys", vmin=0.0, vmax=mat.max() if mat.max() > 0 else 1.0)
+        ax.set_xticks([0, 1, 2, 3], labels=["Col 1", "Col 2", "Col 3", "Col 4"])
+        ax.set_yticks([0, 1], labels=["Row 1", "Row 2"])
+        ax.set_xlabel("Column"); ax.set_ylabel("Row")
+        ax.set_title(f"{category} · {ui_label}")
+
+        # readable labels: white text on dark cells, black on light
+        vmax = mat.max() if mat.max() > 0 else 1.0
+        for i in range(2):
+            for j in range(4):
+                val = mat[i, j]
+                txt_color = "white" if (vmax > 0 and val >= 0.5 * vmax) else "black"
+                ax.text(j, i, f"{100*val:.1f}%", ha="center", va="center", color=txt_color, fontsize=9)
+
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Selection rate")
+
+        hm_path = RESULTS_DIR / f"heatmap_{job_id}.png"
+        fig.tight_layout()
+        fig.savefig(hm_path, bbox_inches="tight")
+        plt.close(fig)
+
+        artifacts["position_heatmap"] = str(hm_path)
+        artifacts["position_heatmap_png"] = str(hm_path)
+    except Exception as e:
+        print("DEBUG heatmap generation failed:", repr(e))
+
+    return {
+        "job_id": job_id,
+        "ts": ts,
+        "model_requested": ui_label,
+        "vendor": vendor,
+        "n_iterations": n,
+        "inputs": {
+            "product": category,
+            "brand": brand,
+            "price": price,
+            "currency": currency,
+            "badges": badges,
+        },
+        "artifacts": artifacts,
+        "logit_table_rows": badge_rows,
+    }
 
     # -------- assemble results payload --------
     results: Dict = {
@@ -764,6 +819,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
