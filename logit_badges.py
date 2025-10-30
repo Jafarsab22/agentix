@@ -35,6 +35,9 @@ import pandas as pd
 from scipy.special import expit
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
+import matplotlib
+matplotlib.use("Agg")  # safe for headless servers
+import matplotlib.pyplot as plt
 
 # ----------------- knobs -----------------
 MIN_CASES = 10
@@ -285,7 +288,9 @@ def save_position_heatmap(path_csv: str, out_png_path: str, title: str | None = 
             mat[int(r), int(c)] = float(v)
 
     fig, ax = plt.subplots(figsize=(6.2, 3.2), dpi=144)
-    im = ax.imshow(mat, vmin=0.0, vmax=1.0)
+    #im = ax.imshow(mat, vmin=0.0, vmax=1.0)
+    im = ax.imshow(mat, cmap="viridis_r", vmin=0.0, vmax=1.0)
+
     for r in range(2):
         for c in range(4):
             ax.text(c, r, f"{100.0*mat[r,c]:.1f}%", ha="center", va="center", fontsize=9)
@@ -303,4 +308,5 @@ def save_position_heatmap(path_csv: str, out_png_path: str, title: str | None = 
     fig.savefig(out_png_path)
     plt.close(fig)
     return out_png_path
+
 
