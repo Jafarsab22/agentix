@@ -654,14 +654,14 @@ def run_job_sync(payload: Dict) -> Dict:
             # Pass internal keys directly to the estimator (or None for no filtering)
             badge_keys = _normalize_badge_filter(badges)
             print("DEBUG badge_filter_internal=", badge_keys)
-    
+
             badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
             if not isinstance(badge_table, pd.DataFrame):
                 badge_table = pd.DataFrame(badge_table)
-    
+
             print("DEBUG badge_table_shape=", tuple(badge_table.shape))
             print("DEBUG badge_table_cols=", list(badge_table.columns))
-    
+
             if "badge" in badge_table.columns and not badge_table.empty:
                 pref_cols = [
                     "badge", "beta", "p", "sign",
@@ -669,7 +669,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 ]
                 cols = [c for c in pref_cols if c in badge_table.columns]
                 df_rich = badge_table[cols].copy()
-    
+
                 job_meta = {
                     "job_id": job_id,
                     "timestamp": ts,
@@ -682,19 +682,47 @@ def run_job_sync(payload: Dict) -> Dict:
                 }
                 for k in list(job_meta.keys())[::-1]:
                     df_rich.insert(0, k, job_meta[k])
-    
+
                 df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
                 badge_rows = badge_table.to_dict("records")
-    
+
                 artifacts["badges_effects"] = str(effects_path)
                 artifacts["effects_csv"] = str(effects_path)
                 artifacts["table_badges"] = str(effects_path)
+
+                # --- Position heat-map artifact ---
+                try:
+                    from logit_badges import save_position_heatmap
+                    hm_path = RESULTS_DIR / f"position_heatmap_{job_id}.png"
+                    save_position_heatmap(str(choice_path), str(hm_path), title=f"{category} · {ui_label}")
+                    artifacts["position_heatmap"] = str(hm_path)
+                except Exception as e:
+                    print("[logit] heatmap generation failed:", repr(e), flush=True)
             else:
                 print("DEBUG empty_or_missing_badge_table")
         except Exception as e:
             print("[logit] skipped due to error:", repr(e), flush=True)
     else:
         print("DEBUG choice file missing or empty")
+
+    # -------- assemble results payload --------
+    results: Dict = {
+        "job_id": job_id,
+        "ts": ts,
+        "model_requested": ui_label,
+        "vendor": vendor,
+        "n_iterations": n,
+        "inputs": {
+            "product": category,
+            "brand": brand,
+            "price": price,
+            "currency": currency,
+            "badges": badges,
+        },
+        "artifacts": artifacts,
+        "logit_table_rows": badge_rows,
+    }
+    return results
 
 
     vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
@@ -736,6 +764,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
