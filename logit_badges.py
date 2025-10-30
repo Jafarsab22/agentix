@@ -1,80 +1,173 @@
 # -*- coding: utf-8 -*-
 """
-logit_badges — v1.10 (2025-10-30)
+logit_badges.py — v1.9 (2025-10-30)
 
 Purpose
-    Estimate within-screen (conditional) logit effects for an 8-alternative choice
-    design with page fixed effects, handling small-N runs robustly.
+    Conditional-logit with page (screen) and product fixed effects, robust to
+    small-N via ridge-IRLS. Reports BOTH position effects (Row 1, Col 1–3) and
+    lever effects (frame, assurance, scarcity, strike, timer, social_proof,
+    voucher, bundle). Also computes business metrics: odds ratios, BH-q, AME
+    (percentage points), and price-equivalent λ for each binary regressor.
 
 Key assumptions
-    • Data source: results/df_choice.csv as produced by the runner (8 rows per screen).
-    • Baseline utilities absorb screen-level factors via page FEs (case_id dummies).
-    • Position controls included: row_top, col1, col2, col3 (baseline = bottom row, 4th col).
-    • Price control: ln_price included if present and varying.
-    • Badges estimated separately: frame (1 = ALL-IN), assurance, scarcity, strike, timer,
-      social_proof, voucher, bundle. Any badge with no variation is dropped.
-    • Small-N stability: below MIN_CASES (default 10) we always use ridge-IRLS with page FEs;
-      for larger N we still default to ridge-IRLS (fast & stable). Product FEs are added
-      only when N >= MIN_CASES to avoid overparameterisation in tiny runs.
+    • Baselines: bottom row and rightmost column (col4) as positional bases.
+    • Price slope: prefer ln_price if available/variable; fall back to price.
+    • Badge filtering: if badge_filter is provided, we include ONLY those non-
+      position levers among the seven non-frame badges plus frame if present.
+      Position terms are always included; FE are always included for estimation
+      but not reported.
+    • Heat-map: 2×4 grid in log-odds units from the estimated row/column terms.
 
-Returns
-    pandas.DataFrame with columns:
-      ['badge','beta','se','p','q_bh','odds_ratio','ci_low','ci_high',
-       'ame_pp','evid_score','price_eq','sign']
-
-Usage
-    from logit_badges import run_logit
-    tbl = run_logit("results/df_choice.csv", badge_filter=["frame","assurance","scarcity"])
+API
+    run_logit(path_csv, badge_filter=None, model_label=None) -> pandas.DataFrame
+    Writes PNG heat-map into results/position_heatmap_{model}.png (overwrites).
 """
 
 from __future__ import annotations
 
 import math
+import json
+from pathlib import Path
+from typing import Iterable, Optional, Tuple, List
+
 import numpy as np
 import pandas as pd
 from scipy.special import expit
 from scipy.stats import norm
-from statsmodels.stats.multitest import multipletests
+import patsy as pt
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# ----------------- knobs -----------------
-MIN_CASES = 10          # don’t report effects when fewer than 10 complete screens
-RIDGE_ALPHA_SMALL = 5e-2
-RIDGE_ALPHA_LARGE = 1e-2
-MAX_ITER = 300
-TOL = 1e-7
+# For the heat-map
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
 
-ALLOWED = ["frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle"]
-POS_COLS = ["row_top","col1","col2","col3"]
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---------------------- Helpers ----------------------
 
-# ----------------- core: ridge-IRLS with FE -----------------
-def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float, max_iter: int = MAX_ITER, tol: float = TOL):
+_POS_LABELS = {
+    "row_top": "Row 1",
+    "col1": "Column 1",
+    "col2": "Column 2",
+    "col3": "Column 3",
+}
+
+_BADGE_LABELS = {
+    "frame": "All-in framing",
+    "assurance": "Assurance",
+    "scarcity": "Scarcity tag",
+    "strike": "Strike-through",
+    "timer": "Countdown timer",
+    "social_proof": "Social proof",
+    "voucher": "Voucher",
+    "bundle": "Bundle",
+}
+
+_ALLOWED_BADGES = list(_BADGE_LABELS.keys())
+
+def _bh_q(pvals: np.ndarray) -> np.ndarray:
+    """Benjamini–Hochberg FDR control (monotone)."""
+    m = len(pvals)
+    if m == 0:
+        return np.array([])
+    order = np.argsort(pvals)
+    ranks = np.empty(m, dtype=float)
+    ranks[order] = np.arange(1, m + 1)
+    q = pvals * m / ranks
+    # enforce monotonicity
+    q_sorted = np.minimum.accumulate(q[order][::-1])[::-1]
+    out = np.empty_like(q)
+    out[order] = q_sorted
+    return np.clip(out, 0.0, 1.0)
+
+def _stars(p: float) -> str:
+    if p < 0.001: return "***"
+    if p < 0.01: return "**"
+    if p < 0.05: return "*"
+    return "0"
+
+def _fmt(x, nd=3):
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+def _select_price_column(df: pd.DataFrame) -> Tuple[str, pd.Series]:
+    """Prefer ln_price; else price; else return ('', empty)."""
+    if "ln_price" in df.columns and df["ln_price"].notna().var() > 0:
+        return "ln_price", df["ln_price"]
+    if "price" in df.columns and df["price"].notna().var() > 0:
+        return "price", df["price"]
+    return "", pd.Series(dtype=float)
+
+def _design_columns(df: pd.DataFrame, badge_filter: Optional[Iterable[str]]) -> Tuple[List[str], List[str], List[str]]:
+    # Position terms always included
+    pos_cols = ["row_top", "col1", "col2", "col3"]
+
+    # Filter badges if requested; normalise and intersect with available columns
+    want = set([str(x).strip().lower() for x in (badge_filter or []) if x])
+    if not want:
+        badge_cols = [c for c in _ALLOWED_BADGES if c in df.columns]
+    else:
+        badge_cols = [c for c in _ALLOWED_BADGES if c in want and c in df.columns]
+
+    # Price
+    price_key, _ = _select_price_column(df)
+    price_cols = [price_key] if price_key else []
+
+    return pos_cols, badge_cols, price_cols
+
+def _drop_constant_cols(X: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    dropped = []
+    keep = []
+    for c in X.columns:
+        v = X[c]
+        if v.dtype.kind not in "fiu":
+            try:
+                v = pd.to_numeric(v, errors="coerce")
+            except Exception:
+                pass
+        if v.notna().var() <= 0:
+            dropped.append(c)
+        else:
+            keep.append(c)
+    return X[keep], dropped
+
+def _fit_mle(formula: str, data: pd.DataFrame):
+    return smf.logit(formula, data=data).fit(disp=0, maxiter=2000, method="lbfgs")
+
+def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float = 1e-2, max_iter: int = 300, tol: float = 1e-7):
     """
-    Penalised Newton–Raphson / IRLS for logistic regression:
-      min_beta  -loglik(beta) + alpha * ||beta||^2
-
-    Returns (beta, cov) where cov is (approx) inverse penalised Fisher info.
+    Penalised IRLS: min_beta -loglik + alpha * ||beta||^2
+    Returns (beta, cov, p_hat).
     """
     n, k = X.shape
-    beta = np.zeros(k, dtype=np.float64)
-    # tiny jitter to avoid flat start in separable corners
+    beta = np.zeros(k, dtype=float)
     rng = np.random.default_rng(0)
     beta += rng.normal(scale=1e-6, size=k)
 
-    I = np.eye(k, dtype=np.float64)
+    I = np.eye(k, dtype=float)
 
     for _ in range(max_iter):
-        xb = np.clip(X @ beta, -35.0, 35.0)           # numeric guard
+        xb = np.clip(X @ beta, -35.0, 35.0)
         p = expit(xb)
-        W = p * (1.0 - p)                             # weights
-        if np.max(W) < 1e-12:
+        W = p * (1.0 - p)  # n
+        if float(np.max(W)) < 1e-12:
             break
-        z = xb + (y - p) / np.maximum(W, 1e-12)      # working response
+        z = xb + (y - p) / np.maximum(W, 1e-12)
+
         Xw = X * W[:, None]
-        H = X.T @ Xw + 2.0 * alpha * I               # penalised Hessian
+        H = X.T @ Xw + 2.0 * alpha * I
         g = X.T @ (W * z)
+
         beta_new = np.linalg.pinv(H) @ g
-        if np.max(np.abs(beta_new - beta)) < tol:
+        if np.linalg.norm(beta_new - beta, ord=np.inf) < tol:
             beta = beta_new
             break
         beta = beta_new
@@ -87,169 +180,195 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float, max_iter: int 
     cov = np.linalg.pinv(H)
     return beta, cov, p
 
+def _fit_fast_ridge(formula: str, data: pd.DataFrame, alpha: float = 1e-2):
+    y, X = pt.dmatrices(formula, data, return_type="dataframe")
+    # Ensure numeric float arrays (avoid expit dtype error)
+    yv = np.asarray(y.values, dtype=float).ravel()
+    Xv = np.asarray(X.values, dtype=float)
+    beta, cov, p = _ridge_logit_irls(yv, Xv, alpha=alpha)
+    params = pd.Series(beta, index=X.columns)
+    bse = pd.Series(np.sqrt(np.diag(cov)), index=X.columns)
+    z = params / bse.replace(0, np.nan)
+    pvals = pd.Series(2.0 * (1.0 - norm.cdf(np.abs(z))), index=X.columns)
 
-# ----------------- helpers -----------------
-def _complete_screens(df: pd.DataFrame) -> pd.DataFrame:
+    class Wrap:
+        pass
+    w = Wrap()
+    w.params = params
+    w.bse = bse
+    w.pvalues = pvals
+    w._X = Xv
+    w._p = p
+    w._columns = X.columns
+    return w
+
+def _heatmap_path_for(model_label: Optional[str]) -> Path:
+    tag = (str(model_label or "model").strip().lower()
+           .replace(" ", "_").replace("/", "_").replace("-", "_"))
+    return RESULTS_DIR / f"position_heatmap_{tag}.png"
+
+# ---------------------- Main API ----------------------
+
+def run_logit(choice_csv_path: str, badge_filter: Optional[Iterable[str]] = None, model_label: Optional[str] = None) -> pd.DataFrame:
+    df = pd.read_csv(choice_csv_path)
+    # Keep only complete 8-alternative screens
     counts = df.groupby("case_id").size()
-    keep = counts[counts == 8].index
-    return df[df["case_id"].isin(keep)].copy()
+    df = df[df["case_id"].isin(counts[counts == 8].index)].copy()
 
-def _is_var(col: pd.Series) -> bool:
-    try:
-        return (pd.to_numeric(col, errors="coerce").fillna(0.0).astype(float).nunique(dropna=False) > 1)
-    except Exception:
-        return False
-
-def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int):
-    # base controls
-    cols = [c for c in POS_COLS if c in df.columns]
-    if "ln_price" in df.columns and _is_var(df["ln_price"]):
-        cols.append("ln_price")
-
-    # badge set
-    if badge_filter:
-        targets = [b for b in badge_filter if b in ALLOWED]
-    else:
-        targets = list(ALLOWED)
-
-    dropped = []
-    for b in targets:
-        if b in df.columns and _is_var(df[b]):
-            cols.append(b)
-        else:
-            dropped.append(b)
-
-    if dropped:
-        print(f"[logit] dropped constant columns: {dropped}", flush=True)
-
-    # main matrix
-    X_main = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(np.float64)
-
-    # page FE (always)
-    d_case = pd.get_dummies(df["case_id"], drop_first=True, dtype=np.float64)
-
-    # product FE only when enough screens (avoid overfit for tiny N)
-    d_prod = None
-    if n_cases >= MIN_CASES and "title" in df.columns:
-        d_prod = pd.get_dummies(df["title"], drop_first=True, dtype=np.float64)
-
-    if d_prod is not None:
-        X = pd.concat([X_main, d_case, d_prod], axis=1)
-        fe_cols = d_case.shape[1] + d_prod.shape[1]
-    else:
-        X = pd.concat([X_main, d_case], axis=1)
-        fe_cols = d_case.shape[1]
-
-    X = X.astype(np.float64)
-    y = pd.to_numeric(df["chosen"], errors="coerce").fillna(0.0).astype(np.float64).values
-
-    return X, y, cols, fe_cols
-
-
-def _tidy(beta, cov, p_hat, cols, label_map, b_price: float | None):
-    """
-    Build the public effects table for the requested levers only (no position, no ln_price).
-    """
-    idx = list(cols)
-    beta_s = pd.Series(beta[:len(idx)], index=idx, dtype=float)
-    se_s = pd.Series(np.sqrt(np.diag(cov)[:len(idx)]), index=idx, dtype=float)
-
-    # subset to the lever columns we want to report
-    report_keys = [k for k in idx if (k in ALLOWED or k == "frame") and k != "ln_price" and k not in POS_COLS]
-    if not report_keys:
+    if df.empty:
         return pd.DataFrame(columns=["badge","beta","se","p","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score","price_eq","sign"])
 
-    z = beta_s[report_keys] / se_s[report_keys].replace(0.0, np.nan)
-    pvals = 2.0 * (1.0 - norm.cdf(np.abs(z.values)))
-    # BH-FDR across reported badges
-    _, q_bh, _, _ = multipletests(pvals, alpha=0.05, method="fdr_bh")
+    # Titles are constant per slot identity; use as product FE
+    # Guarantee required columns are ints
+    for c in ("row_top","col1","col2","col3","frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle","chosen"):
+        if c in df.columns:
+            df[c] = df[c].astype(int)
 
-    # AME: average over p*(1-p)*beta (percentage points)
-    wbar = float(np.mean(p_hat * (1.0 - p_hat))) if p_hat.size else 0.0
+    pos_cols, badge_cols, price_cols = _design_columns(df, badge_filter)
 
-    out = []
-    for i, k in enumerate(report_keys):
-        b = float(beta_s[k])
-        se = float(se_s[k])
-        p = float(pvals[i])
-        q = float(q_bh[i])
-        orx = math.exp(b)
-        ci_l = math.exp(b - 1.96 * se)
-        ci_h = math.exp(b + 1.96 * se)
-        ame_pp = 100.0 * wbar * b
-        # crude evidence score in [0,1]
-        evid = max(0.0, 1.0 - p)
+    # Build formula with FE: case FE (screen) and product FE (title)
+    rhs_terms = pos_cols + badge_cols + price_cols + ["C(case_id)", "C(title)"]
+    # Drop columns with zero variance BEFORE estimation (except FE which are symbolic)
+    to_check = pos_cols + badge_cols + price_cols
+    zero_vars = [c for c in to_check if c in df.columns and df[c].var() <= 0]
+    if zero_vars:
+        # print(f"[logit] dropped constant columns: {zero_vars}")
+        rhs_terms = [t for t in rhs_terms if t not in zero_vars]
 
-        if b_price is not None and abs(b_price) > 1e-9:
-            price_eq = abs(b / b_price)
-        else:
-            price_eq = float("nan")
+    # Price term presence
+    price_key, price_series = _select_price_column(df)
 
-        sign = "↑" if (p < 0.05 and b > 0) else ("↓" if (p < 0.05 and b < 0) else "0")
-        out.append({
-            "badge": label_map.get(k, k),
-            "beta": b, "se": se, "p": p, "q_bh": q,
-            "odds_ratio": orx, "ci_low": ci_l, "ci_high": ci_h,
-            "ame_pp": ame_pp, "evid_score": evid, "price_eq": price_eq,
-            "sign": sign
-        })
-    return pd.DataFrame(out)
+    formula = "chosen ~ -1 + " + " + ".join(rhs_terms)
 
-
-# ----------------- public API -----------------
-def run_logit(path_csv: str, badge_filter: list[str] | None = None):
-    """
-    Read df_choice.csv, fit ridge-FE logit, and return a tidy badge-effects table.
-    badge_filter: optional subset like ['frame','assurance','scarcity', ...].
-    """
-    df = pd.read_csv(path_csv)
-    df = _complete_screens(df)
-
+    # Fit ladder: MLE if reasonably sized; else ridge FE
     n_cases = df["case_id"].nunique()
-    print(f"[logit] fit_mode = ridge_default; screens={n_cases}; rows={len(df)}", flush=True)
+    # threshold consistent with your Colab approach
+    try_mle = n_cases >= 30
 
-    # show quick variability diagnostics (as in your runner debug)
-    for k in ["frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle"]:
-        if k in df.columns:
-            try:
-                print(f"DEBUG {k}_unique=", int(pd.to_numeric(df[k], errors="coerce").fillna(-1).nunique(dropna=False)))
-            except Exception:
-                pass
+    fit = None
+    mode = ""
+    try:
+        if try_mle:
+            fit = _fit_mle(formula, df)
+            mode = "MLE (page+product FE)"
+        else:
+            raise RuntimeError("force_ridge_smallN")
+    except Exception:
+        try:
+            fit = _fit_fast_ridge(formula, df, alpha=1e-2)
+            mode = "Ridge-IRLS (page+product FE)"
+        except Exception:
+            # final fallback: drop product FE if extremely saturated
+            formula2 = "chosen ~ -1 + " + " + ".join([t for t in rhs_terms if not t.startswith("C(title)")])
+            fit = _fit_fast_ridge(formula2, df, alpha=3e-2)
+            mode = "Ridge-IRLS (page FE)"
 
-    X, y, cols, fe_cols = _build_design(df, badge_filter, n_cases)
+    # Extract named params
+    if hasattr(fit, "params"):
+        params = pd.Series(np.asarray(fit.params).ravel(), index=list(getattr(fit, "params").index))
+        bse = pd.Series(np.asarray(getattr(fit, "bse")).ravel(), index=list(getattr(fit, "bse").index))
+        pvals = pd.Series(np.asarray(getattr(fit, "pvalues")).ravel(), index=list(getattr(fit, "pvalues").index))
+    else:
+        # defensive
+        return pd.DataFrame(columns=["badge","beta","se","p","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score","price_eq","sign"])
 
-    # separate ln_price & keep for price_eq
-    b_price_idx = None
-    if "ln_price" in cols:
-        b_price_idx = cols.index("ln_price")
+    # Helper to get a scalar by key (0 if missing)
+    def g(key: str) -> float:
+        return float(params.get(key, 0.0))
 
-    alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
+    # Collect rows for position and selected badges
+    rows = []
 
-    # fit
-    beta, cov, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
+    for k in pos_cols:
+        lab = _POS_LABELS.get(k, k)
+        rows.append((lab, params.get(k, np.nan), bse.get(k, np.nan), pvals.get(k, np.nan)))
 
-    # report design size
-    main_cols = len(cols)
-    print(f"[logit] design: main={main_cols}; FE={fe_cols}; total_cols={X.shape[1]}", flush=True)
+    for k in badge_cols:
+        lab = _BADGE_LABELS.get(k, k)
+        rows.append((lab, params.get(k, np.nan), bse.get(k, np.nan), pvals.get(k, np.nan)))
 
-    b_price = float(beta[b_price_idx]) if b_price_idx is not None else None
+    # Convert to DataFrame and compute metrics
+    out = pd.DataFrame(rows, columns=["badge","beta","se","p"]).copy()
+    out["beta"] = out["beta"].apply(_fmt)
+    out["se"] = out["se"].apply(_fmt)
+    out["p"] = out["p"].apply(_fmt)
 
-    # pretty labels
-    label_map = {
-        "frame": "All-in framing",
-        "assurance": "Assurance",
-        "scarcity": "Scarcity tag",
-        "strike": "Strike-through",
-        "timer": "Timer",
-        "social_proof": "Social proof",
-        "voucher": "Voucher",
-        "bundle": "Bundle",
-    }
+    # Odds ratios and Wald CIs in OR-space
+    out["odds_ratio"] = np.exp(out["beta"])
+    zcrit = 1.959963984540054
+    out["ci_low"] = np.exp(out["beta"] - zcrit * out["se"])
+    out["ci_high"] = np.exp(out["beta"] + zcrit * out["se"])
 
-    table = _tidy(beta, cov, p_hat, cols, label_map, b_price)
+    # BH q-values across the reported rows
+    out["q_bh"] = _bh_q(out["p"].values)
 
-    # deterministic column order expected by the UI
-    pref_cols = ["badge","beta","se","p","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score","price_eq","sign"]
-    table = table.reindex(columns=pref_cols)
+    # Approx AME (percentage points): mean(W)*beta * 100, where W = p(1-p)
+    try:
+        if hasattr(fit, "_p"):
+            Wbar = float(np.mean(getattr(fit, "_p") * (1.0 - getattr(fit, "_p"))))
+        else:
+            # crude fallback if MLE: use sigmoid at 0
+            Wbar = 0.25
+    except Exception:
+        Wbar = 0.25
+    out["ame_pp"] = out["beta"] * Wbar * 100.0
 
-    return table
+    # Evidence score (1 - p) as a very compact synthesis for UI sorting
+    out["evid_score"] = 1.0 - out["p"].clip(0.0, 1.0)
+
+    # Price equivalent λ = exp(-b/β_price) - 1 (if slope identified)
+    if price_key:
+        b_price = float(params.get(price_key, np.nan))
+        if (not math.isnan(b_price)) and abs(b_price) > 1e-8:
+            out["price_eq"] = np.exp(-out["beta"] / b_price) - 1.0
+        else:
+            out["price_eq"] = np.nan
+    else:
+        out["price_eq"] = np.nan
+
+    # Sign arrow for the UI
+    def _sign_row(r):
+        if r["p"] < 0.05 and r["odds_ratio"] > 1.0:
+            return "↑"
+        if r["p"] < 0.05 and r["odds_ratio"] < 1.0:
+            return "↓"
+        return "0"
+    out["sign"] = out.apply(_sign_row, axis=1)
+
+    # -------------------- Heat-map (position leverage) --------------------
+    # Grid of additive utility adjustments by cell (log-odds units)
+    b_row = g("row_top")
+    b_c1, b_c2, b_c3 = g("col1"), g("col2"), g("col3")
+
+    grid = np.array([
+        [b_row + b_c1, b_row + b_c2, b_row + b_c3, b_row + 0.0],  # top row
+        [0.0 + b_c1,   0.0 + b_c2,   0.0 + b_c3,   0.0 + 0.0],    # bottom row
+    ], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(3.6, 2.2), dpi=160)
+    im = ax.imshow(grid, aspect="auto")
+    ax.set_xticks([0,1,2,3], labels=["C1","C2","C3","C4"])
+    ax.set_yticks([0,1], labels=["Row 1","Row 2"])
+    for (i, j), val in np.ndenumerate(grid):
+        ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=8, color="black")
+    ax.set_title("Position leverage (log-odds)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    out_path = _heatmap_path_for(model_label)
+    fig.tight_layout()
+    try:
+        fig.savefig(out_path, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+
+    # Attach estimator note as attributes for debugging (not used by caller)
+    out.attrs["estimator"] = mode
+    out.attrs["heatmap_path"] = str(out_path)
+
+    # Order rows: position first, then badges (stable UI)
+    def _order_key(lbl: str) -> Tuple[int, str]:
+        if lbl in ("Row 1","Column 1","Column 2","Column 3"):
+            return (0, lbl)
+        return (1, lbl)
+    out = out.sort_values(by=["badge"], key=lambda s: s.map(lambda x: _order_key(str(x))))
+    out = out.reset_index(drop=True)
+    return out
