@@ -190,14 +190,14 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
         ("Timestamp", payload.get("ts", "")),
     ]
     parts = [
-        "<html><head><meta charset='utf-8'><title>Badge effects</title>",
+        "<html><head><meta charset='utf-8'><title>Estimates of the Conditional Logit Regression</title>",
         "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;padding:16px}"
         "table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #ccc;padding:8px}"
         "th{text-align:left;background:#f6f6f6}"
         "td.num{text-align:right}</style>",
         "</head><body>",
-        "<h2>Badge effects</h2>",
+        "<h2>Estimates of the Conditional Logit Regression</h2>",
         "<h3>Run metadata</h3><table>",
     ]
     for k, v in meta_rows:
@@ -336,7 +336,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     )
 
     if rows:
-        header = "### Badge Effects\n\n" + title_block
+        header = "### Estimates of the Conditional Logit Regression\n\n" + title_block
         msg_parts = [header]
         msg_parts.append(_render_section("Position effects", sec_map.get("Position effects", [])))
         msg_parts.append(_render_section("Badge/lever effects", sec_map.get("Badge/lever effects", [])))
@@ -748,6 +748,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
