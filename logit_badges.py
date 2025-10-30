@@ -3,55 +3,12 @@
 # ================================================================
 # CONDITIONAL (FIXED-EFFECTS) LOGIT FOR AI-AGENT READINESS SCORING
 # ================================================================
-# Purpose
-#   Estimate within-screen effects of e-commerce levers (badges, position, price)
-#   on AI agents’ choices and return a tidy table for the UI.
-#
-# Identification & assumptions
-#   • One choice per screen (choice set): chosen ∈ {0,1}.
-#   • Condition on screen (choice-set) fixed effects; optionally add product FEs
-#     unless near-saturated.
-#   • Covariates must vary within screens to be identified (position dummies,
-#     ln_price, and individual badges).
-#   • We always filter to COMPLETE choice sets (exactly `alts_per_screen` rows per
-#     screen) before building the design.
-#
-# Estimation strategy (robust to small N and quasi-separation)
-#   1) Build X with screen FEs (+ product FEs unless near-saturated).
-#   2) If number of complete screens < ridge_threshold (default 50),
-#      fit ridge-penalised logit (stable under separation).
-#   3) Otherwise fit GLM(Logit):
-#        - If clusters (screens) ≥ cluster_min (default 30) → cluster-robust SEs.
-#        - Else → HC1 sandwich SEs (non-clustered).
-#      If GLM is numerically unstable (non-finite params/SEs) → ridge fallback.
-#
-# Guardrails to reduce collinearity and brittle SEs
-#   • Drop any regressor with no overall variation; drop ln_price if it has NO
-#     within-screen variation.
-#   • Do NOT include composite “frame_allin/partitioned” columns alongside “frame”.
-#     `_harmonize_badges` collapses them into a single binary `frame` when present.
-#   • Keep separate dark-pattern badges (scarcity, strike, timer) rather than a
-#     single pooled indicator.
-#
-# Outputs
-#   • CLI: writes logit_readiness_results.csv and prints key coefficients.
-#   • API: run_logit(...) → list[dict] rows for the “Badge Effects” UI table.
-#
-# Acronyms (for future reference)
-#   FE   = Fixed Effects
-#   GLM  = Generalised Linear Model
-#   HC1  = Huber–White heteroskedasticity-consistent SEs (type 1)
-#   BH   = Benjamini–Hochberg (FDR control)
-#   AME  = Average Marginal Effect (approximate, percentage points)
-#   OR   = Odds Ratio
-# ================================================================
 
 from __future__ import annotations
 
 import argparse
 import io
 import math
-import sys
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
@@ -60,7 +17,6 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.stats.multitest import multipletests
-
 
 # Badge variables in your data (keys must match column names)
 BADGE_VARS: List[str] = [
@@ -80,21 +36,11 @@ BADGE_LABELS: Dict[str, str] = {
     "bundle": "Bundle",
 }
 
-
 # -----------------------
 # Robust I/O loader
 # -----------------------
 
 def _load_df(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, bytearray, Any]) -> pd.DataFrame:
-    """
-    Accept:
-      - pandas.DataFrame
-      - str / pathlib.Path to CSV/TXT/Parquet/JSON
-      - dict payloads with a path under common keys (choice_path, path, file, csv),
-        including nested (payload['paths']['choice'])
-      - file-like objects (with .read)
-      - raw CSV/JSON bytes
-    """
     if isinstance(df_or_path, pd.DataFrame):
         return df_or_path.copy()
 
@@ -109,7 +55,6 @@ def _load_df(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, b
             return pd.read_parquet(p)
         if suf == ".json":
             return pd.read_json(p)
-        # Fallback to CSV
         return pd.read_csv(p)
 
     if isinstance(df_or_path, dict):
@@ -126,7 +71,7 @@ def _load_df(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, b
                         return _load_df(vv)
         try:
             return pd.DataFrame(df_or_path)
-        except Exception as _:
+        except Exception:
             pass
 
     if hasattr(df_or_path, "read"):
@@ -149,13 +94,11 @@ def _load_df(df_or_path: Union[pd.DataFrame, str, Path, Dict[str, Any], bytes, b
 
     raise TypeError("run_logit could not find a choice file: pass a DataFrame, a file path, or a payload dict containing it.")
 
-
 # -----------------------
 # Schema + feature prep
 # -----------------------
 
 def _rename_core_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Map confirmed headers to internal names."""
     return df.rename(columns={"case_id": "screen_id", "title": "product"})
 
 def _ensure_required_columns(df: pd.DataFrame) -> None:
@@ -165,21 +108,14 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
         raise KeyError(f"Missing required columns: {missing}. Available: {list(df.columns)}")
 
 def _filter_complete_screens(df: pd.DataFrame, alts_per_screen: int) -> pd.DataFrame:
-    """
-    Keep only complete screens with exactly `alts_per_screen` alternatives.
-    This guards fixed-effects identification and reduces quasi-separation.
-    """
     counts = df.groupby("screen_id")["product"].transform("count")
     return df.loc[counts == alts_per_screen].copy()
 
 def _make_position_dummies(df: pd.DataFrame) -> pd.DataFrame:
-    """Use row_top, col1–col3 if present; else derive from row/col (baseline: bottom row, 4th col)."""
     df = df.copy()
     if "row_top" not in df.columns and "row" in df.columns:
-        # Treat row==0 as top row; else 0
         row_i = pd.to_numeric(df["row"], errors="coerce")
         df["row_top"] = (row_i == 0).astype(int).fillna(0)
-    # Derive columns if needed; baseline is col4
     if (not all(c in df.columns for c in ["col1", "col2", "col3"])) and "col" in df.columns:
         ci = pd.to_numeric(df["col"], errors="coerce")
         if "col1" not in df.columns:
@@ -188,14 +124,12 @@ def _make_position_dummies(df: pd.DataFrame) -> pd.DataFrame:
             df["col2"] = (ci == 1).astype(int).fillna(0)
         if "col3" not in df.columns:
             df["col3"] = (ci == 2).astype(int).fillna(0)
-    # Ensure integer dummies
     for c in ["row_top", "col1", "col2", "col3"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
     return df
 
 def _make_logs(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure ln_price exists; keep file-supplied ln_price if already present."""
     df = df.copy()
     price_num = pd.to_numeric(df["price"], errors="coerce")
     if (price_num <= 0).any():
@@ -205,10 +139,6 @@ def _make_logs(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _harmonize_badges(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Collapse mutually exclusive frame variants into a single contrast:
-    frame = 1 (all-in) vs 0 (partitioned). Leaves original columns intact.
-    """
     df = df.copy()
     has_allin = "frame_allin" in df.columns
     has_part  = "frame_partitioned" in df.columns
@@ -221,16 +151,13 @@ def _harmonize_badges(df: pd.DataFrame) -> pd.DataFrame:
             df["frame"] = pd.to_numeric(df["frame_allin"], errors="coerce").fillna(0).astype(int)
         else:
             df["frame"] = 0
-    # Ensure badge dummies are strictly 0/1 integers where present
     for c in BADGE_VARS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
     return df
 
 def _collect_badge_columns(df: pd.DataFrame) -> List[str]:
-    """Return badge columns that exist and vary (≥2 distinct values)."""
     return [c for c in BADGE_VARS if c in df.columns and df[c].nunique(dropna=True) > 1]
-
 
 # -----------------------
 # Matrix sanitisation
@@ -246,16 +173,11 @@ def _coerce_numeric(X: pd.DataFrame) -> pd.DataFrame:
     Xn = Xn.fillna(0.0)
     return Xn.astype("float64")
 
-
 # -----------------------
 # Design builders
 # -----------------------
 
 def _build_design(df: pd.DataFrame, include_product_fe: bool = True, use_price: bool = True) -> Tuple[pd.Series, pd.DataFrame, pd.Series, List[str]]:
-    """
-    Build y, X with absorbed fixed effects for screen_id and optionally product.
-    Returns: y, X (float64), clusters (screen_id), list_of_predictor_names_in_order
-    """
     df = df.copy()
 
     lever_cols: List[str] = []
@@ -267,7 +189,6 @@ def _build_design(df: pd.DataFrame, include_product_fe: bool = True, use_price: 
 
     badge_cols = _collect_badge_columns(df)
 
-    # Optional: model category dummies if provided
     model_cols: List[str] = []
     if "model" in df.columns:
         dummies = pd.get_dummies(df["model"], prefix="model", drop_first=True)
@@ -276,7 +197,6 @@ def _build_design(df: pd.DataFrame, include_product_fe: bool = True, use_price: 
 
     clusters = df["screen_id"].astype(str)
 
-    # Fixed effects: screen (+ product unless near-saturated)
     dmy_cols = ["screen_id"]
     if include_product_fe:
         dmy_cols.append("product")
@@ -297,13 +217,11 @@ def _build_design(df: pd.DataFrame, include_product_fe: bool = True, use_price: 
 
     return y, X, clusters, x_vars_existing
 
-
 # -----------------------
 # Estimation
 # -----------------------
 
 def _fit_glm_logit(y: pd.Series, X: pd.DataFrame, cov_type: str, cov_kwds: dict | None) -> sm.GLM:
-    """GLM(Logit) with configurable covariance; returns fitted results."""
     model = sm.GLM(y, X, family=sm.families.Binomial())
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -311,36 +229,29 @@ def _fit_glm_logit(y: pd.Series, X: pd.DataFrame, cov_type: str, cov_kwds: dict 
     return res
 
 def _tidy_from_params(params, se, X):
-    """Build tidy table given params and se; compute p, q_bh, OR, CI, AME, evid."""
     params = pd.Series(params, index=X.columns) if not isinstance(params, pd.Series) else params
     se     = pd.Series(se,     index=X.columns) if not isinstance(se,     pd.Series) else se
 
-    # z and two-sided p using erfc for numeric stability: p = erfc(|z| / sqrt(2))
     z = params / se.replace(0.0, np.nan)
     z_vals = np.asarray(z, dtype=float)
     pvals_arr = np.array([math.erfc(abs(zi) / math.sqrt(2.0)) if np.isfinite(zi) else np.nan for zi in z_vals], dtype=float)
     pvals = pd.Series(pvals_arr, index=params.index)
 
-    # Benjamini–Hochberg on numpy array
-    # Handle all-NaN gracefully
     if np.isfinite(pvals_arr).any():
         _, q_bh_arr, _, _ = multipletests(np.nan_to_num(pvals_arr, nan=1.0), method="fdr_bh")
     else:
         q_bh_arr = np.full_like(pvals_arr, fill_value=np.nan, dtype=float)
     q_bh = pd.Series(q_bh_arr, index=params.index)
 
-    # Odds ratios with clipping to avoid overflow
-    CLIP = 40.0  # exp(±40) ≈ 2.35e17
+    CLIP = 40.0
     pruned = params.clip(lower=-CLIP, upper=CLIP)
     orx = np.exp(pruned)
 
-    # CI on OR scale with clipping (use `se` here!)
     ci_arg_lo = np.clip(pruned - 1.96 * se, -CLIP, CLIP)
     ci_arg_hi = np.clip(pruned + 1.96 * se, -CLIP, CLIP)
     ci_low  = np.exp(ci_arg_lo)
     ci_high = np.exp(ci_arg_hi)
 
-    # AME (neutral weight), evidence
     ame_pp = 100.0 * 0.25 * params
     evid   = (params.abs() / se.replace(0.0, np.nan))
 
@@ -357,21 +268,18 @@ def _tidy_from_params(params, se, X):
     })
     return out
 
-def _fit_ridge_logit(y: pd.Series, X: pd.DataFrame, alpha: float = 1.0) -> Tuple[pd.Series, pd.Series]:
+def _fit_ridge_logit(y: pd.Series, X: pd.DataFrame, alpha: float = 0.05) -> Tuple[pd.Series, pd.Series]:
     """
     Ridge-penalised logit fallback (no clusters).
-    Returns params and approximate SEs from observed Hessian at the solution.
-    Robust to separation and small samples.
+    Gentle L2 penalty by default; robust to separation and small samples.
+    SEs are derived from (X'WX + αI)^(-1).
     """
     logit = sm.Logit(y, X)
     alpha_use = float(alpha)
-    if X.shape[0] <= 120:
-        alpha_use = max(alpha_use, 1.0)
-    res = logit.fit_regularized(alpha=alpha_use, L1_wt=0.0, maxiter=1000, disp=False)
 
+    res = logit.fit_regularized(alpha=alpha_use, L1_wt=0.0, maxiter=1000, disp=False)
     params = pd.Series(res.params, index=X.columns)
 
-    # Stabilised weights
     lin = np.asarray(X @ params)
     lin = np.clip(lin, -40.0, 40.0)
     p = 1.0 / (1.0 + np.exp(-lin))
@@ -379,20 +287,16 @@ def _fit_ridge_logit(y: pd.Series, X: pd.DataFrame, alpha: float = 1.0) -> Tuple
 
     Xv = X.values
     XtWX = Xv.T @ (Xv * W[:, None])
-    ridge_eps = 1e-4
+    # Penalised Fisher information inverse
+    A = XtWX + alpha_use * np.eye(XtWX.shape[0])
     try:
-        cov = np.linalg.inv(XtWX + ridge_eps * np.eye(XtWX.shape[0]))
+        cov = np.linalg.inv(A)
     except np.linalg.LinAlgError:
-        cov = np.linalg.pinv(XtWX + ridge_eps * np.eye(XtWX.shape[0]))
+        cov = np.linalg.pinv(A)
     se = pd.Series(np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=np.inf)), index=X.columns)
     return params, se
 
 def fit_glm_tidy_with_cov_strategy(y: pd.Series, X: pd.DataFrame, clusters: pd.Series, cluster_min: int = 30) -> Tuple[pd.DataFrame, str]:
-    """
-    Fit GLM(Logit) and compute tidy table using either cluster-robust
-    or HC1 covariance depending on the number of clusters.
-    Returns (tidy_df, fit_mode_label).
-    """
     n_clusters = pd.Series(clusters).nunique()
     cov_type = "cluster" if n_clusters >= cluster_min else "HC1"
     cov_kwds = {"groups": clusters} if cov_type == "cluster" else None
@@ -430,7 +334,6 @@ def fit_glm_tidy_with_cov_strategy(y: pd.Series, X: pd.DataFrame, clusters: pd.S
     })
     mode = "glm_cluster" if cov_type == "cluster" else "glm_hc1"
     return out, mode
-
 
 # -----------------------
 # Results shaping for app
@@ -489,7 +392,6 @@ def _results_to_rows(results_df: pd.DataFrame) -> List[Dict[str, Any]]:
     rows.sort(key=lambda r: str(r.get("badge", "")))
     return rows
 
-
 # -----------------------
 # Public API for the app
 # -----------------------
@@ -500,58 +402,31 @@ def run_logit(
     min_cases: int = 10,
     use_price: bool = True,
     alts_per_screen: int = 8,
-    ridge_threshold: int = 50,
+    ridge_threshold: int = 30,
     cluster_min: int = 30
 ) -> List[Dict[str, Any]]:
-    """
-    App-facing API. Returns list[dict] for the 'Badge Effects' table.
-
-    Parameters
-    ----------
-    df_or_path : DataFrame | path-like | payload
-        Choice data with required columns.
-    selected_badges : list[str] | None
-        If provided, filter the returned rows to these human-readable labels.
-    min_cases : int
-        Minimum number of COMPLETE screens required to proceed (default 10).
-    use_price : bool
-        If False, drops ln_price even if present.
-    alts_per_screen : int
-        Number of alternatives that constitute a complete screen (default 8).
-    ridge_threshold : int
-        Use ridge when the number of complete screens is below this (default 50).
-    cluster_min : int
-        Minimum clusters (screens) to use cluster-robust covariance (default 30).
-    """
-    # Load + schema
     df = _load_df(df_or_path)
     df = _rename_core_columns(df)
     _ensure_required_columns(df)
 
-    # Basic cleaning and typing
     df = df.dropna(subset=["chosen", "screen_id", "product", "price"]).copy()
     df["chosen"] = pd.to_numeric(df["chosen"], errors="coerce").fillna(0).astype(int)
 
-    # Derive position/log vars; harmonise frame variants
     df = _make_position_dummies(df)
     df = _make_logs(df)
     df = _harmonize_badges(df)
 
-    # Keep only COMPLETE screens
     df = _filter_complete_screens(df, alts_per_screen=alts_per_screen)
 
-    # Guardrail for tiny pilots
     n_screens = df["screen_id"].nunique()
     if n_screens < min_cases:
         return []
 
-    # If price is requested but has no within-screen variation across ALL screens, drop it
     if use_price and "ln_price" in df.columns:
         within_var = df.groupby("screen_id")["ln_price"].nunique()
         if (within_var <= 1).all():
             use_price = False
 
-    # Build design (start with product FE; if near-saturated, drop them)
     y, X_full, clusters, _ = _build_design(df, include_product_fe=True, use_price=use_price)
     near_sat = (X_full.shape[1] >= max(df.shape[0] - 2, 1))
     if near_sat:
@@ -559,38 +434,32 @@ def run_logit(
     else:
         X = X_full
 
-    # Drop any remaining columns that are constant after FE expansion (safety)
     X = _drop_constant_cols(X)
 
-    # Choose estimator: ridge by default for small/medium N; GLM for larger samples
     try:
         if n_screens < ridge_threshold:
-            params, se = _fit_ridge_logit(y, X, alpha=1.0)
+            params, se = _fit_ridge_logit(y, X, alpha=0.05)
             results = _tidy_from_params(params, se, X)
             results.attrs["fit_mode"] = "ridge_default"
         else:
             results, mode = fit_glm_tidy_with_cov_strategy(y, X, clusters, cluster_min=cluster_min)
             results.attrs["fit_mode"] = mode
     except Exception:
-        params, se = _fit_ridge_logit(y, X, alpha=1.0)
+        params, se = _fit_ridge_logit(y, X, alpha=0.05)
         results = _tidy_from_params(params, se, X)
         results.attrs["fit_mode"] = "ridge_fallback_uncaught"
 
-    # Optional debug: which path did we take?
     fit_mode = getattr(results, "attrs", {}).get("fit_mode")
     if fit_mode:
         print(f"[logit] fit_mode = {fit_mode}; screens={n_screens}; rows={df.shape[0]}; cols={X.shape[1]}")
 
-    # Shape rows for the app table (badges only to match current UI contract)
     rows = _results_to_rows(results)
 
-    # Optional filter to only the user-selected badge labels
     if selected_badges:
         want = {s.strip().lower() for s in selected_badges}
         rows = [r for r in rows if r.get("badge") and r["badge"].strip().lower() in want]
 
     return rows
-
 
 # -----------------------
 # CLI entrypoint
@@ -602,7 +471,7 @@ def main():
     parser.add_argument("--output", type=str, default="logit_readiness_results.csv", help="Output CSV for tidy results.")
     parser.add_argument("--min_screens", type=int, default=10, help="Minimum COMPLETE screens required to proceed.")
     parser.add_argument("--alts_per_screen", type=int, default=8, help="Alternatives per complete screen (default 8).")
-    parser.add_argument("--ridge_threshold", type=int, default=50, help="Use ridge when screens < this threshold.")
+    parser.add_argument("--ridge_threshold", type=int, default=30, help="Use ridge when screens < this threshold.")
     parser.add_argument("--cluster_min", type=int, default=30, help="Min clusters for cluster-robust SEs.")
     parser.add_argument("--no_price", action="store_true", help="If set, drop ln_price even if present.")
     args = parser.parse_args()
@@ -618,14 +487,12 @@ def main():
     df = _make_logs(df)
     df = _harmonize_badges(df)
 
-    # Keep only COMPLETE screens
     df = _filter_complete_screens(df, alts_per_screen=int(args.alts_per_screen))
 
     n_screens = df["screen_id"].nunique()
     if n_screens < int(args.min_screens):
         raise ValueError(f"Insufficient COMPLETE screens for inference: {n_screens} < {int(args.min_screens)}")
 
-    # Price usage decision
     use_price = not bool(args.no_price)
     if use_price and "ln_price" in df.columns:
         within_var = df.groupby("screen_id")["ln_price"].nunique()
@@ -641,9 +508,8 @@ def main():
 
     X = _drop_constant_cols(X)
 
-    # Estimator choice
     if n_screens < int(args.ridge_threshold):
-        params, se = _fit_ridge_logit(y, X, alpha=1.0)
+        params, se = _fit_ridge_logit(y, X, alpha=0.05)
         results = _tidy_from_params(params, se, X)
         results.attrs["fit_mode"] = "ridge_default"
     else:
@@ -651,13 +517,12 @@ def main():
             results, mode = fit_glm_tidy_with_cov_strategy(y, X, clusters, cluster_min=int(args.cluster_min))
             results.attrs["fit_mode"] = mode
         except Exception:
-            params, se = _fit_ridge_logit(y, X, alpha=1.0)
+            params, se = _fit_ridge_logit(y, X, alpha=0.05)
             results = _tidy_from_params(params, se, X)
             results.attrs["fit_mode"] = "ridge_fallback"
 
     results.round(6).to_csv(args.output, index=True)
 
-    # Show key lever coefficients (position, price, badges)
     show_keys: List[str] = []
     for v in ["row_top", "col1", "col2", "col3", "ln_price"] + BADGE_VARS:
         if v in results.index:
@@ -670,7 +535,6 @@ def main():
         safe_cols = [c for c in cols if c in results.columns]
         print("=== Key Lever Effects (position, price, badges) ===")
         print(results.loc[show_keys, safe_cols].to_string())
-
 
 if __name__ == "__main__":
     main()
