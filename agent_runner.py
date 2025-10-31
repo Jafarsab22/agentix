@@ -786,7 +786,37 @@ def run_job_sync(payload: Dict) -> Dict:
     else:
         print("DEBUG choice file missing or empty")
 
-    # Heatmaps are now produced inside logit_badges; the runner no longer generates them.
+    # ---- NEW: call logit_badges heatmaps and record their paths (no drawing here) ----
+    try:
+        emp_png  = RESULTS_DIR / f"heatmap_empirical_{job_id}.png"
+        prob_png = RESULTS_DIR / f"heatmap_probability_{job_id}.png"
+
+        if choice_path.exists() and choice_path.stat().st_size > 0:
+            if hasattr(logit_badges, "save_position_heatmap_empirical"):
+                emp_path = logit_badges.save_position_heatmap_empirical(
+                    str(choice_path),
+                    str(emp_png),
+                    title=f"{category} · {ui_label} — empirical"
+                )
+                artifacts["position_heatmap_empirical"] = emp_path
+
+            if hasattr(logit_badges, "save_position_heatmap"):
+                prob_path = logit_badges.save_position_heatmap(
+                    str(choice_path),
+                    str(prob_png),
+                    title=f"{category} · {ui_label} — probability"
+                )
+                artifacts["position_heatmap_prob"] = prob_path
+                # backward-compatible keys used by the UI
+                artifacts["position_heatmap"] = prob_path
+                artifacts["position_heatmap_png"] = prob_path
+    except Exception as e:
+        print("DEBUG heatmap generation skipped:", repr(e))
+
+    # Always expose core file locations
+    artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
+    artifacts.setdefault("df_long",   str(RESULTS_DIR / "df_long.csv"))
+    artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
 
     results: Dict = {
         "job_id": job_id,
@@ -807,6 +837,7 @@ def run_job_sync(payload: Dict) -> Dict:
     return results
 
 
+
 if __name__ == "__main__":
     # Manual driver: read jobs/*.json and process
     jobs_dir = pathlib.Path("jobs")
@@ -820,4 +851,5 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
