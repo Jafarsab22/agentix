@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- 
 """
 Agentix — Vision Runner (jpeg_b64) for two-stage design
-Version: v1.10 (2025-10-31)
+Version: v1.10 (2025-10-31) — patched
 
 Key assumptions and alignment
     1) One choice per screen; each screen has exactly 8 alternatives (2×4).
@@ -19,11 +19,11 @@ Key assumptions and alignment
     6) Post-processing uses logit_badges.run_logit(...) which absorbs screen FEs
        and includes product FEs by default (as set in that module).
 
-Why this fixes the “chosen disappeared” issue
-    • We validate the model’s decision per screen and set case_valid=1/0.
-    • We always compute chosen from validated row/col, otherwise chosen=0.
-    • We append rows to df_choice.csv using a fixed column order (CHOICE_COLS).
-      If an old file has a different header, we rotate it aside and write a fresh file.
+Patch summary
+    • Fixes “chosen stuck at (0,0)” by preventing silent defaulting to (0,0).
+      - More generous tokens + defensive parsing in ALL vendor calls (OpenAI, Anthropic, Gemini).
+      - reconcile(...) no longer coerces missing/invalid row/col to 0; if unresolved, sets row=col=-1.
+    • Removes runner-side heatmap generation; heatmaps are owned by logit_badges only.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ import logit_badges  # exposes run_logit
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "Agentix MC runner – inline-render or URL – 2025-10-31 (v1.10)"
+VERSION = "Agentix MC runner – inline-render or URL – 2025-10-31 (v1.10, patched)"
 print(f"[agent_runner] {VERSION}", flush=True)
 
 # ---------- strict output schema (prevents header drift) ----------
@@ -222,13 +222,42 @@ def _find_prod(gt, title, row, col):
     return None
 
 def reconcile(decision: dict, groundtruth: dict) -> dict:
-    r = int(decision.get("row", 0)); c = int(decision.get("col", 0))
-    r = 0 if r < 0 else (1 if r > 1 else r)
-    c = 0 if c < 0 else (3 if c > 3 else c)
-    prod = _find_prod(groundtruth, decision.get("chosen_title"), r, c)
+    """
+    Defensive reconciliation:
+      • Never silently coerce missing/invalid row/col to 0.
+      • Prefer title match; otherwise use coordinates only if both present and in-bounds.
+      • If unresolved, set row=col=-1 so no card is falsely marked as chosen.
+    """
+    r_raw = decision.get("row", None)
+    c_raw = decision.get("col", None)
+
+    r = None
+    c = None
+    try:
+        if r_raw is not None:
+            r = int(r_raw)
+            if r < 0 or r > 1:
+                r = None
+    except Exception:
+        r = None
+    try:
+        if c_raw is not None:
+            c = int(c_raw)
+            if c < 0 or c > 3:
+                c = None
+    except Exception:
+        c = None
+
+    title = (decision.get("chosen_title") or "").strip()
+    prod = None
+    if title:
+        prod = _find_prod(groundtruth, title, r if r is not None else -9, c if c is not None else -9)
+    if prod is None and (r is not None and c is not None):
+        prod = _find_prod(groundtruth, "", r, c)
 
     if prod:
-        decision["row"], decision["col"] = int(prod.get("row", r)), int(prod.get("col", c))
+        decision["row"] = int(prod.get("row", r if r is not None else -1))
+        decision["col"] = int(prod.get("col", c if c is not None else -1))
         decision["frame"] = int(prod.get("frame", 1)) if prod.get("frame") is not None else None
         decision["assurance"] = int(prod.get("assurance", 0)) if prod.get("assurance") is not None else None
 
@@ -254,6 +283,8 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
             decision["price"] = None
             decision["ln_price"] = None
     else:
+        decision["row"] = -1
+        decision["col"] = -1
         decision.update({"frame": None, "assurance": None, "scarcity": None, "strike": None, "timer": None,
                          "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
@@ -301,16 +332,7 @@ def call_openai(image_b64, category, model_name=None):
         "function": {
             "name": "choose",
             "description": "Select one product from the 2×4 grid.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chosen_title": {"type": "string"},
-                    "row": {"type": "integer"},
-                    "col": {"type": "integer"}
-                },
-                "required": ["chosen_title", "row", "col"],
-                "additionalProperties": False
-            }
+            "parameters": SCHEMA_JSON
         }
     }]
 
@@ -325,7 +347,8 @@ def call_openai(image_b64, category, model_name=None):
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        "max_tokens": 8,
+        # Allow enough tokens for a proper tool call with string title + ints
+        "max_tokens": 64,
         "temperature": 0
     }
 
@@ -337,11 +360,30 @@ def call_openai(image_b64, category, model_name=None):
     tcs = msg.get("tool_calls", [])
     if not tcs:
         raise RuntimeError("OpenAI returned no tool_calls.")
-    args_json = tcs[0]["function"]["arguments"]
+    raw = tcs[0]["function"].get("arguments")
+
+    if isinstance(raw, str):
+        try:
+            args = json.loads(raw)
+        except Exception:
+            args = {}
+    elif isinstance(raw, dict):
+        args = raw
+    else:
+        args = {}
+
+    title = args.get("chosen_title")
+    args["chosen_title"] = title if isinstance(title, str) else ""
     try:
-        return json.loads(args_json)
+        args["row"] = int(args.get("row"))
     except Exception:
-        return args_json if isinstance(args_json, dict) else {}
+        args["row"] = None
+    try:
+        args["col"] = int(args.get("col"))
+    except Exception:
+        args["col"] = None
+
+    return args
 
 # ---------- Anthropic ----------
 def _post_with_retries(url, headers, payload, timeout=120, attempts=5, backoff=0.9):
@@ -367,7 +409,7 @@ def call_anthropic(image_b64: str, category: str, model_name: str):
     headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     tools = [{"name": "choose", "description": "Select one grid item", "input_schema": SCHEMA_JSON}]
     body = {
-        "model": model_name, "max_tokens": 80, "temperature": 0,
+        "model": model_name, "max_tokens": 128, "temperature": 0,
         "system": SYSTEM_PROMPT, "tools": tools, "tool_choice": {"type": "tool", "name": "choose"},
         "messages": [{
             "role": "user",
@@ -381,7 +423,18 @@ def call_anthropic(image_b64: str, category: str, model_name: str):
     tool_blocks = [b for b in blocks if b.get("type") == "tool_use" and b.get("name") == "choose"]
     if not tool_blocks:
         raise RuntimeError("Anthropic: no tool_use choose.")
-    return tool_blocks[0].get("input", {}) or {}
+    args = tool_blocks[0].get("input", {}) or {}
+    title = args.get("chosen_title")
+    args["chosen_title"] = title if isinstance(title, str) else ""
+    try:
+        args["row"] = int(args.get("row"))
+    except Exception:
+        args["row"] = None
+    try:
+        args["col"] = int(args.get("col"))
+    except Exception:
+        args["col"] = None
+    return args
 
 # ---------- Gemini ----------
 def call_gemini(image_b64: str, category: str, model_name: str):
@@ -410,14 +463,27 @@ def call_gemini(image_b64: str, category: str, model_name: str):
     if not candidates:
         raise RuntimeError("Gemini: no candidates.")
     parts = candidates[0].get("content", {}).get("parts", [])
+    args = {}
     for p in parts:
         fc = p.get("functionCall")
         if fc and fc.get("name") == "choose":
-            args = fc.get("args", {}) or {}
-            if "row" in args: args["row"] = int(args["row"])
-            if "col" in args: args["col"] = int(args["col"])
-            return args
-    raise RuntimeError("Gemini: no functionCall choose.")
+            raw = fc.get("args", {}) or {}
+            args = dict(raw)
+            break
+    if not args:
+        raise RuntimeError("Gemini: no functionCall choose.")
+
+    title = args.get("chosen_title")
+    args["chosen_title"] = title if isinstance(title, str) else ""
+    try:
+        args["row"] = int(args.get("row"))
+    except Exception:
+        args["row"] = None
+    try:
+        args["col"] = int(args.get("col"))
+    except Exception:
+        args["col"] = None
+    return args
 
 def _choose_with_model(image_b64, category, ui_label):
     vendor, model, _ = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
@@ -545,7 +611,7 @@ def _episode(
             except Exception:
                 if attempt == 0:
                     continue
-                model_label, decision = ("openai", {"row": -1, "col": -1, "chosen_title": ""})
+                model_label, decision = ("openai", {"row": None, "col": None, "chosen_title": ""})
 
             decision = reconcile(decision, gt)
             return set_id, model_label, gt, image_b64, decision
@@ -782,36 +848,12 @@ def run_job_sync(payload: Dict) -> Dict:
             else:
                 print("DEBUG empty_or_missing_badge_table")
         except Exception as e:
-            print("[logit] skipped due to error:", repr(e), flush=True)
+            print("[logit] skipped due to error:", repr(e))
     else:
         print("DEBUG choice file missing or empty")
 
-    # ---- NEW: call logit_badges heatmaps and record their paths (no drawing here) ----
-    try:
-        emp_png  = RESULTS_DIR / f"heatmap_empirical_{job_id}.png"
-        prob_png = RESULTS_DIR / f"heatmap_probability_{job_id}.png"
-
-        if choice_path.exists() and choice_path.stat().st_size > 0:
-            if hasattr(logit_badges, "save_position_heatmap_empirical"):
-                emp_path = logit_badges.save_position_heatmap_empirical(
-                    str(choice_path),
-                    str(emp_png),
-                    title=f"{category} · {ui_label} — empirical"
-                )
-                artifacts["position_heatmap_empirical"] = emp_path
-
-            if hasattr(logit_badges, "save_position_heatmap"):
-                prob_path = logit_badges.save_position_heatmap(
-                    str(choice_path),
-                    str(prob_png),
-                    title=f"{category} · {ui_label} — probability"
-                )
-                artifacts["position_heatmap_prob"] = prob_path
-                # backward-compatible keys used by the UI
-                artifacts["position_heatmap"] = prob_path
-                artifacts["position_heatmap_png"] = prob_path
-    except Exception as e:
-        print("DEBUG heatmap generation skipped:", repr(e))
+    # Runner no longer creates heatmaps; leave that responsibility to logit_badges.
+    # If logit_badges wants to save heatmaps, it can expose and document the paths.
 
     # Always expose core file locations
     artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
@@ -851,5 +893,3 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
-
-
