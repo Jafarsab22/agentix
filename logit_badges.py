@@ -271,13 +271,73 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
 
     return table
 
-
-# ----------------- probability-based heat-map (darker = higher selection) -----------------
+# ----------------- empirical heat-map (darker = higher selection) -----------------
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+def save_position_heatmap_empirical(path_csv: str,
+                                    out_png_path: str,
+                                    title: str | None = None) -> str:
+    """
+    Render a 2×4 heat-map of EMPIRICAL selection rates by (row, col) using df_choice.csv.
+    We average the binary 'chosen' over all rows in each (row, col) cell.
+
+    Conventions:
+      • Rows: Row 1 = top (index 0), Row 2 = bottom (index 1).
+      • Columns: 1..4 correspond to indices 0..3.
+      • Darker shades indicate a higher observed selection rate.
+    """
+    df = pd.read_csv(path_csv)
+    df = _complete_screens(df).copy()
+
+    # Guards and numeric casts
+    df["row"] = pd.to_numeric(df.get("row", 0), errors="coerce").fillna(-1).astype(int)
+    df["col"] = pd.to_numeric(df.get("col", 0), errors="coerce").fillna(-1).astype(int)
+    df["chosen"] = pd.to_numeric(df.get("chosen", 0), errors="coerce").fillna(0).astype(int)
+
+    # Mean chosen by grid cell → empirical selection rate
+    mat = np.zeros((2, 4), dtype=float)
+    g = df.groupby(["row", "col"])["chosen"].mean()
+    for (r, c), v in g.items():
+        r = int(r); c = int(c)
+        if 0 <= r <= 1 and 0 <= c <= 3:
+            mat[r, c] = float(v)
+
+    # Plot (darker = higher); use data-driven vmax for contrast
+    vmax = float(mat.max()) if mat.max() > 0 else 1.0
+    fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
+    im = ax.imshow(mat, cmap="Greys_r", vmin=0.0, vmax=vmax)
+
+    # Percent labels with adaptive text colour
+    for r in range(2):
+        for c in range(4):
+            val = float(mat[r, c])
+            txt_color = "white" if (vmax > 0 and val >= 0.5 * vmax) else "black"
+            ax.text(c, r, f"{100.0 * val:.1f}%", ha="center", va="center", fontsize=9, color=txt_color)
+
+    ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"])
+    ax.set_yticks([0, 1]);    ax.set_yticklabels(["Row 1", "Row 2"])
+    ax.set_xlabel("Column");  ax.set_ylabel("Row")
+    ax.set_title(title or "Empirical webpage heatmap of AI shopping agents", fontsize=11)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.set_ylabel("Empirical selection rate", rotation=270, labelpad=12)
+
+    # Light grid to emphasise cell boundaries
+    ax.set_xticks(np.arange(-.5, 4, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, 2, 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6, alpha=0.6)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    fig.tight_layout()
+    fig.savefig(out_png_path, bbox_inches="tight")
+    plt.close(fig)
+    return out_png_path
+
+# ----------------- probability-based heat-map (darker = higher selection) -----------------
 
 def save_position_heatmap(path_csv: str,
                           out_png_path: str,
@@ -325,7 +385,7 @@ def save_position_heatmap(path_csv: str,
     ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"])
     ax.set_yticks([0, 1]);    ax.set_yticklabels(["Row 1", "Row 2"])
     ax.set_xlabel("Column");  ax.set_ylabel("Row")
-    ax.set_title(title or "Webpage heatmap of AI shopping agents", fontsize=11)
+    ax.set_title(title or "Probability webpage heatmap of AI shopping agents", fontsize=11)
 
     # Colorbar + light grid
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -339,3 +399,4 @@ def save_position_heatmap(path_csv: str,
     fig.savefig(out_png_path)
     plt.close(fig)
     return out_png_path
+
