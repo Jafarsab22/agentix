@@ -259,49 +259,101 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
                          "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
 
-# ---------------- vendor calls (Colab-conform) ----------------
-def call_openai(image_b64: str, category: str, model_name: str):
+# --- Robust OpenAI POST with retries (mirrors Anthropic helper) ---
+def _post_with_retries_openai(url, headers, payload,
+                              timeout=(15, 300),       # (connect, read)
+                              max_attempts=6,
+                              backoff_base=0.75,
+                              backoff_cap=12.0):
+    import requests, random, time
+    sess = requests.Session()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = sess.post(url, headers=headers, json=payload, timeout=timeout)
+            # Retry on rate limits and 5xx
+            if r.status_code in (429, 409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
+                # exponential backoff with jitter
+                sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                sleep_s *= random.uniform(0.6, 1.4)
+                time.sleep(sleep_s)
+                continue
+            return r
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            # transient network error → backoff and retry
+            sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+            sleep_s *= random.uniform(0.6, 1.4)
+            time.sleep(sleep_s)
+            if attempt == max_attempts:
+                raise
+    # If we fell out without returning, raise the last response if present
+    raise RuntimeError("OpenAI retry exhausted without success.")
+
+# ---------- OpenAI ----------
+def call_openai(image_b64, category, model_name=None):
+    import os, json, requests
     key = os.getenv("OPENAI_API_KEY")
     if not key:
-        raise RuntimeError("OPENAI_API_KEY missing.")
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
-    tools = [{"type": "function", "function": {"name": "choose", "description": "Select one grid item", "parameters": SCHEMA_JSON}}]
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "choose",
+            "description": "Select one product from the 2×4 grid.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chosen_title": {"type": "string"},
+                    "row": {"type": "integer"},
+                    "col": {"type": "integer"}
+                },
+                "required": ["chosen_title", "row", "col"],
+                "additionalProperties": False
+            }
+        }
+    }]
+
     data = {
-        "model": model_name,
+        "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [
-                {"type": "text", "text": f"Category: {category}. Use ONLY the tool."},
+                {"type": "text", "text": f"Category: {category}. Use ONLY the 'choose' tool."},
                 {"type": "image_url", "image_url": {"url": image_b64}}
             ]}
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
+        # keep the response small; tool-calls don't need many tokens
+        "max_tokens": 8,
         "temperature": 0
     }
-    r = requests.post(url, headers=headers, json=data, timeout=120)
-    r.raise_for_status()
+
+    # Use robust retry with longer read-timeout
+    r = _post_with_retries_openai(url, headers, data, timeout=(12, 240), max_attempts=6)
+    if r.status_code >= 400:
+        # Show the first part of the body for debugging, but don’t dump everything
+        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
+
     msg = r.json()["choices"][0]["message"]
     tcs = msg.get("tool_calls", [])
     if not tcs:
-        raise RuntimeError("OpenAI: no tool_calls.")
-    return json.loads(tcs[0]["function"]["arguments"])
+        # Extremely rare path; treat as transient for the caller to log
+        raise RuntimeError("OpenAI returned no tool_calls.")
+    args_json = tcs[0]["function"]["arguments"]
+    try:
+        return json.loads(args_json)
+    except Exception:
+        # Some SDKs may already return a dict-like; handle gracefully
+        return args_json if isinstance(args_json, dict) else {}
 
-def _post_with_retries(url, headers, payload, timeout=120, max_attempts=6, backoff_base=0.75, backoff_cap=12.0):
-    import random as _random
-    sess = requests.Session()
-    last = None
-    for attempt in range(1, max_attempts + 1):
-        last = sess.post(url, headers=headers, json=payload, timeout=timeout)
-        if last.status_code < 400:
-            return last
-        if last.status_code in (429, 529) or (500 <= last.status_code < 600):
-            sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
-            sleep_s *= _random.uniform(0.5, 1.5)
-            time.sleep(sleep_s); continue
-        break
-    raise RuntimeError(f"Anthropic error {getattr(last, 'status_code', 'NA')}: {getattr(last, 'text', '')[:400]}")
 
 def call_anthropic(image_b64: str, category: str, model_name: str):
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -819,6 +871,7 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 
