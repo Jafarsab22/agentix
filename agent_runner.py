@@ -1,36 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 Agentix — Vision Runner (jpeg_b64) for two-stage design
-Version: v1.9 (2025-10-30)
+Version: v1.10 (2025-10-31)
 
 Key assumptions and alignment
     1) One choice per screen; each screen has exactly 8 alternatives (2×4).
-    2) Frame is assigned independently of non-frame badges. If the UI selects the
-       frame comparison, we block 4 ALL-IN and 4 PARTITIONED per screen; otherwise
-       frame is fixed. This matches storefront.render_screen(...).
-    3) Exactly one non-frame visual badge per card, drawn from the enabled set
-       with a balanced per-screen allocation that includes a true “none” cell.
-    4) Prices follow eight log-symmetric levels around the anchor and are placed
-       with an 8×8 Latin square to remove price–position confounds.
-    5) Ground truth is a plain list of 8 dicts under the hidden #groundtruth div
-       in the HTML (no wrapper object); keys match the logit module:
-       case_id/set_id, title, row/col, row_top, col1–col3, frame, assurance,
-       scarcity, strike, timer, social_proof, voucher, bundle, price, ln_price.
-    6) Post-processing uses logit_badges.run_logit(...) which renames case_id→
-       screen_id and absorbs screen FEs; product FEs are included unless near-
-       saturated. We never “post-hoc balance” columns in the runner.
+    2) Frame is assigned independently of non-frame badges.
+    3) Exactly one non-frame visual badge per card (plus a true “none” cell).
+    4) Prices follow eight log-symmetric levels around the anchor (Latin square).
+    5) Ground truth: a list of 8 dicts under #groundtruth (case_id/set_id, title,
+       row/col, row_top, col1–col3, frame, assurance, scarcity, strike, timer,
+       social_proof, voucher, bundle, price, ln_price).
+    6) Post-processing uses logit_badges.run_logit(...) (with screen FEs and product FEs).
 
-Why this fixes the crash
-    The previous file called _openai_choose / _anthropic_choose / _gemini_choose
-    but those symbols weren’t defined in that module. This revision uses
-    call_openai / call_anthropic / call_gemini (your Colab convention) and
-    routes through _choose_with_model which dispatches to those functions.
-
-Env & I/O
-    • Requires one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
-      (the app currently exposes “OpenAI GPT-4.1-mini” in the dropdown).
-    • Writes results/df_choice.csv, results/df_long.csv, results/log_compare.jsonl,
-      and results/badges_effects.csv. Returns rows for the UI table.
+This version fixes the (0,0) default bug by validating model decisions. Invalid
+or unparsable decisions no longer default to top-left; they are flagged and the
+screen is excluded downstream by the estimator.
 """
 
 from __future__ import annotations
@@ -44,7 +29,6 @@ import pathlib
 import math
 from datetime import datetime
 from typing import Dict, List, Tuple, Iterable
-from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -67,7 +51,7 @@ import logit_badges  # exposes run_logit
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "Agentix MC runner – inline-render or URL – 2025-10-30 (v1.9)"
+VERSION = "Agentix MC runner – inline-render or URL – 2025-10-31 (v1.10)"
 print(f"[agent_runner] {VERSION}", flush=True)
 
 # ---------------- small helpers ----------------
@@ -166,7 +150,6 @@ def _new_driver():
     except Exception:
         pass
 
-    # Railway often provides a Chromium binary
     bin_hint = os.getenv("CHROME_BIN")
     if bin_hint:
         opts.binary_location = bin_hint
@@ -222,17 +205,40 @@ def _find_prod(gt, title, row, col):
             return p
     return None
 
+# [FIX] Strict validation (no defaults to 0/0)
+def _valid_decision(d: dict) -> bool:
+    try:
+        r = d.get("row", None)
+        c = d.get("col", None)
+        if r is None or c is None:
+            return False
+        r = int(r); c = int(c)
+        return (r in (0, 1)) and (c in (0, 1, 2, 3))
+    except Exception:
+        return False
+
+# [FIX] Do not coerce to (0,0); mark invalid instead
 def reconcile(decision: dict, groundtruth: dict) -> dict:
-    r = int(decision.get("row", 0)); c = int(decision.get("col", 0))
-    r = 0 if r < 0 else (1 if r > 1 else r)
-    c = 0 if c < 0 else (3 if c > 3 else c)
+    valid = _valid_decision(decision)
+    if not valid:
+        decision = dict(decision)  # shallow copy
+        decision.update({
+            "row": None, "col": None, "valid": False,
+            "frame": None, "assurance": None, "scarcity": None, "strike": None, "timer": None,
+            "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None
+        })
+        return decision
+
+    r = int(decision.get("row"))
+    c = int(decision.get("col"))
+    decision["row"], decision["col"] = r, c
     prod = _find_prod(groundtruth, decision.get("chosen_title"), r, c)
 
     if prod:
-        decision["row"], decision["col"] = int(prod.get("row", r)), int(prod.get("col", c))
         decision["frame"] = int(prod.get("frame", 1)) if prod.get("frame") is not None else None
         decision["assurance"] = int(prod.get("assurance", 0)) if prod.get("assurance") is not None else None
 
+        # dark badge decoding if present
         dark_str = (str(prod.get("dark", "")).strip().lower()) if "dark" in prod else None
         if dark_str is not None:
             decision["scarcity"] = 1 if dark_str == "scarcity" else 0
@@ -254,12 +260,14 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
         else:
             decision["price"] = None
             decision["ln_price"] = None
+        decision["valid"] = True
     else:
         decision.update({"frame": None, "assurance": None, "scarcity": None, "strike": None, "timer": None,
-                         "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
+                         "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None,
+                         "valid": True})  # row/col valid even if title mismatch
     return decision
 
-# --- Robust OpenAI POST with retries (mirrors Anthropic helper) ---
+# --- Robust OpenAI POST with retries ---
 def _post_with_retries_openai(url, headers, payload,
                               timeout=(15, 300),       # (connect, read)
                               max_attempts=6,
@@ -270,9 +278,7 @@ def _post_with_retries_openai(url, headers, payload,
     for attempt in range(1, max_attempts + 1):
         try:
             r = sess.post(url, headers=headers, json=payload, timeout=timeout)
-            # Retry on rate limits and 5xx
-            if r.status_code in (429, 409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
-                # exponential backoff with jitter
+            if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
                 sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
                 sleep_s *= random.uniform(0.6, 1.4)
                 time.sleep(sleep_s)
@@ -281,19 +287,16 @@ def _post_with_retries_openai(url, headers, payload,
         except (requests.exceptions.ReadTimeout,
                 requests.exceptions.ConnectTimeout,
                 requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError) as e:
-            # transient network error → backoff and retry
+                requests.exceptions.ChunkedEncodingError):
             sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
             sleep_s *= random.uniform(0.6, 1.4)
             time.sleep(sleep_s)
             if attempt == max_attempts:
                 raise
-    # If we fell out without returning, raise the last response if present
     raise RuntimeError("OpenAI retry exhausted without success.")
 
 # ---------- OpenAI ----------
 def call_openai(image_b64, category, model_name=None):
-    import os, json, requests
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -331,29 +334,39 @@ def call_openai(image_b64, category, model_name=None):
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        # keep the response small; tool-calls don't need many tokens
         "max_tokens": 8,
         "temperature": 0
     }
 
-    # Use robust retry with longer read-timeout
     r = _post_with_retries_openai(url, headers, data, timeout=(12, 240), max_attempts=6)
     if r.status_code >= 400:
-        # Show the first part of the body for debugging, but don’t dump everything
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
 
     msg = r.json()["choices"][0]["message"]
     tcs = msg.get("tool_calls", [])
     if not tcs:
-        # Extremely rare path; treat as transient for the caller to log
         raise RuntimeError("OpenAI returned no tool_calls.")
     args_json = tcs[0]["function"]["arguments"]
     try:
         return json.loads(args_json)
     except Exception:
-        # Some SDKs may already return a dict-like; handle gracefully
         return args_json if isinstance(args_json, dict) else {}
 
+# ---------- Anthropic ----------
+def _post_with_retries(url, headers, payload, timeout=120, max_attempts=6):
+    import random
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
+                time.sleep(min(12.0, 0.75 * (2 ** (attempt - 1))) * random.uniform(0.6, 1.4))
+                continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException:
+            if attempt == max_attempts:
+                raise
+            time.sleep(min(12.0, 0.75 * (2 ** (attempt - 1))) * random.uniform(0.6, 1.4))
 
 def call_anthropic(image_b64: str, category: str, model_name: str):
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -372,13 +385,14 @@ def call_anthropic(image_b64: str, category: str, model_name: str):
                 {"type": "text", "text": f"Category: {category}. Use ONLY the tool 'choose'."}
             ]
         }]}
-    r = _post_with_retries(url, headers, body, timeout=120)
+    r = _post_with_retries(url, headers, body, timeout=180)
     blocks = r.json().get("content", [])
     tool_blocks = [b for b in blocks if b.get("type") == "tool_use" and b.get("name") == "choose"]
     if not tool_blocks:
         raise RuntimeError("Anthropic: no tool_use choose.")
     return tool_blocks[0].get("input", {}) or {}
 
+# ---------- Gemini ----------
 def call_gemini(image_b64: str, category: str, model_name: str):
     key = os.getenv("GEMINI_API_KEY")
     if not key:
@@ -398,7 +412,7 @@ def call_gemini(image_b64: str, category: str, model_name: str):
             {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
             {"inline_data": {"mime_type": "image/jpeg", "data": image_b64.split(",")[1]}}
         ]}]}
-    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=120)
+    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=180)
     r.raise_for_status()
     resp = r.json()
     candidates = resp.get("candidates", [])
@@ -534,7 +548,7 @@ def _episode(
 
             image_b64 = _jpeg_b64_from_driver(driver, quality=72)
             model_label, decision = _choose_with_model(image_b64, category, ui_label)
-            decision = reconcile(decision, gt)
+            decision = reconcile(decision, gt)  # [FIX] strict validation
             return set_id, model_label, gt, image_b64, decision
 
         except (TimeoutException, ReadTimeoutError):
@@ -546,16 +560,25 @@ def _episode(
 def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
+    valid = bool(decision.get("valid", False))
+    dec_row = decision.get("row", None)
+    dec_col = decision.get("col", None)
 
     # df_choice (8 rows per screen)
     for p in products:
         dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
-        row_top = 1 if int(p.get("row", 0)) == 0 else 0
-        col1 = 1 if int(p.get("col", 0)) == 0 else 0
-        col2 = 1 if int(p.get("col", 0)) == 1 else 0
-        col3 = 1 if int(p.get("col", 0)) == 2 else 0
-        chosen = 1 if (int(p.get("row", 9)) == int(decision.get("row", -1))
-                       and int(p.get("col", 9)) == int(decision.get("col", -1))) else 0
+        prow = int(p.get("row", 0))
+        pcol = int(p.get("col", 0))
+        row_top = 1 if prow == 0 else 0
+        col1 = 1 if pcol == 0 else 0
+        col2 = 1 if pcol == 1 else 0
+        col3 = 1 if pcol == 2 else 0
+
+        # [FIX] only mark chosen when decision is valid
+        if valid and dec_row is not None and dec_col is not None:
+            chosen = int((prow == int(dec_row)) and (pcol == int(dec_col)))
+        else:
+            chosen = 0
 
         scarcity = 1 if dark == "scarcity" else (int(p.get("scarcity", 0)) if dark is None else 0)
         strike   = 1 if dark == "strike"   else (int(p.get("strike", 0))   if dark is None else 0)
@@ -568,7 +591,7 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
             "case_id": f"{RUN_ID}|{set_id}|{model_label}",
             "run_id": RUN_ID, "set_id": set_id, "model": model_label, "category": category,
             "title": p.get("title"),
-            "row": int(p.get("row", 0)), "col": int(p.get("col", 0)),
+            "row": prow, "col": pcol,
             "row_top": row_top, "col1": col1, "col2": col2, "col3": col3,
             "frame": int(p.get("frame", 1)),
             "assurance": int(p.get("assurance", 0)),
@@ -578,7 +601,8 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
             "social_proof": int(p.get("social_proof", 1 if p.get("social") else 0)) if ("social_proof" in p or "social" in p) else 0,
             "voucher": int(p.get("voucher", 0)),
             "bundle":  int(p.get("bundle", 0)),
-            "chosen": chosen
+            "chosen": chosen,
+            "case_valid": 1 if valid else 0,   # [FIX] tag the whole screen
         }
         if price_val is not None:
             rec["price"] = float(price_val)
@@ -587,9 +611,9 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
 
     df_choice = pd.DataFrame(rows_choice)
     for c in ("row", "col", "row_top", "col1", "col2", "col3", "frame", "assurance",
-              "scarcity", "strike", "timer", "social_proof", "voucher", "bundle", "chosen"):
+              "scarcity", "strike", "timer", "social_proof", "voucher", "bundle", "chosen", "case_valid"):
         if c in df_choice.columns:
-            df_choice[c] = df_choice[c].astype(int)
+            df_choice[c] = pd.to_numeric(df_choice[c], errors="coerce").fillna(0).astype(int)
 
     # Append to results/df_choice.csv
     agg_choice = RESULTS_DIR / "df_choice.csv"
@@ -599,7 +623,8 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
     rows_long.append({
         "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
-        "row": int(decision.get("row", 0)), "col": int(decision.get("col", 0)),
+        "row": (int(dec_row) if dec_row is not None else None),
+        "col": (int(dec_col) if dec_col is not None else None),
         "frame": int(decision.get("frame", 1)) if decision.get("frame") is not None else None,
         "assurance": int(decision.get("assurance", 0)) if decision.get("assurance") is not None else None,
         "scarcity": int(decision.get("scarcity", 0)) if decision.get("scarcity") is not None else None,
@@ -610,6 +635,7 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         "bundle": int(decision.get("bundle", 0)) if decision.get("bundle") is not None else None,
         "price": float(decision.get("price")) if decision.get("price") is not None else None,
         "ln_price": float(decision.get("ln_price")) if decision.get("ln_price") is not None else None,
+        "case_valid": 1 if valid else 0,
     })
     df_long = pd.DataFrame(rows_long)
     agg_long = RESULTS_DIR / "df_long.csv"
@@ -673,7 +699,6 @@ def run_job_sync(payload: Dict) -> Dict:
 
     # ----- conditional-logit post-processing (single file: badges_effects.csv) -----
     from uuid import uuid4
-
     ts = datetime.utcnow().isoformat() + "Z"
     job_id = payload.get("job_id") or f"run-{uuid4().hex[:8]}"
 
@@ -690,10 +715,14 @@ def run_job_sync(payload: Dict) -> Dict:
             _df_dbg = pd.read_csv(choice_path)
             print("DEBUG rows=", len(_df_dbg))
             print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
+            # [FIX] show valid/invalid screens
+            if "case_valid" in _df_dbg.columns:
+                _valid_by_case = _df_dbg.groupby("case_id")["case_valid"].max()
+                print("DEBUG valid_cases=", int((_valid_by_case == 1).sum()), " invalid_cases=", int((_valid_by_case != 1).sum()))
             for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
                 if _c in _df_dbg.columns:
                     try:
-                        print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
+                        print(f"DEBUG {_c}_unique=", int(pd.to_numeric(_df_dbg[_c], errors="coerce").nunique(dropna=False)))
                     except Exception:
                         print(f"DEBUG {_c}_unique= NA")
         except Exception as e:
@@ -703,7 +732,6 @@ def run_job_sync(payload: Dict) -> Dict:
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
         try:
-            # Pass internal keys directly to the estimator (or None for no filtering)
             badge_keys = _normalize_badge_filter(badges)
             print("DEBUG badge_filter_internal=", badge_keys)
 
@@ -748,71 +776,12 @@ def run_job_sync(payload: Dict) -> Dict:
     else:
         print("DEBUG choice file missing or empty")
 
-    # ----- NEW: position heat-map (dark = high selection rate) -----
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        dfc = pd.read_csv(choice_path)
-        dfc = dfc[pd.to_numeric(dfc.get("chosen", 0), errors="coerce").fillna(0).astype(int).between(0, 1)]
-        sel = dfc[dfc["chosen"] == 1].copy()
-        # 2×4 grid, rows 0/1, cols 0..3
-        mat = np.zeros((2, 4), dtype=float)
-        tot = max(1, len(sel))
-        for _, r in sel.iterrows():
-            rr = int(r.get("row", 0)); cc = int(r.get("col", 0))
-            if 0 <= rr <= 1 and 0 <= cc <= 3:
-                mat[rr, cc] += 1.0
-        mat = mat / tot
-
-        fig, ax = plt.subplots(figsize=(6.2, 3.2), dpi=160)
-        im = ax.imshow(mat, cmap="Greys", vmin=0.0, vmax=mat.max() if mat.max() > 0 else 1.0)
-        ax.set_xticks([0, 1, 2, 3], labels=["Col 1", "Col 2", "Col 3", "Col 4"])
-        ax.set_yticks([0, 1], labels=["Row 1", "Row 2"])
-        ax.set_xlabel("Column"); ax.set_ylabel("Row")
-        ax.set_title(f"{category} · {ui_label}")
-
-        # readable labels: white text on dark cells, black on light
-        vmax = mat.max() if mat.max() > 0 else 1.0
-        for i in range(2):
-            for j in range(4):
-                val = mat[i, j]
-                txt_color = "white" if (vmax > 0 and val >= 0.5 * vmax) else "black"
-                ax.text(j, i, f"{100*val:.1f}%", ha="center", va="center", color=txt_color, fontsize=9)
-
-        cbar = fig.colorbar(im, ax=ax)
-        cbar.set_label("Selection rate")
-
-        hm_path = RESULTS_DIR / f"heatmap_{job_id}.png"
-        fig.tight_layout()
-        fig.savefig(hm_path, bbox_inches="tight")
-        plt.close(fig)
-
-        artifacts["position_heatmap"] = str(hm_path)
-        artifacts["position_heatmap_png"] = str(hm_path)
-    except Exception as e:
-        print("DEBUG heatmap generation failed:", repr(e))
-
-    return {
-        "job_id": job_id,
-        "ts": ts,
-        "model_requested": ui_label,
-        "vendor": vendor,
-        "n_iterations": n,
-        "inputs": {
-            "product": category,
-            "brand": brand,
-            "price": price,
-            "currency": currency,
-            "badges": badges,
-        },
-        "artifacts": artifacts,
-        "logit_table_rows": badge_rows,
-    }
-
+    
     # -------- assemble results payload --------
+    artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
+    artifacts.setdefault("df_long", str(RESULTS_DIR / "df_long.csv"))
+    artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
+
     results: Dict = {
         "job_id": job_id,
         "ts": ts,
@@ -832,32 +801,6 @@ def run_job_sync(payload: Dict) -> Dict:
     return results
 
 
-    vendor_used = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))[0]
-    return {
-        "job_id": payload.get("job_id", job_id),
-        "ts": ts,
-        "model_requested": ui_label,
-        "vendor": vendor_used,
-        "n_iterations": n,
-        "inputs": {
-            "product": category,
-            "brand": brand,
-            "price": price,
-            "currency": currency,
-            "badges": badges
-        },
-        "artifacts": {
-            "df_choice": str(RESULTS_DIR / "df_choice.csv"),
-            "df_long": str(RESULTS_DIR / "df_long.csv"),
-            "log_compare": str(RESULTS_DIR / "log_compare.jsonl"),
-            "badges_effects": artifacts.get("badges_effects", ""),
-            "effects_csv": artifacts.get("effects_csv", ""),
-            "table_badges": artifacts.get("table_badges", "")
-        },
-        "logit_table_rows": badge_rows
-    }
-
-
 if __name__ == "__main__":
     # Manual driver: read jobs/*.json and process
     jobs_dir = pathlib.Path("jobs")
@@ -871,9 +814,3 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
-
-
-
-
-
-
