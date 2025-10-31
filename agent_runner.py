@@ -580,75 +580,65 @@ def _append_choice(df_choice: pd.DataFrame, path: pathlib.Path):
             write_header = True
     df_choice.to_csv(path, mode="a", header=write_header, index=False, encoding="utf-8-sig")
 
+
 def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
+    case_valid = 1 if len(products) == 8 else 0
 
-    # Validate decision
-    try:
-        drow = int(decision.get("row", -1))
-        dcol = int(decision.get("col", -1))
-        decision_valid = (0 <= drow <= 1) and (0 <= dcol <= 3)
-    except Exception:
-        decision_valid = False
-        drow, dcol = -1, -1
-
-    # df_choice (8 rows per screen)
+    # ------- df_choice: exactly 8 rows per screen -------
     for p in products:
-        dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
-        prow = int(p.get("row", 0)); pcol = int(p.get("col", 0))
-        row_top = 1 if prow == 0 else 0
-        col1 = 1 if pcol == 0 else 0
-        col2 = 1 if pcol == 1 else 0
-        col3 = 1 if pcol == 2 else 0
-        chosen = 1 if (decision_valid and prow == drow and pcol == dcol) else 0
+        r_p = int(p.get("row", 0)); c_p = int(p.get("col", 0))
+        r_d = int(decision.get("row", -9)); c_d = int(decision.get("col", -9))
+        chosen = 1 if (r_p == r_d and c_p == c_d) else 0
 
-        scarcity = 1 if dark == "scarcity" else (int(p.get("scarcity", 0)) if dark is None else 0)
-        strike   = 1 if dark == "strike"   else (int(p.get("strike", 0))   if dark is None else 0)
-        timer    = 1 if dark == "timer"    else (int(p.get("timer", 0))    if dark is None else 0)
+        row_top = 1 if r_p == 0 else 0
+        col1 = 1 if c_p == 0 else 0
+        col2 = 1 if c_p == 1 else 0
+        col3 = 1 if c_p == 2 else 0
+
+        dark = (p.get("dark") or "").strip().lower() if "dark" in p else None
+        scarcity = 1 if dark == "scarcity" else int(p.get("scarcity", 0))
+        strike   = 1 if dark == "strike"   else int(p.get("strike", 0))
+        timer    = 1 if dark == "timer"    else int(p.get("timer", 0))
 
         price_val = p.get("price", p.get("total_price", None))
-        ln_price  = p.get("ln_price", math.log(max(float(price_val), 1e-8))) if price_val is not None else None
+        ln_price  = (float(p.get("ln_price")) if p.get("ln_price") is not None
+                     else (math.log(max(float(price_val), 1e-8)) if price_val is not None else None))
 
-        rec = {
+        rows_choice.append({
             "case_id": f"{RUN_ID}|{set_id}|{model_label}",
             "run_id": RUN_ID, "set_id": set_id, "model": model_label, "category": category,
             "title": p.get("title"),
-            "row": prow, "col": pcol,
+            "row": r_p, "col": c_p,
             "row_top": row_top, "col1": col1, "col2": col2, "col3": col3,
             "frame": int(p.get("frame", 1)),
             "assurance": int(p.get("assurance", 0)),
-            "scarcity": int(scarcity),
-            "strike":   int(strike),
-            "timer":    int(timer),
+            "scarcity": int(scarcity), "strike": int(strike), "timer": int(timer),
             "social_proof": int(p.get("social_proof", 1 if p.get("social") else 0)) if ("social_proof" in p or "social" in p) else 0,
-            "voucher": int(p.get("voucher", 0)),
-            "bundle":  int(p.get("bundle", 0)),
-            "chosen": chosen,
-            "case_valid": int(1 if decision_valid else 0)
-        }
-        if price_val is not None:
-            rec["price"] = float(price_val)
-            rec["ln_price"] = float(ln_price)
-        else:
-            rec["price"] = None
-            rec["ln_price"] = None
-        rows_choice.append(rec)
+            "voucher": int(p.get("voucher", 0)), "bundle": int(p.get("bundle", 0)),
+            "chosen": chosen, "case_valid": case_valid,
+            "price": float(price_val) if price_val is not None else None,
+            "ln_price": float(ln_price) if ln_price is not None else None,
+        })
 
     df_choice = pd.DataFrame(rows_choice)
-    for c in ("row","col","row_top","col1","col2","col3","frame","assurance",
+    for c in ["row","col","row_top","col1","col2","col3","frame","assurance",
               "scarcity","strike","timer","social_proof","voucher","bundle",
-              "chosen","case_valid"):
+              "chosen","case_valid"]:
         if c in df_choice.columns:
             df_choice[c] = pd.to_numeric(df_choice[c], errors="coerce").fillna(0).astype(int)
 
-    _append_choice(df_choice, RESULTS_DIR / "df_choice.csv")
+    # lock column order and append (header written once)
+    df_choice = df_choice.reindex(columns=CHOICE_COLS)
+    agg_choice = RESULTS_DIR / "df_choice.csv"
+    df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False, encoding="utf-8")
 
-    # df_long (one row per screen)
+    # ------- df_long: one row per screen (for auditing) -------
     rows_long.append({
         "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
-        "row": int(drow if decision_valid else -1), "col": int(dcol if decision_valid else -1),
+        "row": int(decision.get("row", -1)), "col": int(decision.get("col", -1)),
         "frame": int(decision.get("frame", 1)) if decision.get("frame") is not None else None,
         "assurance": int(decision.get("assurance", 0)) if decision.get("assurance") is not None else None,
         "scarcity": int(decision.get("scarcity", 0)) if decision.get("scarcity") is not None else None,
@@ -659,20 +649,19 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         "bundle": int(decision.get("bundle", 0)) if decision.get("bundle") is not None else None,
         "price": float(decision.get("price")) if decision.get("price") is not None else None,
         "ln_price": float(decision.get("ln_price")) if decision.get("ln_price") is not None else None,
-        "case_valid": int(1 if decision_valid else 0)
     })
     df_long = pd.DataFrame(rows_long)
-    agg_long = RESULTS_DIR / "df_long.csv"
-    df_long.to_csv(agg_long, mode="a", header=not agg_long.exists(), index=False, encoding="utf-8-sig")
+    df_long.to_csv(RESULTS_DIR / "df_long.csv",
+                   mode="a", header=not (RESULTS_DIR / "df_long.csv").exists(),
+                   index=False, encoding="utf-8")
 
-    # JSONL (screen-level snapshot)
-    rec = {
-        "run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
-        "category": category, "set_id": set_id, "model": model_label,
-        "groundtruth": gt, "decision": decision, "case_valid": int(1 if decision_valid else 0)
-    }
+    # JSONL snapshot (unchanged)
+    rec = {"run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
+           "category": category, "set_id": set_id, "model": model_label,
+           "groundtruth": gt, "decision": decision}
     with (RESULTS_DIR / "log_compare.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
 
 # ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
@@ -831,3 +820,4 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
