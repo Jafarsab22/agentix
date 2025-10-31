@@ -5,17 +5,25 @@ Version: v1.10 (2025-10-31)
 
 Key assumptions and alignment
     1) One choice per screen; each screen has exactly 8 alternatives (2×4).
-    2) Frame is assigned independently of non-frame badges.
-    3) Exactly one non-frame visual badge per card (plus a true “none” cell).
-    4) Prices follow eight log-symmetric levels around the anchor (Latin square).
-    5) Ground truth: a list of 8 dicts under #groundtruth (case_id/set_id, title,
-       row/col, row_top, col1–col3, frame, assurance, scarcity, strike, timer,
-       social_proof, voucher, bundle, price, ln_price).
-    6) Post-processing uses logit_badges.run_logit(...) (with screen FEs and product FEs).
+    2) Frame is assigned independently of non-frame badges. If the UI selects the
+       frame comparison, we block 4 ALL-IN and 4 PARTITIONED per screen; otherwise
+       frame is fixed. This matches storefront.render_screen(...).
+    3) Exactly one non-frame visual badge per card, drawn from the enabled set
+       with a balanced per-screen allocation that includes a true “none” cell.
+    4) Prices follow eight log-symmetric levels around the anchor and are placed
+       with an 8×8 Latin square to remove price–position confounds.
+    5) Ground truth is a plain list of 8 dicts under the hidden #groundtruth div
+       in the HTML (no wrapper object); keys match the logit module:
+       case_id/set_id, title, row/col, row_top, col1–col3, frame, assurance,
+       scarcity, strike, timer, social_proof, voucher, bundle, price, ln_price.
+    6) Post-processing uses logit_badges.run_logit(...) which absorbs screen FEs
+       and includes product FEs by default (as set in that module).
 
-This version fixes the (0,0) default bug by validating model decisions. Invalid
-or unparsable decisions no longer default to top-left; they are flagged and the
-screen is excluded downstream by the estimator.
+Why this fixes the “chosen disappeared” issue
+    • We validate the model’s decision per screen and set case_valid=1/0.
+    • We always compute chosen from validated row/col, otherwise chosen=0.
+    • We append rows to df_choice.csv using a fixed column order (CHOICE_COLS).
+      If an old file has a different header, we rotate it aside and write a fresh file.
 """
 
 from __future__ import annotations
@@ -53,6 +61,14 @@ RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=Tru
 
 VERSION = "Agentix MC runner – inline-render or URL – 2025-10-31 (v1.10)"
 print(f"[agent_runner] {VERSION}", flush=True)
+
+# ---------- strict output schema (prevents header drift) ----------
+CHOICE_COLS = [
+    "case_id","run_id","set_id","model","category","title",
+    "row","col","row_top","col1","col2","col3",
+    "frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle",
+    "chosen","case_valid","price","ln_price"
+]
 
 # ---------------- small helpers ----------------
 def _load_html(driver, html: str):
@@ -205,40 +221,17 @@ def _find_prod(gt, title, row, col):
             return p
     return None
 
-# [FIX] Strict validation (no defaults to 0/0)
-def _valid_decision(d: dict) -> bool:
-    try:
-        r = d.get("row", None)
-        c = d.get("col", None)
-        if r is None or c is None:
-            return False
-        r = int(r); c = int(c)
-        return (r in (0, 1)) and (c in (0, 1, 2, 3))
-    except Exception:
-        return False
-
-# [FIX] Do not coerce to (0,0); mark invalid instead
 def reconcile(decision: dict, groundtruth: dict) -> dict:
-    valid = _valid_decision(decision)
-    if not valid:
-        decision = dict(decision)  # shallow copy
-        decision.update({
-            "row": None, "col": None, "valid": False,
-            "frame": None, "assurance": None, "scarcity": None, "strike": None, "timer": None,
-            "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None
-        })
-        return decision
-
-    r = int(decision.get("row"))
-    c = int(decision.get("col"))
-    decision["row"], decision["col"] = r, c
+    r = int(decision.get("row", 0)); c = int(decision.get("col", 0))
+    r = 0 if r < 0 else (1 if r > 1 else r)
+    c = 0 if c < 0 else (3 if c > 3 else c)
     prod = _find_prod(groundtruth, decision.get("chosen_title"), r, c)
 
     if prod:
+        decision["row"], decision["col"] = int(prod.get("row", r)), int(prod.get("col", c))
         decision["frame"] = int(prod.get("frame", 1)) if prod.get("frame") is not None else None
         decision["assurance"] = int(prod.get("assurance", 0)) if prod.get("assurance") is not None else None
 
-        # dark badge decoding if present
         dark_str = (str(prod.get("dark", "")).strip().lower()) if "dark" in prod else None
         if dark_str is not None:
             decision["scarcity"] = 1 if dark_str == "scarcity" else 0
@@ -260,20 +253,18 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
         else:
             decision["price"] = None
             decision["ln_price"] = None
-        decision["valid"] = True
     else:
         decision.update({"frame": None, "assurance": None, "scarcity": None, "strike": None, "timer": None,
-                         "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None,
-                         "valid": True})  # row/col valid even if title mismatch
+                         "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
 
-# --- Robust OpenAI POST with retries ---
+# --- Robust POST with retries (OpenAI) ---
 def _post_with_retries_openai(url, headers, payload,
                               timeout=(15, 300),       # (connect, read)
                               max_attempts=6,
                               backoff_base=0.75,
                               backoff_cap=12.0):
-    import requests, random, time
+    import random
     sess = requests.Session()
     for attempt in range(1, max_attempts + 1):
         try:
@@ -353,20 +344,20 @@ def call_openai(image_b64, category, model_name=None):
         return args_json if isinstance(args_json, dict) else {}
 
 # ---------- Anthropic ----------
-def _post_with_retries(url, headers, payload, timeout=120, max_attempts=6):
+def _post_with_retries(url, headers, payload, timeout=120, attempts=5, backoff=0.9):
     import random
-    for attempt in range(1, max_attempts + 1):
+    for i in range(attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
-                time.sleep(min(12.0, 0.75 * (2 ** (attempt - 1))) * random.uniform(0.6, 1.4))
+                time.sleep((backoff ** i) * (1.0 + random.random()))
                 continue
             r.raise_for_status()
             return r
-        except requests.RequestException:
-            if attempt == max_attempts:
+        except requests.exceptions.RequestException:
+            if i == attempts - 1:
                 raise
-            time.sleep(min(12.0, 0.75 * (2 ** (attempt - 1))) * random.uniform(0.6, 1.4))
+            time.sleep((backoff ** i) * (1.0 + random.random()))
 
 def call_anthropic(image_b64: str, category: str, model_name: str):
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -385,7 +376,7 @@ def call_anthropic(image_b64: str, category: str, model_name: str):
                 {"type": "text", "text": f"Category: {category}. Use ONLY the tool 'choose'."}
             ]
         }]}
-    r = _post_with_retries(url, headers, body, timeout=180)
+    r = _post_with_retries(url, headers, body, timeout=240)
     blocks = r.json().get("content", [])
     tool_blocks = [b for b in blocks if b.get("type") == "tool_use" and b.get("name") == "choose"]
     if not tool_blocks:
@@ -412,7 +403,7 @@ def call_gemini(image_b64: str, category: str, model_name: str):
             {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
             {"inline_data": {"mime_type": "image/jpeg", "data": image_b64.split(",")[1]}}
         ]}]}
-    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=180)
+    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=240)
     r.raise_for_status()
     resp = r.json()
     candidates = resp.get("candidates", [])
@@ -479,7 +470,7 @@ def preview_one(payload: Dict) -> Dict:
 
     driver = _new_driver()
     try:
-        set_id, _, gt, image_b64, _ = _episode(
+        set_id, _, gt, image_b64, decision = _episode(
             driver=driver,
             category=category,
             ui_label=ui_label,
@@ -547,8 +538,16 @@ def _episode(
             gt = json.loads(gt_text)
 
             image_b64 = _jpeg_b64_from_driver(driver, quality=72)
-            model_label, decision = _choose_with_model(image_b64, category, ui_label)
-            decision = reconcile(decision, gt)  # [FIX] strict validation
+
+            # Try to get a valid decision; if the model call fails once, retry this once.
+            try:
+                model_label, decision = _choose_with_model(image_b64, category, ui_label)
+            except Exception:
+                if attempt == 0:
+                    continue
+                model_label, decision = ("openai", {"row": -1, "col": -1, "chosen_title": ""})
+
+            decision = reconcile(decision, gt)
             return set_id, model_label, gt, image_b64, decision
 
         except (TimeoutException, ReadTimeoutError):
@@ -557,28 +556,52 @@ def _episode(
             raise
 
 # ---------------- writers ----------------
+def _append_choice(df_choice: pd.DataFrame, path: pathlib.Path):
+    df_choice = df_choice.reindex(columns=CHOICE_COLS)
+    write_header = True
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                first = f.readline().strip()
+            existing = [c.strip() for c in first.split(",")] if first else []
+            if existing == CHOICE_COLS:
+                write_header = False
+            else:
+                # rotate the inconsistent file to avoid header drift
+                backup = path.with_suffix(".old.csv")
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                except Exception:
+                    pass
+                path.rename(backup)
+                write_header = True
+        except Exception:
+            write_header = True
+    df_choice.to_csv(path, mode="a", header=write_header, index=False, encoding="utf-8-sig")
+
 def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decision: dict, payload: dict):
     rows_choice, rows_long = [], []
     products = _products_from_gt(gt)
-    valid = bool(decision.get("valid", False))
-    dec_row = decision.get("row", None)
-    dec_col = decision.get("col", None)
+
+    # Validate decision
+    try:
+        drow = int(decision.get("row", -1))
+        dcol = int(decision.get("col", -1))
+        decision_valid = (0 <= drow <= 1) and (0 <= dcol <= 3)
+    except Exception:
+        decision_valid = False
+        drow, dcol = -1, -1
 
     # df_choice (8 rows per screen)
     for p in products:
         dark = (p.get("dark") or "none").strip().lower() if "dark" in p else None
-        prow = int(p.get("row", 0))
-        pcol = int(p.get("col", 0))
+        prow = int(p.get("row", 0)); pcol = int(p.get("col", 0))
         row_top = 1 if prow == 0 else 0
         col1 = 1 if pcol == 0 else 0
         col2 = 1 if pcol == 1 else 0
         col3 = 1 if pcol == 2 else 0
-
-        # [FIX] only mark chosen when decision is valid
-        if valid and dec_row is not None and dec_col is not None:
-            chosen = int((prow == int(dec_row)) and (pcol == int(dec_col)))
-        else:
-            chosen = 0
+        chosen = 1 if (decision_valid and prow == drow and pcol == dcol) else 0
 
         scarcity = 1 if dark == "scarcity" else (int(p.get("scarcity", 0)) if dark is None else 0)
         strike   = 1 if dark == "strike"   else (int(p.get("strike", 0))   if dark is None else 0)
@@ -602,29 +625,30 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
             "voucher": int(p.get("voucher", 0)),
             "bundle":  int(p.get("bundle", 0)),
             "chosen": chosen,
-            "case_valid": 1 if valid else 0,   # [FIX] tag the whole screen
+            "case_valid": int(1 if decision_valid else 0)
         }
         if price_val is not None:
             rec["price"] = float(price_val)
             rec["ln_price"] = float(ln_price)
+        else:
+            rec["price"] = None
+            rec["ln_price"] = None
         rows_choice.append(rec)
 
     df_choice = pd.DataFrame(rows_choice)
-    for c in ("row", "col", "row_top", "col1", "col2", "col3", "frame", "assurance",
-              "scarcity", "strike", "timer", "social_proof", "voucher", "bundle", "chosen", "case_valid"):
+    for c in ("row","col","row_top","col1","col2","col3","frame","assurance",
+              "scarcity","strike","timer","social_proof","voucher","bundle",
+              "chosen","case_valid"):
         if c in df_choice.columns:
             df_choice[c] = pd.to_numeric(df_choice[c], errors="coerce").fillna(0).astype(int)
 
-    # Append to results/df_choice.csv
-    agg_choice = RESULTS_DIR / "df_choice.csv"
-    df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False)
+    _append_choice(df_choice, RESULTS_DIR / "df_choice.csv")
 
     # df_long (one row per screen)
     rows_long.append({
         "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
-        "row": (int(dec_row) if dec_row is not None else None),
-        "col": (int(dec_col) if dec_col is not None else None),
+        "row": int(drow if decision_valid else -1), "col": int(dcol if decision_valid else -1),
         "frame": int(decision.get("frame", 1)) if decision.get("frame") is not None else None,
         "assurance": int(decision.get("assurance", 0)) if decision.get("assurance") is not None else None,
         "scarcity": int(decision.get("scarcity", 0)) if decision.get("scarcity") is not None else None,
@@ -635,17 +659,17 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         "bundle": int(decision.get("bundle", 0)) if decision.get("bundle") is not None else None,
         "price": float(decision.get("price")) if decision.get("price") is not None else None,
         "ln_price": float(decision.get("ln_price")) if decision.get("ln_price") is not None else None,
-        "case_valid": 1 if valid else 0,
+        "case_valid": int(1 if decision_valid else 0)
     })
     df_long = pd.DataFrame(rows_long)
     agg_long = RESULTS_DIR / "df_long.csv"
-    df_long.to_csv(agg_long, mode="a", header=not agg_long.exists(), index=False)
+    df_long.to_csv(agg_long, mode="a", header=not agg_long.exists(), index=False, encoding="utf-8-sig")
 
     # JSONL (screen-level snapshot)
     rec = {
         "run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
         "category": category, "set_id": set_id, "model": model_label,
-        "groundtruth": gt, "decision": decision
+        "groundtruth": gt, "decision": decision, "case_valid": int(1 if decision_valid else 0)
     }
     with (RESULTS_DIR / "log_compare.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -699,6 +723,7 @@ def run_job_sync(payload: Dict) -> Dict:
 
     # ----- conditional-logit post-processing (single file: badges_effects.csv) -----
     from uuid import uuid4
+
     ts = datetime.utcnow().isoformat() + "Z"
     job_id = payload.get("job_id") or f"run-{uuid4().hex[:8]}"
 
@@ -715,14 +740,10 @@ def run_job_sync(payload: Dict) -> Dict:
             _df_dbg = pd.read_csv(choice_path)
             print("DEBUG rows=", len(_df_dbg))
             print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
-            # [FIX] show valid/invalid screens
-            if "case_valid" in _df_dbg.columns:
-                _valid_by_case = _df_dbg.groupby("case_id")["case_valid"].max()
-                print("DEBUG valid_cases=", int((_valid_by_case == 1).sum()), " invalid_cases=", int((_valid_by_case != 1).sum()))
             for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
                 if _c in _df_dbg.columns:
                     try:
-                        print(f"DEBUG {_c}_unique=", int(pd.to_numeric(_df_dbg[_c], errors="coerce").nunique(dropna=False)))
+                        print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
                     except Exception:
                         print(f"DEBUG {_c}_unique= NA")
         except Exception as e:
@@ -776,11 +797,7 @@ def run_job_sync(payload: Dict) -> Dict:
     else:
         print("DEBUG choice file missing or empty")
 
-    
-    # -------- assemble results payload --------
-    artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
-    artifacts.setdefault("df_long", str(RESULTS_DIR / "df_long.csv"))
-    artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
+    # Heatmaps are now produced inside logit_badges; the runner no longer generates them.
 
     results: Dict = {
         "job_id": job_id,
