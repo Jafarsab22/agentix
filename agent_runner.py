@@ -807,61 +807,61 @@ def run_job_sync(payload: Dict) -> Dict:
     print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
 
     if choice_path.exists() and choice_path.stat().st_size > 0:
-    try:
-        badge_keys = _normalize_badge_filter(badges)
-        print("DEBUG badge_filter_internal=", badge_keys)
-
-        badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
-        if not isinstance(badge_table, pd.DataFrame):
-            badge_table = pd.DataFrame(badge_table)
-
-        print("DEBUG badge_table_shape=", tuple(badge_table.shape))
-        print("DEBUG badge_table_cols=", list(badge_table.columns))
-
-        if "badge" in badge_table.columns and not badge_table.empty:
-            pref_cols = [
-                "badge", "beta", "p", "sign",
-                "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
-            ]
-            cols = [c for c in pref_cols if c in badge_table.columns]
-            df_rich = badge_table[cols].copy()
-
-            job_meta = {
-                "job_id": job_id,
-                "timestamp": ts,
-                "product": category,
-                "brand": brand,
-                "model": ui_label,
-                "price": price,
-                "currency": currency,
-                "n_iteration": n
-            }
-            for k in list(job_meta.keys())[::-1]:
-                df_rich.insert(0, k, job_meta[k])
-
-            df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
-            badge_rows = badge_table.to_dict("records")
-
-            artifacts["badges_effects"] = str(effects_path)
-            artifacts["effects_csv"] = str(effects_path)
-            artifacts["table_badges"] = str(effects_path)
-        else:
-            print("DEBUG empty_or_missing_badge_table")
-
-        # Delegate heatmap generation to logit_badges (logit owns plotting)
         try:
-            hm = logit_badges.generate_heatmaps(
-                str(choice_path),
-                out_dir=str(RESULTS_DIR),
-                title_prefix=f"{category} · {ui_label}",
-                file_tag=job_id
-            )
-            artifacts.update(hm)
+            badge_keys = _normalize_badge_filter(badges)
+            print("DEBUG badge_filter_internal=", badge_keys)
+    
+            badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
+            if not isinstance(badge_table, pd.DataFrame):
+                badge_table = pd.DataFrame(badge_table)
+    
+            print("DEBUG badge_table_shape=", tuple(badge_table.shape))
+            print("DEBUG badge_table_cols=", list(badge_table.columns))
+    
+            if "badge" in badge_table.columns and not badge_table.empty:
+                pref_cols = [
+                    "badge", "beta", "p", "sign",
+                    "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
+                ]
+                cols = [c for c in pref_cols if c in badge_table.columns]
+                df_rich = badge_table[cols].copy()
+    
+                job_meta = {
+                    "job_id": job_id,
+                    "timestamp": ts,
+                    "product": category,
+                    "brand": brand,
+                    "model": ui_label,
+                    "price": price,
+                    "currency": currency,
+                    "n_iteration": n
+                }
+                for k in list(job_meta.keys())[::-1]:
+                    df_rich.insert(0, k, job_meta[k])
+    
+                df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
+                badge_rows = badge_table.to_dict("records")
+    
+                artifacts["badges_effects"] = str(effects_path)
+                artifacts["effects_csv"] = str(effects_path)
+                artifacts["table_badges"] = str(effects_path)
+            else:
+                print("DEBUG empty_or_missing_badge_table")
+    
+            # Delegate heatmap generation to logit_badges (logit owns plotting)
+            try:
+                hm = logit_badges.generate_heatmaps(
+                    str(choice_path),
+                    out_dir=str(RESULTS_DIR),
+                    title_prefix=f"{category} · {ui_label}",
+                    file_tag=job_id
+                )
+                artifacts.update(hm)
+            except Exception as e:
+                print("DEBUG generate_heatmaps skipped:", repr(e))
+    
         except Exception as e:
-            print("DEBUG generate_heatmaps skipped:", repr(e))
-
-    except Exception as e:
-        print("[logit] skipped due to error:", repr(e), flush=True)
+            print("[logit] skipped due to error:", repr(e), flush=True)
 
 
     # Always expose core file locations
@@ -902,4 +902,5 @@ if __name__ == "__main__":
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
