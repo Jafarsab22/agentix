@@ -400,3 +400,55 @@ def save_position_heatmap(path_csv: str,
     plt.close(fig)
     return out_png_path
 
+# --------- convenience wrapper so logit_badges owns heatmap creation ---------
+import os, time, pathlib
+
+def generate_heatmaps(path_csv: str,
+                      out_dir: str = "results",
+                      title_prefix: str | None = None,
+                      file_tag: str | None = None) -> dict:
+    """
+    Create both heatmaps and return their file paths in a dict.
+    This keeps generation inside logit_badges while letting callers (e.g., the runner)
+    simply delegate and surface the resulting assets.
+
+    Parameters
+    ----------
+    path_csv : str
+        Path to df_choice.csv.
+    out_dir : str
+        Directory where PNGs will be saved. Will be created if missing.
+    title_prefix : str | None
+        Optional prefix for figure titles (e.g., "Shoes · OpenAI GPT-4.1-mini").
+    file_tag : str | None
+        Optional tag (e.g., a job_id) to de-duplicate filenames across runs.
+
+    Returns
+    -------
+    dict
+        {
+          "position_heatmap_empirical": "<path>",
+          "position_heatmap_prob": "<path>"
+        }
+    """
+    out = {}
+    od = pathlib.Path(out_dir)
+    od.mkdir(parents=True, exist_ok=True)
+
+    tag = file_tag or str(int(time.time()))
+    emp_path  = od / f"heatmap_empirical_{tag}.png"
+    prob_path = od / f"heatmap_probability_{tag}.png"
+
+    emp_title  = f"{title_prefix} — empirical"    if title_prefix else None
+    prob_title = f"{title_prefix} — probability"  if title_prefix else None
+
+    emp_p = save_position_heatmap_empirical(path_csv, str(emp_path), title=emp_title)
+    prob_p = save_position_heatmap(path_csv, str(prob_path), title=prob_title)
+
+    out["position_heatmap_empirical"] = emp_p
+    out["position_heatmap_prob"] = prob_p
+    # Back-compat alias keys if your UI expects them
+    out["position_heatmap"] = prob_p
+    out["position_heatmap_png"] = prob_p
+    return out
+
