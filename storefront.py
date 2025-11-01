@@ -223,7 +223,10 @@ def render_screen(
     price_anchor: float,
     currency: str,
     brand: str = "",
+    frame_plan: list[int] | None = None,
+    badge_plan: list[str] | None = None,
 ) -> str:
+
     """
     Render HTML for an 8-card screen and embed a hidden JSON payload with
     per-card ground truth for the estimator. All keys align with the logit API.
@@ -282,7 +285,13 @@ def render_screen(
     display_name = (f"{brand_text} {category}".strip()) or str(category)
     
     # build a deterministic per-screen assignment across selected badges + 'none'
-    badge_plan = _balanced_badge_assignments(enabled_nonframes, seeds, set_id)
+    if badge_plan is None or len(badge_plan) != 8:
+        badge_plan = _balanced_badge_assignments(enabled_nonframes, seeds, set_id)
+    else:
+        # normalise external plan defensively
+        badge_plan = [("social" if (b or "").strip().lower() in ("social","social_proof") else (b or "none")).lower()
+                      for b in badge_plan]
+
     assert len(badge_plan) == 8
     for i in range(8):
         # Grid coordinates: rows 0/1, cols 0..3
@@ -291,9 +300,14 @@ def render_screen(
         # Price for this card
         price_total = _price_for_card(p0, set_id, i, seeds)
 
-        # Stage 1: assign pricing frame (mutually exclusive; blocked 4/4 if randomised)
-        frame_allin, frame_partitioned = _assign_frame_for_card(i, set_id, seeds, frame_mode)
+        # Stage 1: assign pricing frame
+        if frame_plan is not None and len(frame_plan) == 8:
+            v = 1 if int(frame_plan[i]) == 1 else 0
+            frame_allin, frame_partitioned = (1, 0) if v == 1 else (0, 1)
+        else:
+            frame_allin, frame_partitioned = _assign_frame_for_card(i, set_id, seeds, frame_mode)
         is_partitioned = bool(frame_partitioned)
+
         
         # --- Stage 2: we now follow a deterministic balanced plan rather than a uniform random draw.
         chosen_nonframe = badge_plan[i]
