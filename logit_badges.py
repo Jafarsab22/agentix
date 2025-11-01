@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-logit_badges — v1.15 (2025-10-31)
+logit_badges — v1.16 (2025-11-01)
 
 Purpose
     Estimate within-screen (conditional) logit effects for an 8-alternative choice
@@ -13,7 +13,9 @@ Key assumptions
     • Attribute: ln_price computed from price if present and > 0 (guarded).
     • Badges estimated independently: frame, assurance, scarcity, strike, timer,
       social_proof, voucher, bundle. Any non-varying regressor is dropped.
-    • Small-N stability: ridge-IRLS with numeric guards; no MLE branch (penalised estimator is default).
+    • Small-N stability: ridge-IRLS with numeric guards (penalised estimator is default).
+    • AME stability: for binary regressors, AME computed as average Δp of setting x_j=1 vs 0
+      with all other covariates fixed; for ln_price (continuous), AME uses mean[p(1−p)]·β.
 
 Returns
     pandas.DataFrame with columns:
@@ -28,7 +30,7 @@ import time
 import pathlib
 import numpy as np
 import pandas as pd
-from scipy.special import expit
+from scipy.special import expit, logit
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
 
@@ -38,6 +40,7 @@ RIDGE_ALPHA_SMALL = 5e-2
 RIDGE_ALPHA_LARGE = 1e-2
 MAX_ITER = 300
 TOL = 1e-7
+EPS = 1e-9  # prob clamp
 
 BADGE_KEYS = ["frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle"]
 POS_COLS = ["row_top","col1","col2","col3"]
@@ -149,9 +152,43 @@ def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int
 
     X = X.astype(np.float64)
     y = pd.to_numeric(df["chosen"], errors="coerce").fillna(0.0).astype(np.float64).values
-    return X, y, cols, fe_cols
+    return X, y, cols, fe_cols, X_main.values
 
-def _tidy(beta, cov, p_hat, cols, b_price: float | None):
+def _average_marginal_effects(cols: list[str],
+                              beta_main: np.ndarray,
+                              p_hat: np.ndarray,
+                              X_main: np.ndarray) -> dict[str, float]:
+    """
+    Stable AME:
+      • For binary regressors (0/1): average Δp of flipping x_j to 1 vs 0:
+            p1_i = σ(η_i + β_j*(1 - x_ij))
+            p0_i = σ(η_i - β_j*x_ij)
+            AME = 100 * mean(p1_i - p0_i)
+      • For ln_price (continuous): 100 * mean[p_i(1-p_i)] * β_j
+    """
+    p = np.clip(p_hat, EPS, 1.0 - EPS)
+    eta = logit(p)
+
+    ame = {}
+    name_to_idx = {c: i for i, c in enumerate(cols)}
+    for c in cols:
+        j = name_to_idx[c]
+        b = float(beta_main[j])
+        x = X_main[:, j].astype(float)
+
+        if c == "ln_price":
+            ame[c] = 100.0 * float(np.mean(p * (1.0 - p))) * b
+        else:
+            # treat as binary regressor
+            p1 = expit(eta + b * (1.0 - x))
+            p0 = expit(eta - b * x)
+            ame[c] = 100.0 * float(np.mean(p1 - p0))
+
+        # clamp to feasible bounds
+        ame[c] = float(np.clip(ame[c], -100.0, 100.0))
+    return ame
+
+def _tidy(beta, cov, p_hat, cols, b_price: float | None, ame_map: dict[str, float]):
     idx = list(cols)
     beta_s = pd.Series(beta[:len(idx)], index=idx, dtype=float)
     se_s = pd.Series(np.sqrt(np.diag(cov)[:len(idx)]), index=idx, dtype=float)
@@ -160,14 +197,13 @@ def _tidy(beta, cov, p_hat, cols, b_price: float | None):
     keys_attr = [k for k in ["ln_price"] if k in idx]
     keys_badge = [k for k in BADGE_KEYS if k in idx]
 
-    def make_rows(keys, section, lab_map):
+    def make_rows(keys, section, lab_map, allow_price_eq: bool):
         if not keys:
             return []
         z = beta_s[keys] / se_s[keys].replace(0.0, np.nan)
         pvals = 2.0 * (1.0 - norm.cdf(np.abs(z.values)))
         _, q_bh, _, _ = multipletests(pvals, alpha=0.05, method="fdr_bh") if len(keys) > 1 else ([None], [pvals[0]], None, None)
 
-        wbar = float(np.mean(p_hat * (1.0 - p_hat))) if p_hat.size else 0.0
         out = []
         for i, k in enumerate(keys):
             b = float(beta_s[k]); se = float(se_s[k])
@@ -175,12 +211,14 @@ def _tidy(beta, cov, p_hat, cols, b_price: float | None):
             orx = math.exp(b)
             ci_l = math.exp(b - 1.96 * se)
             ci_h = math.exp(b + 1.96 * se)
-            ame_pp = 100.0 * wbar * b
+            ame_pp = float(ame_map.get(k, 0.0))
             evid = max(0.0, 1.0 - p)
-            if (b_price is not None) and (abs(b_price) > 1e-12) and (k != "ln_price"):
+
+            if allow_price_eq and (b_price is not None) and (abs(b_price) > 1e-12):
                 price_eq = abs(b / b_price)
             else:
                 price_eq = float("nan")
+
             sign = "+" if (p < 0.05 and b > 0) else ("-" if (p < 0.05 and b < 0) else "0")
             out.append({
                 "section": section,
@@ -193,9 +231,11 @@ def _tidy(beta, cov, p_hat, cols, b_price: float | None):
         return out
 
     rows = []
-    rows += make_rows(keys_pos, "Position effects", POS_LABELS)
-    rows += make_rows(keys_badge, "Badge/lever effects", BADGE_LABELS)
-    rows += make_rows(keys_attr, "Attribute effects", ATTR_LABELS)
+    # No price-equivalent λ for position controls
+    rows += make_rows(keys_pos, "Position effects", POS_LABELS, allow_price_eq=False)
+    # Price-equivalent λ only for badges/levers (not for ln(price) or positions)
+    rows += make_rows(keys_badge, "Badge/lever effects", BADGE_LABELS, allow_price_eq=True)
+    rows += make_rows(keys_attr, "Attribute effects", ATTR_LABELS, allow_price_eq=False)
 
     return pd.DataFrame(rows)
 
@@ -215,7 +255,7 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
             except Exception:
                 pass
 
-    X, y, cols, fe_cols = _build_design(df, badge_filter, n_cases)
+    X, y, cols, fe_cols, X_main = _build_design(df, badge_filter, n_cases)
 
     b_price_idx = cols.index("ln_price") if "ln_price" in cols else None
     alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
@@ -227,7 +267,10 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
 
     b_price = float(beta[b_price_idx]) if b_price_idx is not None else None
 
-    table = _tidy(beta, cov, p_hat, cols, b_price)
+    # Stable AME map
+    ame_map = _average_marginal_effects(cols, beta[:main_cols], p_hat, X_main)
+
+    table = _tidy(beta, cov, p_hat, cols, b_price, ame_map)
 
     pref_cols = ["section","badge","beta","se","p","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score","price_eq","sign"]
     table = table.reindex(columns=pref_cols)
@@ -259,11 +302,6 @@ def save_position_heatmap_empirical(path_csv: str,
     """
     Render a 2×4 heat-map of EMPIRICAL selection rates by (row, col) using df_choice.csv.
     We average the binary 'chosen' over all rows in each (row, col) cell.
-
-    Conventions:
-      • Rows: Row 1 = top (index 0), Row 2 = bottom (index 1).
-      • Columns: 1..4 correspond to indices 0..3.
-      • Darker shades indicate a higher observed selection rate.
     """
     df = pd.read_csv(path_csv)
     df = _complete_screens(df).copy()
@@ -281,17 +319,14 @@ def save_position_heatmap_empirical(path_csv: str,
 
     vmax_auto = float(mat.max())
     vhi = vmax_auto if vmax_auto > 0 else 1.0
-    vlo = 0.0
 
     fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
-    # Use non-reversed 'Greys' but invert the normalization explicitly so higher -> darker
-    im = ax.imshow(mat, cmap="Greys", vmin=vhi, vmax=vlo)
+    im = ax.imshow(mat, cmap="Greys", vmin=vhi, vmax=0.0)
 
     for r in range(2):
         for c in range(4):
             val = float(mat[r, c])
-            thresh = 0.5 * vhi
-            txt_color = "white" if val >= thresh else "black"
+            txt_color = "white" if val >= 0.5 * vhi else "black"
             ax.text(c, r, f"{100.0 * val:.1f}%", ha="center", va="center", fontsize=9, color=txt_color)
 
     ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"])
@@ -322,16 +357,13 @@ def save_position_heatmap(path_csv: str,
     Steps: rebuild design X with the same helpers used in run_logit(), fit ridge logit,
     compute p̂ for every alternative, then average p̂ within each grid cell.
     Darker shades indicate higher predicted selection.
-
-    Rows: Row 1 (top, index 0), Row 2 (bottom, index 1).
-    Columns: 1..4 (indices 0..3).
     """
     df = pd.read_csv(path_csv)
     df = _prepare_df(df)
     df = _complete_screens(df)
 
     n_cases = int(df["case_id"].nunique())
-    X, y, cols, fe_cols = _build_design(df, badge_filter=None, n_cases=n_cases)
+    X, y, cols, fe_cols, _X_main = _build_design(df, badge_filter=None, n_cases=n_cases)
     alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
     beta, cov, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
 
@@ -345,7 +377,6 @@ def save_position_heatmap(path_csv: str,
             mat[r, c] = float(v)
 
     fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
-    # Explicit inverted normalization so higher probability -> darker shade
     im = ax.imshow(mat, cmap="Greys", vmin=1.0, vmax=0.0)
 
     for r in range(2):
