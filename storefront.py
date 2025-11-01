@@ -215,6 +215,25 @@ def _balanced_badge_assignments(enabled_nonframes: list[str], seeds: Seeds, set_
 # Public API
 # ------------------------------
 
+def _screen_block_and_within(set_id: str) -> tuple[int, int]:
+    idx = _screen_index(set_id)
+    block = (idx - 1) // 8
+    within = (idx - 1) % 8
+    return block, within
+
+def _flip_flags(seeds: Seeds, set_id: str) -> tuple[bool, bool]:
+    rng = seeds.rng("flip", set_id)
+    flip_lr = bool(rng.random() < 0.50)   # mirror left-right on ~50% of screens
+    flip_tb = bool(rng.random() < 0.25)   # mirror top-bottom on ~25% (optional)
+    return flip_lr, flip_tb
+
+def _price_for_display_pos(anchor: float, set_id: str, seeds: Seeds, within: int, col_display: int) -> float:
+    # Keep Latin-square orthogonality with respect to the **displayed** column.
+    block, _ = _screen_block_and_within(set_id)
+    levels = _price_levels_for_block(anchor, seeds, block)  # 8 shuffled multipliers
+    level_index = _LATIN_8[within][col_display]             # pick by displayed column
+    return round(levels[level_index], 2)
+
 def render_screen(
     category: str,
     set_id: str,
@@ -223,34 +242,15 @@ def render_screen(
     price_anchor: float,
     currency: str,
     brand: str = "",
-    frame_plan: list[int] | None = None,
-    badge_plan: list[str] | None = None,
 ) -> str:
-
-    """
-    Render HTML for an 8-card screen and embed a hidden JSON payload with
-    per-card ground truth for the estimator. All keys align with the logit API.
-
-    Parameters
-    ----------
-    category : str
-    set_id   : str
-    badges   : list[str]   # human-readable selections from the UI
-    catalog_seed : int
-    price_anchor : float   # currency units (must be > 0 for ln(price))
-    currency : str         # e.g., "£", "$"
-    brand    : str
-    """
-    # Normalise the user's selected badges (lower-cased keys)
     sel = { (b or "").strip().lower(): True for b in (badges or []) }
 
-    # Map UI labels to internal keys (accept both canonical and legacy spellings)
     enabled_frames: list[str] = []
     if sel.get("all-in v. partitioned pricing"):
         enabled_frames.extend(["frame_allin", "frame_partitioned"])
-    if sel.get("all-in pricing"):        # legacy
+    if sel.get("all-in pricing"):
         enabled_frames.append("frame_allin")
-    if sel.get("partitioned pricing"):   # legacy
+    if sel.get("partitioned pricing"):
         enabled_frames.append("frame_partitioned")
 
     enabled_nonframes: list[str] = []
@@ -263,103 +263,68 @@ def render_screen(
     if sel.get("timer"):
         enabled_nonframes.append("timer")
     if sel.get("social proof") or sel.get("social"):
-        enabled_nonframes.append("social")  # internal alias; emits social_proof=1
+        enabled_nonframes.append("social")
     if sel.get("voucher"):
         enabled_nonframes.append("voucher")
     if sel.get("bundle"):
         enabled_nonframes.append("bundle")
 
     seeds = Seeds(catalog_seed=int(catalog_seed), brand=str(brand or ""), category=str(category or "product"))
-
-    # Frame mode (blocked or fixed)
     frame_mode = _frame_mode(enabled_frames)
 
-    # Prices: 8 log-symmetric levels via Latin schedule
     p0 = float(price_anchor or 0.0)
-    p0 = max(p0, 0.01)  # guard ln(price)
+    p0 = max(p0, 0.01)
+
+    brand_text = (brand or "").strip()
+    display_name_base = (f"{brand_text} {category}".strip()) or str(category)
+
+    # NEW: symmetric position mirroring
+    flip_lr, flip_tb = _flip_flags(seeds, set_id)
+    _, within = _screen_block_and_within(set_id)
+
+    # Balanced non-frame plan (kept)
+    badge_plan = _balanced_badge_assignments(enabled_nonframes, seeds, set_id)
+    assert len(badge_plan) == 8
 
     cards_html: list[str] = []
     gt_rows: list[dict] = []
 
-    brand_text = (brand or "").strip()
-    display_name = (f"{brand_text} {category}".strip()) or str(category)
-    
-    # build a deterministic per-screen assignment across selected badges + 'none'
-    if badge_plan is None or len(badge_plan) != 8:
-        badge_plan = _balanced_badge_assignments(enabled_nonframes, seeds, set_id)
-    else:
-        # normalise external plan defensively
-        badge_plan = [("social" if (b or "").strip().lower() in ("social","social_proof") else (b or "none")).lower()
-                      for b in badge_plan]
-
-    assert len(badge_plan) == 8
     for i in range(8):
-        # Grid coordinates: rows 0/1, cols 0..3
-        r, c = (0 if i < 4 else 1), (i % 4)
+        # base grid coordinates before flips
+        r0, c0 = (0 if i < 4 else 1), (i % 4)
 
-        # Price for this card
-        price_total = _price_for_card(p0, set_id, i, seeds)
+        # apply flips for **display** coordinates
+        r = (1 - r0) if flip_tb else r0
+        c = (3 - c0) if flip_lr else c0
 
-        # Stage 1: assign pricing frame
-        if frame_plan is not None and len(frame_plan) == 8:
-            v = 1 if int(frame_plan[i]) == 1 else 0
-            frame_allin, frame_partitioned = (1, 0) if v == 1 else (0, 1)
-        else:
-            frame_allin, frame_partitioned = _assign_frame_for_card(i, set_id, seeds, frame_mode)
+        # price tied to the **displayed** column to keep Latin-square orthogonality
+        price_total = _price_for_display_pos(p0, set_id, seeds, within, c)
+
+        frame_allin, frame_partitioned = _assign_frame_for_card(i, set_id, seeds, frame_mode)
         is_partitioned = bool(frame_partitioned)
 
-        
-        # --- Stage 2: we now follow a deterministic balanced plan rather than a uniform random draw.
         chosen_nonframe = badge_plan[i]
-            
-        # Initialise badge flags (0/1)
-        assurance = 0
-        scarcity = 0
-        strike = 0
-        timer = 0
-        social_proof = 0
-        voucher = 0
-        bundle = 0
 
-        # Activate the selected non-frame flag
-        if chosen_nonframe == "assurance":
-            assurance = 1
-        elif chosen_nonframe == "scarcity":
-            scarcity = 1
-        elif chosen_nonframe == "strike":
-            strike = 1
-        elif chosen_nonframe == "timer":
-            timer = 1
-        elif chosen_nonframe == "social":
-            social_proof = 1
-        elif chosen_nonframe == "voucher":
-            voucher = 1
-        elif chosen_nonframe == "bundle":
-            bundle = 1
+        assurance = 1 if chosen_nonframe == "assurance" else 0
+        scarcity  = 1 if chosen_nonframe == "scarcity"  else 0
+        strike    = 1 if chosen_nonframe == "strike"    else 0
+        timer     = 1 if chosen_nonframe == "timer"     else 0
+        social_proof = 1 if chosen_nonframe == "social" else 0
+        voucher   = 1 if chosen_nonframe == "voucher"   else 0
+        bundle    = 1 if chosen_nonframe == "bundle"    else 0
 
-        # Render price depending on frame
         if is_partitioned:
             base, fees, ship, tax = _partition_total_into_components(price_total, seeds, set_id)
             price_block = f"<div class='price'>{_format_currency(base, currency)} + charges</div>"
-            part_block = (
-                f"<div class='pp'>+ Fees {_format_currency(fees, currency)} · "
-                f"ship {_format_currency(ship, currency)} · tax {_format_currency(tax, currency)}"
-                f"<br>Total {_format_currency(price_total, currency)}</div>"
-            )
+            part_block  = (f"<div class='pp'>+ Fees {_format_currency(fees, currency)} · "
+                           f"ship {_format_currency(ship, currency)} · tax {_format_currency(tax, currency)}"
+                           f"<br>Total {_format_currency(price_total, currency)}</div>")
         else:
             price_block = f"<div class='price'>{_format_currency(price_total, currency)}</div>"
             part_block = ""
 
-        # Visuals for badges (at most one non-frame visual shown)
-        assur_block = ""
+        assur_block = "<div class='badge'>Free returns · 30-day warranty</div>" if assurance else ""
         dark_block = ""
-        social_block = ""
-        voucher_block = ""
-        bundle_block = ""
-
-        if assurance:
-            assur_block = "<div class='badge'>Free returns · 30-day warranty</div>"
-
         if scarcity:
             scarcity_level = max(2, int(round(price_total % 7)) + 2)
             dark_block = f"<div class='pill warn'>Only {scarcity_level} left</div>"
@@ -367,56 +332,42 @@ def render_screen(
             strike_price = round(price_total * 1.20, 2)
             dark_block = f"<div class='pill'><s>{_format_currency(strike_price, currency)}</s></div>"
         elif timer:
-            mm = 1 + ((i * 7) % 15)
-            ss = 5 + ((i * 13) % 55)
+            mm = 1 + ((i * 7) % 15); ss = 5 + ((i * 13) % 55)
             dark_block = f"<div class='pill warn'>Deal ends in {mm:02d}:{ss:02d}</div>"
 
-        if social_proof:
-            social_block = "<div class='chip'>👥 2k bought this month</div>"
-        elif voucher:
-            voucher_block = "<div class='chip good'>10% OFF · code SAVE10</div>"
-        elif bundle:
-            bundle_block = "<div class='chip info'>Buy 2, save 10%</div>"
+        social_block = "<div class='chip'>👥 2k bought this month</div>" if social_proof else ""
+        voucher_block = "<div class='chip good'>10% OFF · code SAVE10</div>" if voucher else ""
+        bundle_block = "<div class='chip info'>Buy 2, save 10%</div>" if bundle else ""
 
-        # Compose one card
+        title = f"{display_name_base} #{i+1}"
+
         cards_html.append(
             f"<div class='card' style='grid-row:{r+1};grid-column:{c+1}'>"
-            f"<div class='title'>{display_name}</div>"
+            f"<div class='title'>{title}</div>"
             f"{price_block}{part_block}{assur_block}{dark_block}{social_block}{voucher_block}{bundle_block}"
             f"</div>"
         )
 
-        # Ground-truth row (aligned with logit)
         gt_rows.append({
-            "case_id": str(set_id),                 # logit renames case_id → screen_id
+            "case_id": str(set_id),
             "set_id": str(set_id),
             "category": str(category),
-            "title": f"{display_name} #{i+1}",
+            "title": title,
             "row": r, "col": c,
             "row_top": 1 if r == 0 else 0,
             "col1": 1 if c == 0 else 0,
             "col2": 1 if c == 1 else 0,
             "col3": 1 if c == 2 else 0,
-            "frame": 1 if frame_allin else 0,       # 1 = ALL-IN (matches estimator expectation)
-            "assurance": assurance,
-            "scarcity": scarcity,
-            "strike": strike,
-            "timer": timer,
-            "social_proof": social_proof,
-            "voucher": voucher,
-            "bundle": bundle,
-            "price": round(price_total, 2),
+            "frame": 1 if frame_allin else 0,
+            "assurance": assurance, "scarcity": scarcity, "strike": strike, "timer": timer,
+            "social_proof": social_proof, "voucher": voucher, "bundle": bundle,
+            "price": float(price_total),
             "ln_price": math.log(max(price_total, 1e-8)),
-            # Fields the runner/agent will add later:
-            # "chosen": 0/1   (per agent choice)
-            # "model": "..."  (optional)
-            # "run_id": "..." (optional)
         })
 
     grid = "".join(cards_html)
     gt_json = json.dumps(gt_rows)
 
-    # Minimal CSS; no JS required. Hidden div carries the ground truth JSON.
     html = """<!doctype html>
 <html><head><meta charset='utf-8'>
 <style>
@@ -443,8 +394,6 @@ body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; ma
 {gt}
 </div>
 </body></html>"""
-
-    # Use simple replacement to avoid str.format clashing with CSS braces
     return html.replace("{grid}", grid).replace("{gt}", gt_json)
 
 
