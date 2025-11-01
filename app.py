@@ -368,21 +368,41 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         if html_path:
             artifacts["effects_html"] = html_path
 
-        # Inline heat-map (if produced by the runner) with caption
-        hm_path = artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
-        if hm_path:
+        # ---- Inline heat-maps: show BOTH empirical and probability maps ----
+        def _embed_png(path, alt_text, caption):
             try:
-                with open(hm_path, "rb") as _f:
+                with open(path, "rb") as _f:
                     import base64 as _b64
                     _b = _b64.b64encode(_f.read()).decode("utf-8")
-                msg_parts.append(
-                    f'\n\n<img alt="Webpage heatmap of AI shopping agents" '
+                return (
+                    f'\n\n<img alt="{alt_text}" '
                     f'src="data:image/png;base64,{_b}" '
                     f'style="max-width:560px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
-                    f"\n*Webpage heatmap of AI shopping agents*\n"
+                    f"\n{caption}\n"
                 )
             except Exception:
-                pass
+                return ""
+
+        emp_path = artifacts.get("position_heatmap_empirical", "")
+        prob_path = artifacts.get("position_heatmap_prob", "") or artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
+
+        # Clear, distinct captions; reaffirm darker = higher selection
+        if emp_path:
+            msg_parts.append(
+                _embed_png(
+                    emp_path,
+                    "Empirical selection heatmap (darker = higher observed selection rate)",
+                    "*Empirical selection heatmap (darker = higher observed selection rate)*"
+                )
+            )
+        if prob_path:
+            msg_parts.append(
+                _embed_png(
+                    prob_path,
+                    "Model-implied probability heatmap (darker = higher predicted selection probability)",
+                    "*Model-implied probability heatmap (darker = higher predicted selection probability)*"
+                )
+            )
 
         msg = "\n".join([p for p in msg_parts if p])
     else:
@@ -748,6 +768,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
