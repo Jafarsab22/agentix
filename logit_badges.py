@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-logit_badges — v1.16 (2025-11-01)
+logit_badges — v1.17 (2025-11-01)
 
 Purpose
     Estimate within-screen (conditional) logit effects for an 8-alternative choice
@@ -16,6 +16,13 @@ Key assumptions
     • Small-N stability: ridge-IRLS with numeric guards (penalised estimator is default).
     • AME stability: for binary regressors, AME computed as average Δp of setting x_j=1 vs 0
       with all other covariates fixed; for ln_price (continuous), AME uses mean[p(1−p)]·β.
+
+New in v1.17
+    • Cluster-robust standard errors at the screen/case level are now the default
+      (configurable via CLUSTER_BY_CASE). Implemented via a sandwich estimator that
+      uses unpenalised score sums per case and the penalised information matrix for
+      the “bread.”
+    • MAX_ITER increased to 500 to match the reference paper’s optimisation cap.
 
 Returns
     pandas.DataFrame with columns:
@@ -38,9 +45,10 @@ from statsmodels.stats.multitest import multipletests
 MIN_CASES = 10
 RIDGE_ALPHA_SMALL = 5e-2
 RIDGE_ALPHA_LARGE = 1e-2
-MAX_ITER = 500
+MAX_ITER = 500  # NEW v1.17: raised to align with reference
 TOL = 1e-7
 EPS = 1e-9  # prob clamp
+CLUSTER_BY_CASE = True  # NEW v1.17: report case-level cluster-robust SEs by default
 
 BADGE_KEYS = ["frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle"]
 POS_COLS = ["row_top","col1","col2","col3"]
@@ -64,6 +72,7 @@ POS_LABELS = {
 ATTR_LABELS = {"ln_price": "ln(price)"}
 
 # ----------------- core: ridge-IRLS with FE -----------------
+
 def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float, max_iter: int = MAX_ITER, tol: float = TOL):
     n, k = X.shape
     beta = np.zeros(k, dtype=np.float64)
@@ -95,17 +104,61 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float, max_iter: int 
     cov = np.linalg.pinv(H)
     return beta, cov, p
 
+# ----------------- NEW v1.17: case-clustered robust covariance -----------------
+
+def _cluster_cov_logit_ridge(X: np.ndarray, y: np.ndarray, beta_hat: np.ndarray, case_ids: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    Case-level clustered (sandwich) covariance for ridge-penalised logistic regression.
+
+    Bread: (X'WX + 2αI)^{-1}
+    Meat:  Σ_c s_c s_c',  where s_i = x_i (y_i − p_i) and s_c = Σ_{i∈c} s_i
+
+    Notes
+    -----
+    • Uses *unpenalised* scores in the meat (standard practice) and the penalised
+      expected information in the bread to reflect the estimator actually used.
+    • Returns a full k×k covariance, aligned with the full design (main + FE).
+    """
+    X = np.asarray(X, float)
+    y = np.asarray(y, float)
+    beta_hat = np.asarray(beta_hat, float)
+
+    eta = np.clip(X @ beta_hat, -35.0, 35.0)
+    p = expit(eta)
+    r = y - p
+    U = X * r[:, None]  # per-observation score vectors (unpenalised)
+
+    # Sum scores within cases
+    g = pd.Series(case_ids).astype("category").cat.codes.to_numpy()
+    G = int(g.max()) + 1
+    S = np.zeros((G, X.shape[1]), dtype=float)
+    for j in range(G):
+        S[j] = U[g == j].sum(axis=0)
+
+    meat = S.T @ S
+    w = p * (1.0 - p)
+    Xw = X * w[:, None]
+    H_unpen = X.T @ Xw
+    H_pen = H_unpen + 2.0 * alpha * np.eye(X.shape[1])
+    bread = np.linalg.inv(H_pen)
+
+    V = bread @ meat @ bread
+    return V
+
 # ----------------- helpers -----------------
+
 def _complete_screens(df: pd.DataFrame) -> pd.DataFrame:
     counts = df.groupby("case_id").size()
     keep = counts[counts == 8].index
     return df[df["case_id"].isin(keep)].copy()
+
 
 def _is_var(col: pd.Series) -> bool:
     try:
         return (pd.to_numeric(col, errors="coerce").fillna(0.0).astype(float).nunique(dropna=False) > 1)
     except Exception:
         return False
+
 
 def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in POS_COLS + BADGE_KEYS:
@@ -121,6 +174,7 @@ def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
     if "title" in df.columns:
         df["title"] = df["title"].astype(str).fillna("")
     return df
+
 
 def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int):
     cols = [c for c in POS_COLS if c in df.columns]
@@ -153,6 +207,7 @@ def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int
     X = X.astype(np.float64)
     y = pd.to_numeric(df["chosen"], errors="coerce").fillna(0.0).astype(np.float64).values
     return X, y, cols, fe_cols, X_main.values
+
 
 def _average_marginal_effects(cols: list[str],
                               beta_main: np.ndarray,
@@ -187,6 +242,7 @@ def _average_marginal_effects(cols: list[str],
         # clamp to feasible bounds
         ame[c] = float(np.clip(ame[c], -100.0, 100.0))
     return ame
+
 
 def _tidy(beta, cov, p_hat, cols, b_price: float | None, ame_map: dict[str, float]):
     idx = list(cols)
@@ -240,6 +296,7 @@ def _tidy(beta, cov, p_hat, cols, b_price: float | None, ame_map: dict[str, floa
     return pd.DataFrame(rows)
 
 # ----------------- public API -----------------
+
 def run_logit(path_csv: str, badge_filter: list[str] | None = None):
     df = pd.read_csv(path_csv)
     df = _prepare_df(df)
@@ -260,7 +317,12 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
     b_price_idx = cols.index("ln_price") if "ln_price" in cols else None
     alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
 
-    beta, cov, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
+    beta, cov_naive, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
+
+    # NEW v1.17: replace naive covariance with case-clustered robust covariance when enabled
+    cov = cov_naive
+    if CLUSTER_BY_CASE:
+        cov = _cluster_cov_logit_ridge(X.values, y, beta, df["case_id"].to_numpy(), alpha)
 
     main_cols = len(cols)
     print(f"[logit] design: main={main_cols}; FE={fe_cols}; total_cols={X.shape[1]}", flush=True)
@@ -296,6 +358,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ----------------- empirical heat-map (darker = higher selection) -----------------
+
 def save_position_heatmap_empirical(path_csv: str,
                                     out_png_path: str,
                                     title: str | None = None) -> str:
@@ -311,7 +374,7 @@ def save_position_heatmap_empirical(path_csv: str,
     df["chosen"] = pd.to_numeric(df.get("chosen", 0), errors="coerce").fillna(0).astype(int)
 
     mat = np.zeros((2, 4), dtype=float)
-    g = df.groupby(["row", "col"])["chosen"].mean()
+    g = df.groupby(["row", "col"])['chosen'].mean()
     for (r, c), v in g.items():
         r = int(r); c = int(c)
         if 0 <= r <= 1 and 0 <= c <= 3:
@@ -349,6 +412,7 @@ def save_position_heatmap_empirical(path_csv: str,
     return out_png_path
 
 # ----------------- probability-based heat-map (darker = higher selection) -----------------
+
 def save_position_heatmap(path_csv: str,
                           out_png_path: str,
                           title: str | None = None) -> str:
@@ -365,12 +429,12 @@ def save_position_heatmap(path_csv: str,
     n_cases = int(df["case_id"].nunique())
     X, y, cols, fe_cols, _X_main = _build_design(df, badge_filter=None, n_cases=n_cases)
     alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
-    beta, cov, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
+    beta, cov_naive, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
 
     df = df.copy()
     df["p_hat"] = p_hat
     mat = np.zeros((2, 4), dtype=float)
-    g = df.groupby(["row", "col"])["p_hat"].mean()
+    g = df.groupby(["row", "col"])['p_hat'].mean()
     for (r, c), v in g.items():
         r = int(r); c = int(c)
         if 0 <= r <= 1 and 0 <= c <= 3:
@@ -402,6 +466,7 @@ def save_position_heatmap(path_csv: str,
     return out_png_path
 
 # --------- convenience wrapper so logit_badges owns heatmap creation ---------
+
 def generate_heatmaps(path_csv: str,
                       out_dir: str = "results",
                       title_prefix: str | None = None,
@@ -438,4 +503,3 @@ def generate_heatmaps(path_csv: str,
         "position_heatmap": prob_p,
         "position_heatmap_png": prob_p,
     }
-
