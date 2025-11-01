@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-logit_badges — v1.14 (2025-10-30)
+logit_badges — v1.15 (2025-10-31)
 
 Purpose
     Estimate within-screen (conditional) logit effects for an 8-alternative choice
@@ -19,26 +19,13 @@ Returns
     pandas.DataFrame with columns:
       ['section','badge','beta','se','p','q_bh','odds_ratio','ci_low','ci_high',
        'ame_pp','evid_score','price_eq','sign']
-Glossary:
-    β (beta): Estimated log-odds coefficient for the regressor (relative to the baseline cell, with screen/product FEs).
-    SE: Standard error of β (from the penalised Fisher information when ridge-IRLS is used).
-    p: Two-sided p-value for H₀: β = 0.
-    q_bh: Benjamini–Hochberg FDR–adjusted p-value across the reported effects.
-    Odds ratio: exp(β). For a binary lever, the multiplicative change in choice odds when it turns on (0→1); for ln(price), per one log-unit increase (≈ ×2.718 in price).
-    CI low / CI high: 95% confidence interval bounds for the odds ratio.
-    AME (pp): Average marginal effect on choice probability, in percentage points, averaged over observed screens.
-    Evidence: 1 − p, a 0–1 summary score for visual ranking (not a substitute for p/q_bh).
-    Price-eq λ: |β / β_price|, the log-price change that would have the same utility impact as the lever; to express as an equivalent % price change use exp(λ) − 1.
-    Effect: Sign flag—“+” if p < 0.05 and β > 0; “−” if p < 0.05 and β < 0; “0” otherwise.
-Usage
-    from logit_badges import run_logit
-    tbl = run_logit("results/df_choice.csv", badge_filter=["frame","assurance","scarcity"])
 """
-
 
 from __future__ import annotations
 
 import math
+import time
+import pathlib
 import numpy as np
 import pandas as pd
 from scipy.special import expit
@@ -73,7 +60,6 @@ POS_LABELS = {
 }
 ATTR_LABELS = {"ln_price": "ln(price)"}
 
-
 # ----------------- core: ridge-IRLS with FE -----------------
 def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float, max_iter: int = MAX_ITER, tol: float = TOL):
     n, k = X.shape
@@ -106,7 +92,6 @@ def _ridge_logit_irls(y: np.ndarray, X: np.ndarray, alpha: float, max_iter: int 
     cov = np.linalg.pinv(H)
     return beta, cov, p
 
-
 # ----------------- helpers -----------------
 def _complete_screens(df: pd.DataFrame) -> pd.DataFrame:
     counts = df.groupby("case_id").size()
@@ -120,25 +105,21 @@ def _is_var(col: pd.Series) -> bool:
         return False
 
 def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-    # ensure numeric dummies exist for positions/badges even if given as strings/bools
     for c in POS_COLS + BADGE_KEYS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(float)
 
-    # ln(price) if feasible
     if "price" in df.columns:
         pr = pd.to_numeric(df["price"], errors="coerce")
         pr = pr.where(pr > 0)
         if pr.notna().any():
             df["ln_price"] = np.log(pr).fillna(0.0)
 
-    # enforce string type for product id used in FEs
     if "title" in df.columns:
         df["title"] = df["title"].astype(str).fillna("")
     return df
 
 def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int):
-    # main regressors: position, attribute(s), badges
     cols = [c for c in POS_COLS if c in df.columns]
     if "ln_price" in df.columns and _is_var(df["ln_price"]):
         cols.append("ln_price")
@@ -155,7 +136,6 @@ def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int
 
     X_main = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(np.float64)
 
-    # fixed effects: ALWAYS include page FE and product FE (if title exists)
     d_case = pd.get_dummies(df["case_id"], drop_first=True, dtype=np.float64)
     if "title" in df.columns:
         d_prod = pd.get_dummies(df["title"], drop_first=True, dtype=np.float64)
@@ -170,7 +150,6 @@ def _build_design(df: pd.DataFrame, badge_filter: list[str] | None, n_cases: int
     X = X.astype(np.float64)
     y = pd.to_numeric(df["chosen"], errors="coerce").fillna(0.0).astype(np.float64).values
     return X, y, cols, fe_cols
-
 
 def _tidy(beta, cov, p_hat, cols, b_price: float | None):
     idx = list(cols)
@@ -198,7 +177,6 @@ def _tidy(beta, cov, p_hat, cols, b_price: float | None):
             ci_h = math.exp(b + 1.96 * se)
             ame_pp = 100.0 * wbar * b
             evid = max(0.0, 1.0 - p)
-            # price-equivalent only for binary levers; treat ln_price as NaN
             if (b_price is not None) and (abs(b_price) > 1e-12) and (k != "ln_price"):
                 price_eq = abs(b / b_price)
             else:
@@ -221,7 +199,6 @@ def _tidy(beta, cov, p_hat, cols, b_price: float | None):
 
     return pd.DataFrame(rows)
 
-
 # ----------------- public API -----------------
 def run_logit(path_csv: str, badge_filter: list[str] | None = None):
     df = pd.read_csv(path_csv)
@@ -231,7 +208,7 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
     n_cases = df["case_id"].nunique()
     print(f"[logit] fit_mode = ridge_default; screens={n_cases}; rows={len(df)}", flush=True)
 
-    for k in ["frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle"]:
+    for k in BADGE_KEYS:
         if k in df.columns:
             try:
                 print(f"DEBUG {k}_unique=", int(pd.to_numeric(df[k], errors="coerce").fillna(-1).nunique(dropna=False)))
@@ -255,7 +232,6 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
     pref_cols = ["section","badge","beta","se","p","q_bh","odds_ratio","ci_low","ci_high","ame_pp","evid_score","price_eq","sign"]
     table = table.reindex(columns=pref_cols)
 
-    # deterministic within-section order
     order = {
         "Position effects": ["Row 1","Column 1","Column 2","Column 3"],
         "Badge/lever effects": [BADGE_LABELS[k] for k in BADGE_KEYS if k in cols],
@@ -271,13 +247,12 @@ def run_logit(path_csv: str, badge_filter: list[str] | None = None):
 
     return table
 
-# ----------------- empirical heat-map (darker = higher selection) -----------------
+# ----------------- heatmap back-end config -----------------
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 
+# ----------------- empirical heat-map (darker = higher selection) -----------------
 def save_position_heatmap_empirical(path_csv: str,
                                     out_png_path: str,
                                     title: str | None = None) -> str:
@@ -293,12 +268,10 @@ def save_position_heatmap_empirical(path_csv: str,
     df = pd.read_csv(path_csv)
     df = _complete_screens(df).copy()
 
-    # Guards and numeric casts
     df["row"] = pd.to_numeric(df.get("row", 0), errors="coerce").fillna(-1).astype(int)
     df["col"] = pd.to_numeric(df.get("col", 0), errors="coerce").fillna(-1).astype(int)
     df["chosen"] = pd.to_numeric(df.get("chosen", 0), errors="coerce").fillna(0).astype(int)
 
-    # Mean chosen by grid cell → empirical selection rate
     mat = np.zeros((2, 4), dtype=float)
     g = df.groupby(["row", "col"])["chosen"].mean()
     for (r, c), v in g.items():
@@ -306,16 +279,19 @@ def save_position_heatmap_empirical(path_csv: str,
         if 0 <= r <= 1 and 0 <= c <= 3:
             mat[r, c] = float(v)
 
-    # Plot (darker = higher); use data-driven vmax for contrast
-    vmax = float(mat.max()) if mat.max() > 0 else 1.0
-    fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
-    im = ax.imshow(mat, cmap="Greys_r", vmin=0.0, vmax=vmax)
+    vmax_auto = float(mat.max())
+    vhi = vmax_auto if vmax_auto > 0 else 1.0
+    vlo = 0.0
 
-    # Percent labels with adaptive text colour
+    fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
+    # Use non-reversed 'Greys' but invert the normalization explicitly so higher -> darker
+    im = ax.imshow(mat, cmap="Greys", vmin=vhi, vmax=vlo)
+
     for r in range(2):
         for c in range(4):
             val = float(mat[r, c])
-            txt_color = "white" if (vmax > 0 and val >= 0.5 * vmax) else "black"
+            thresh = 0.5 * vhi
+            txt_color = "white" if val >= thresh else "black"
             ax.text(c, r, f"{100.0 * val:.1f}%", ha="center", va="center", fontsize=9, color=txt_color)
 
     ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"])
@@ -326,43 +302,39 @@ def save_position_heatmap_empirical(path_csv: str,
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.ax.set_ylabel("Empirical selection rate", rotation=270, labelpad=12)
 
-    # Light grid to emphasise cell boundaries
     ax.set_xticks(np.arange(-.5, 4, 1), minor=True)
     ax.set_yticks(np.arange(-.5, 2, 1), minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6, alpha=0.6)
     ax.tick_params(which="minor", bottom=False, left=False)
 
+    pathlib.Path(out_png_path).parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_png_path, bbox_inches="tight")
     plt.close(fig)
     return out_png_path
 
 # ----------------- probability-based heat-map (darker = higher selection) -----------------
-
 def save_position_heatmap(path_csv: str,
                           out_png_path: str,
                           title: str | None = None) -> str:
     """
     Render a 2×4 heat-map of MODEL-IMPLIED selection probabilities by (row, col).
     Steps: rebuild design X with the same helpers used in run_logit(), fit ridge logit,
-    compute \hat p for every alternative, then average \hat p within each grid cell.
+    compute p̂ for every alternative, then average p̂ within each grid cell.
     Darker shades indicate higher predicted selection.
 
     Rows: Row 1 (top, index 0), Row 2 (bottom, index 1).
     Columns: 1..4 (indices 0..3).
     """
-    # Load & prep exactly as in run_logit()
     df = pd.read_csv(path_csv)
     df = _prepare_df(df)
     df = _complete_screens(df)
 
-    # Rebuild design and fit the same penalised logit
     n_cases = int(df["case_id"].nunique())
     X, y, cols, fe_cols = _build_design(df, badge_filter=None, n_cases=n_cases)
     alpha = RIDGE_ALPHA_LARGE if n_cases >= MIN_CASES else RIDGE_ALPHA_SMALL
     beta, cov, p_hat = _ridge_logit_irls(y, X.values, alpha=alpha)
 
-    # Aggregate model-implied probabilities by grid cell
     df = df.copy()
     df["p_hat"] = p_hat
     mat = np.zeros((2, 4), dtype=float)
@@ -372,22 +344,19 @@ def save_position_heatmap(path_csv: str,
         if 0 <= r <= 1 and 0 <= c <= 3:
             mat[r, c] = float(v)
 
-    # Plot (darker = higher)
     fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=144)
-    im = ax.imshow(mat, cmap="Greys_r", vmin=0.0, vmax=1.0)
+    # Explicit inverted normalization so higher probability -> darker shade
+    im = ax.imshow(mat, cmap="Greys", vmin=1.0, vmax=0.0)
 
-    # Annotate with percentages
     for r in range(2):
         for c in range(4):
             ax.text(c, r, f"{100.0 * mat[r, c]:.1f}%", ha="center", va="center", fontsize=9)
 
-    # Axes, labels, title
     ax.set_xticks(range(4)); ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"])
     ax.set_yticks([0, 1]);    ax.set_yticklabels(["Row 1", "Row 2"])
     ax.set_xlabel("Column");  ax.set_ylabel("Row")
     ax.set_title(title or "Probability webpage heatmap of AI shopping agents", fontsize=11)
 
-    # Colorbar + light grid
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.ax.set_ylabel("Model-implied selection probability", rotation=270, labelpad=12)
     ax.set_xticks(np.arange(-.5, 4, 1), minor=True)
@@ -395,43 +364,30 @@ def save_position_heatmap(path_csv: str,
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6, alpha=0.6)
     ax.tick_params(which="minor", bottom=False, left=False)
 
+    pathlib.Path(out_png_path).parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(out_png_path)
+    fig.savefig(out_png_path, bbox_inches="tight")
     plt.close(fig)
     return out_png_path
 
 # --------- convenience wrapper so logit_badges owns heatmap creation ---------
-import os, time, pathlib
-
 def generate_heatmaps(path_csv: str,
                       out_dir: str = "results",
                       title_prefix: str | None = None,
                       file_tag: str | None = None) -> dict:
     """
     Create both heatmaps and return their file paths in a dict.
-    This keeps generation inside logit_badges while letting callers (e.g., the runner)
-    simply delegate and surface the resulting assets.
-
-    Parameters
-    ----------
-    path_csv : str
-        Path to df_choice.csv.
-    out_dir : str
-        Directory where PNGs will be saved. Will be created if missing.
-    title_prefix : str | None
-        Optional prefix for figure titles (e.g., "Shoes · OpenAI GPT-4.1-mini").
-    file_tag : str | None
-        Optional tag (e.g., a job_id) to de-duplicate filenames across runs.
+    Keeps generation inside logit_badges while letting callers delegate.
 
     Returns
     -------
-    dict
-        {
-          "position_heatmap_empirical": "<path>",
-          "position_heatmap_prob": "<path>"
-        }
+    {
+      "position_heatmap_empirical": "<path>",
+      "position_heatmap_prob": "<path>",
+      "position_heatmap": "<path>",           # alias (probability)
+      "position_heatmap_png": "<path>"        # alias (probability)
+    }
     """
-    out = {}
     od = pathlib.Path(out_dir)
     od.mkdir(parents=True, exist_ok=True)
 
@@ -445,10 +401,9 @@ def generate_heatmaps(path_csv: str,
     emp_p = save_position_heatmap_empirical(path_csv, str(emp_path), title=emp_title)
     prob_p = save_position_heatmap(path_csv, str(prob_path), title=prob_title)
 
-    out["position_heatmap_empirical"] = emp_p
-    out["position_heatmap_prob"] = prob_p
-    # Back-compat alias keys if your UI expects them
-    out["position_heatmap"] = prob_p
-    out["position_heatmap_png"] = prob_p
-    return out
-
+    return {
+        "position_heatmap_empirical": emp_p,
+        "position_heatmap_prob": prob_p,
+        "position_heatmap": prob_p,
+        "position_heatmap_png": prob_p,
+    }
