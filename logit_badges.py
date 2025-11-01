@@ -38,7 +38,7 @@ from statsmodels.stats.multitest import multipletests
 MIN_CASES = 10
 RIDGE_ALPHA_SMALL = 5e-2
 RIDGE_ALPHA_LARGE = 1e-2
-MAX_ITER = 300
+MAX_ITER = 500
 TOL = 1e-7
 EPS = 1e-9  # prob clamp
 
@@ -438,3 +438,4 @@ def generate_heatmaps(path_csv: str,
         "position_heatmap": prob_p,
         "position_heatmap_png": prob_p,
     }
+
