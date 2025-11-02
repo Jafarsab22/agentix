@@ -9,6 +9,63 @@ from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
+# ---------------- async job runner (no UI stream timeouts) ----------------
+import threading, uuid, json, time
+
+_JOBS = {}
+_JOBS_LOCK = threading.Lock()
+
+def _bg_run_job(job_id: str, args_tuple: tuple):
+    """Runs your existing run_now(...) in a background thread and stores outputs."""
+    try:
+        msg, results_json = run_now(*args_tuple)   # uses your current function
+        with _JOBS_LOCK:
+            _JOBS[job_id]["status"] = "done"
+            _JOBS[job_id]["msg"] = msg
+            _JOBS[job_id]["results_json"] = results_json
+    except Exception as e:
+        with _JOBS_LOCK:
+            _JOBS[job_id]["status"] = "error"
+            _JOBS[job_id]["error"] = f"{type(e).__name__}: {e}"
+
+def submit_job_async(product_name: str,
+                     brand_name: str,
+                     model_name: str,
+                     badges: list[str],
+                     price,
+                     currency: str,
+                     n_iterations):
+    """
+    Submit the long run without holding the HTTP connection open.
+    Returns {"ok":True,"job_id":...}.
+    """
+    job_id = f"job-{uuid.uuid4().hex[:8]}"
+    args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {"status": "queued"}
+    th = threading.Thread(target=_bg_run_job, args=(job_id, args_tuple), name=f"runner-{job_id}", daemon=True)
+    th.start()
+    return {"ok": True, "job_id": job_id}
+
+def poll_job(job_id: str):
+    """Lightweight status check."""
+    with _JOBS_LOCK:
+        info = _JOBS.get(job_id)
+        if not info:
+            return {"ok": False, "status": "unknown"}
+        return {"ok": True, "status": info.get("status", "queued")}
+
+def fetch_job(job_id: str):
+    """Fetch final outputs when status == 'done' (or error info)."""
+    with _JOBS_LOCK:
+        info = _JOBS.get(job_id)
+        if not info:
+            return {"ok": False, "status": "unknown"}
+        if info.get("status") == "done":
+            return {"ok": True, "status": "done", "msg": info["msg"], "results_json": info["results_json"]}
+        if info.get("status") == "error":
+            return {"ok": False, "status": "error", "error": info.get("error", "unknown")}
+        return {"ok": True, "status": info.get("status", "queued")}
 
 def _catch_and_report(fn):
     """Wrap a Gradio handler, show a readable error, and log to results/ + console."""
@@ -408,7 +465,57 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     else:
         msg = "No badge effects computed."
 
-    # Persist to Hostinger DB (best-effort) — unchanged
+    # ---------------- [NEW] Fire-and-forget persistence of artifacts + DB ----------------
+    # Runs in a daemon thread so UI disconnects/timeouts do not block saving to your server/DB.
+    try:
+        import threading, base64 as _b64, requests, pathlib as _pl
+
+        def _persist_async(_results, _payload):
+            try:
+                run_id_local = _results.get("job_id") or _payload.get("job_id") or job_id
+                arts = _results.get("artifacts", {}) or {}
+                send_list = []
+                for key in ("effects_csv", "df_choice", "position_heatmap_empirical"):
+                    p = arts.get(key)
+                    if not p:
+                        continue
+                    try:
+                        with open(p, "rb") as fh:
+                            send_list.append({
+                                "filename": _pl.Path(p).name,
+                                "data_base64": _b64.b64encode(fh.read()).decode("utf-8")
+                            })
+                    except Exception:
+                        pass
+                if send_list:
+                    try:
+                        url = "https://aireadyworkforce.pro/Agentix/sendAgentixFiles.php"
+                        _ = requests.post(url, json={"run_id": run_id_local, "files": send_list}, timeout=45)
+                    except Exception:
+                        pass
+
+                try:
+                    from save_to_agentix import persist_results_if_qualify
+                    _ = persist_results_if_qualify(
+                        _results,
+                        _payload,
+                        base_url="https://aireadyworkforce.pro/Agentix",
+                        app_version="app-1",
+                        est_model="logit-1",
+                        alpha=0.05,
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_persist_async, args=(results, payload), name=f"persist-{job_id}", daemon=True).start()
+        results.setdefault("artifacts", {})["agentix_persist_started"] = True
+    except Exception as _bg_e:
+        results.setdefault("artifacts", {})["agentix_persist_error_init"] = str(_bg_e)
+    # ---------------- [END NEW] ----------------------------------------------------------
+
+    # (Keep the original best-effort DB call as well; harmless if it runs twice server-side.)
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -768,6 +875,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
