@@ -1,35 +1,22 @@
-# -*- coding: utf-8 -*-
-"""
-Agentix – Gradio app (Railway) — v1.13 (2025-11-02)
-
-Notes (what changed in this version)
-    • Async queue (threaded) kept: the long run executes in a background thread,
-      results cached in-memory with a lock.
-    • Auto-poller (no Timer dependency): uses demo.load(..., every=2) with a hidden
-      gr.State job_id. While job_id is non-empty, the UI polls every 2 seconds;
-      when the job finishes (done/error) the poller clears job_id, which effectively
-      stops work on subsequent ticks. This works on older Gradio versions that do
-      not provide gr.Timer.
-    • Legacy synchronous button hidden: "Run simulation now" is invisible and not wired.
-    • Contracts unchanged: storefront and agent_runner remain as before; results
-      and artifacts are identical to the blocking path.
-
-Why this helps on Railway
-    • The browser submits and the server returns immediately; a lightweight poll
-      loop fetches results when ready, avoiding long-held HTTP requests.
-"""
-
+# app.py
 import json, uuid, os, time, pathlib, csv, requests
 from datetime import datetime
 import gradio as gr
 from agent_runner import run_job_sync
+from agent_runner import submit_job_async as runner_submit_job_async
+from agent_runner import poll_job as runner_poll_job
+from agent_runner import fetch_job as runner_fetch_job
 import traceback, logging
 from html import escape
 from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------- Async job queue (threaded) ----------
+# ---------- Async job queue (breaks the 900s ceiling) ----------
+# (Kept intact; UI below uses agent_runner's async wrappers via runner_* aliases)
+import threading, uuid, json as _json_shadow
+
+# ---------- Async job queue (breaks the 900s ceiling) ----------
 import threading
 
 _JOBS = {}
@@ -41,6 +28,7 @@ def _bg_run_job(job_id: str, args_tuple: tuple):
     args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
     """
     try:
+        # Reuse the exact formatting and side effects of run_now(...)
         msg, results_json = run_now(*args_tuple)
         with _JOBS_LOCK:
             _JOBS[job_id] = {"status": "done", "msg": msg, "results_json": results_json}
@@ -52,17 +40,16 @@ def submit_job_async(product_name, brand_name, model_name, badges, price, curren
     jid = f"job-{uuid.uuid4().hex[:8]}"
     args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
     with _JOBS_LOCK:
-        _JOBS[jid] = {"status": "running"}  # was "queued"
+        _JOBS[jid] = {"status": "queued"}
     threading.Thread(target=_bg_run_job, args=(jid, args_tuple), name=f"runner-{jid}", daemon=True).start()
     return {"ok": True, "job_id": jid}
-
 
 def poll_job(job_id: str):
     with _JOBS_LOCK:
         info = _JOBS.get(job_id)
     if not info:
         return {"ok": False, "status": "unknown"}
-    return {"ok": True, "status": info["status"], **{k:v for k,v in info.items() if k != "status"}}
+    return {"ok": True, "status": info["status"]}
 
 def fetch_job(job_id: str):
     with _JOBS_LOCK:
@@ -72,8 +59,9 @@ def fetch_job(job_id: str):
     if info["status"] == "done":
         return {"ok": True, "status": "done", "msg": info["msg"], "results_json": info["results_json"]}
     if info["status"] == "error":
-        return {"ok": False, "status": "error", "error": info.get("error","error")}
+        return {"ok": False, "status": "error", "error": info["error"]}
     return {"ok": True, "status": info["status"]}
+
 
 
 def _catch_and_report(fn):
@@ -91,7 +79,8 @@ def _catch_and_report(fn):
             print(tb, flush=True)
             logging.exception("Gradio handler failed")
             msg = f"❌ {type(e).__name__}: {e}\n\n```\n{tb}\n```"
-            return (msg, "{}") if fn.__name__ in ("run_now",) else msg
+            # Handlers that return (markdown, json); pad if needed
+            return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui") else msg
     return _inner
 
 
@@ -124,7 +113,7 @@ CURRENCY_CHOICES = ["£", "$", "EUR"]
 SEPARATE_BADGES = {
     "All-in v. partitioned pricing",
     "Assurance",
-    "Strike-through",
+    "Strike-through",   # “Strike”
     "Timer",
 }
 
@@ -144,6 +133,7 @@ def _auto_iterations_from_badges(badges: list[str]) -> int:
     b = 0
     if "All-in v. partitioned pricing" in sel:
         b += 1
+    # Non-frame levers you currently estimate separately in the logit
     for lab in ("Assurance", "Strike-through", "Timer"):
         if lab in sel:
             b += 1
@@ -196,6 +186,8 @@ def _build_payload(*, job_id, product, brand, model, badges, price, currency, n_
     }
 
 
+# --- helper to export effects with run metadata (used for local download only) ---
+
 def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     if not rows_sorted:
         return None, None
@@ -203,6 +195,7 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     base = f"{ts}_{job_id}_badge_effects"
     csv_path = EFFECTS_DIR / f"{base}.csv"
     html_path = EFFECTS_DIR / f"{base}.html"
+    # Extended fields preserved if present in rows
     fieldnames = [
         "job_id", "timestamp", "product", "brand", "model",
         "price", "currency", "n_iterations",
@@ -296,32 +289,14 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     return str(csv_path), str(html_path)
 
 
-@_catch_and_report
-def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
-    err = _validate_inputs(product_name, price, currency, n_iterations)
-    if err:
-        return err, "{}"
+# ---------- Shared formatter for sync + async paths ----------
 
-    import uuid
-    job_id = f"job-preview-{uuid.uuid4().hex[:8]}"
-    payload = _build_payload(
-        job_id=job_id,
-        product=product_name,
-        brand=brand_name,
-        model=model_name,
-        badges=badges,
-        price=price,
-        currency=currency,
-        n_iterations=n_iterations,
-        fresh=True,
-    )
-
-    import importlib, logit_badges
-    logit_badges = importlib.reload(logit_badges)
-
-    results = run_job_sync(payload)
-
+def _format_results_from_dict(results: dict) -> tuple[str, dict]:
     rows = results.get("logit_table_rows") or []
+    inputs = results.get("inputs") or {}
+    model_name = str(results.get("model_requested") or inputs.get("model") or "model")
+    product_name = str(inputs.get("product") or "")
+    artifacts = results.setdefault("artifacts", {}) or {}
 
     def _fmt(x, nd=3):
         try:
@@ -374,7 +349,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
                 f"| {r.get('badge','')} | "
                 f"{_fmt(r.get('beta'))} | "
                 f"{_fmt(r.get('se'))} | "
-                f"{_fmt(r.get('p'), nd=4)} | "
+                f"{_fmt(r.get('p', r.get('p_value')), nd=4)} | "
                 f"{_fmt(r.get('q_bh'), nd=4)} | "
                 f"{_fmt(r.get('odds_ratio'))} | "
                 f"{_fmt(r.get('ci_low'))} | "
@@ -386,11 +361,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
             )
         return "\n".join(lines)
 
-    title_block = (
-        f"*Model = {model_name}*\n\n"
-        f"*Product = {product_name or '(enter product name)'}*\n"
-    )
-
+    title_block = f"*Model = {model_name}*\n\n*Product = {product_name or '(enter product name)'}*\n"
     if rows:
         header = "### Estimates of the Conditional Logit Regression\n\n" + title_block
         msg_parts = [header]
@@ -415,21 +386,13 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         )
         msg_parts.append(glossary_md)
 
-        csv_path, html_path = _export_badge_effects(rows, payload, job_id)
-        artifacts = results.setdefault("artifacts", {})
-        if csv_path:
-            artifacts["effects_csv"] = csv_path
-        if html_path:
-            artifacts["effects_html"] = html_path
-
         def _embed_png(path, alt_text, caption):
             try:
                 with open(path, "rb") as _f:
                     import base64 as _b64
-                    _b = _b64.b64encode(fh := _f.read()).decode("utf-8")
+                    _b = _b64.b64encode(_f.read()).decode("utf-8")
                 return (
-                    f'\n\n<img alt="{alt_text}" '
-                    f'src="data:image/png;base64,{_b}" '
+                    f'\n\n<img alt="{alt_text}" src="data:image/png;base64,{_b}" '
                     f'style="max-width:560px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
                     f"\n{caption}\n"
                 )
@@ -438,28 +401,63 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
         emp_path = artifacts.get("position_heatmap_empirical", "")
         prob_path = artifacts.get("position_heatmap_prob", "") or artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
-
         if emp_path:
-            msg_parts.append(
-                _embed_png(
-                    emp_path,
-                    "Empirical selection heatmap (darker = higher observed selection rate)",
-                    "*Empirical selection heatmap (darker = higher observed selection rate)*"
-                )
-            )
+            msg_parts.append(_embed_png(
+                emp_path,
+                "Empirical selection heatmap (darker = higher observed selection rate)",
+                "*Empirical selection heatmap (darker = higher observed selection rate)*"
+            ))
         if prob_path:
-            msg_parts.append(
-                _embed_png(
-                    prob_path,
-                    "Model-implied probability heatmap (darker = higher predicted selection probability)",
-                    "*Model-implied probability heatmap (darker = higher predicted selection probability)*"
-                )
-            )
+            msg_parts.append(_embed_png(
+                prob_path,
+                "Model-implied probability heatmap (darker = higher predicted selection probability)",
+                "*Model-implied probability heatmap (darker = higher predicted selection probability)*"
+            ))
 
-        msg = "\n".join([p for p in msg_parts if p])
-    else:
-        msg = "No badge effects computed."
+        return "\n".join([p for p in msg_parts if p]), results
 
+    return "No badge effects computed.", results
+
+
+@_catch_and_report
+def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
+    err = _validate_inputs(product_name, price, currency, n_iterations)
+    if err:
+        return err, "{}"
+
+    import uuid
+    job_id = f"job-preview-{uuid.uuid4().hex[:8]}"
+    payload = _build_payload(
+        job_id=job_id,
+        product=product_name,
+        brand=brand_name,
+        model=model_name,
+        badges=badges,
+        price=price,
+        currency=currency,
+        n_iterations=n_iterations,
+        fresh=True,
+    )
+
+    # Ensure latest estimator code is used
+    import importlib, logit_badges
+    logit_badges = importlib.reload(logit_badges)
+
+    results = run_job_sync(payload)
+
+    # Shared formatter
+    msg, _results_obj = _format_results_from_dict(results)
+
+    # ---- Local export (CSV/HTML) – unchanged
+    rows = results.get("logit_table_rows") or []
+    csv_path, html_path = _export_badge_effects(rows, payload, job_id)
+    artifacts = results.setdefault("artifacts", {})
+    if csv_path:
+        artifacts["effects_csv"] = csv_path
+    if html_path:
+        artifacts["effects_html"] = html_path
+
+    # ---------------- [NEW] Fire-and-forget persistence of artifacts + DB ----------------
     try:
         import threading, base64 as _b64, requests, pathlib as _pl
 
@@ -506,7 +504,9 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         results.setdefault("artifacts", {})["agentix_persist_started"] = True
     except Exception as _bg_e:
         results.setdefault("artifacts", {})["agentix_persist_error_init"] = str(_bg_e)
+    # ---------------- [END NEW] ----------------------------------------------------------
 
+    # Original best-effort DB call (safe if it runs twice server-side).
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -521,8 +521,8 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     except Exception as e:
         results.setdefault("artifacts", {})["agentix_persist_error"] = str(e)
 
-    import json
-    return msg, json.dumps(results, ensure_ascii=False, indent=2)
+    import json as _json
+    return msg, _json.dumps(results, ensure_ascii=False, indent=2)
 
 
 @_catch_and_report
@@ -533,6 +533,8 @@ def search_database(product_name: str):
         return "<p>Enter a product name to search.</p>", "{}"
 
     base_url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
+
+    # --- Call the browser-proven GET path ---
     try:
         r = requests.get(base_url, params={"product": product, "limit": 50}, timeout=12)
         ct = (r.headers.get("content-type") or "").lower()
@@ -552,6 +554,7 @@ def search_database(product_name: str):
     if not runs:
         return "<p>No relevant results found.</p>", json.dumps(data, ensure_ascii=False, indent=2)
 
+    # Pick the most recent run and its effects
     run = runs[0]
     rid = run.get("run_id")
     rows = [e for e in effects if e.get("run_id") == rid]
@@ -559,6 +562,7 @@ def search_database(product_name: str):
     if not rows:
         return "<p>No relevant results found.</p>", json.dumps(data, ensure_ascii=False, indent=2)
 
+    # Shared run-level fields
     product_out = run.get("product", product)
     brand_out   = run.get("brand_type", "")
     model_out   = run.get("model_name", "")
@@ -566,6 +570,7 @@ def search_database(product_name: str):
     curr_out    = run.get("price_currency", "")
     n_iter_out  = run.get("n_iterations", "")
 
+    # Build HTML table (renders in Gradio Markdown/HTML)
     header = (
         "<table style='border-collapse:collapse;width:100%'>"
         "<thead><tr>"
@@ -599,12 +604,74 @@ def search_database(product_name: str):
         )
     table_html = header + "".join(body) + "</tbody></table>"
 
+    # CSV download (Option A): served by the PHP endpoint
     dl_url = f"{base_url}?product={quote(product)}&limit=50&format=csv"
     html = f"{table_html}<p style='margin-top:8px'><a href='{dl_url}'>⬇️ Download CSV</a></p>"
 
     return html, json.dumps(data, ensure_ascii=False, indent=2)
 
-# --- Admin helpers ---
+
+# ---------- Async UI wrappers delegating to agent_runner ----------
+
+@_catch_and_report
+def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
+    err = _validate_inputs(product_name, price, currency, n_iterations)
+    if err:
+        return "", f"❌ {err}"
+    import uuid as _uuid
+    payload = _build_payload(
+        job_id=f"job-{_uuid.uuid4().hex[:8]}",
+        product=product_name, brand=brand_name, model=model_name,
+        badges=badges, price=price, currency=currency,
+        n_iterations=n_iterations, fresh=True,
+    )
+    try:
+        r = runner_submit_job_async(payload)
+        if r.get("ok"):
+            return r.get("job_id",""), f"✅ Submitted. Job {r.get('job_id')} is {r.get('status','running')}."
+        return "", f"❌ Submit failed: {r}"
+    except Exception as e:
+        return "", f"❌ Submit error: {type(e).__name__}: {e}"
+
+@_catch_and_report
+def poll_job_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "Enter a Job ID first."
+    try:
+        r = runner_poll_job(job_id)
+        if not r.get("ok"):
+            return f"⚠️ {r.get('error','unknown error')}"
+        status = r.get("status","unknown")
+        err = r.get("error")
+        return f"Job {job_id}: {status}" + (f" — {err}" if err else "")
+    except Exception as e:
+        return f"❌ Poll error: {type(e).__name__}: {e}"
+
+@_catch_and_report
+def fetch_job_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "Enter a Job ID first.", "{}"
+    try:
+        r = runner_fetch_job(job_id)
+        if not r.get("ok"):
+            st = r.get("status") or r.get("error","not_ready")
+            return f"Job {job_id}: {st}", "{}"
+        raw = r.get("results_json") or "{}"
+        try:
+            results = json.loads(raw)
+        except Exception:
+            results = {}
+        msg, _res = _format_results_from_dict(results)
+        return msg, json.dumps(results, ensure_ascii=False, indent=2)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        return f"❌ Fetch error: {type(e).__name__}: {e}", "{}"
+
+
+# --- Admin helpers --- (continued from Part 1)
 
 @_catch_and_report
 def _list_storefront_jobs(admin_key: str):
@@ -643,7 +710,7 @@ def _list_stats_files(admin_key: str):
     agg_choice = res / "df_choice.csv"
     agg_long   = res / "df_long.csv"
     agg_log    = res / "log_compare.jsonl"
-    badges_effects_path = res / "badges_effects.csv"
+    badges_effects_path = res / "badges_effects.csv"  # single source of truth
 
     msgs = []
     if agg_choice.exists():        msgs.append(f"• Found {agg_choice}")
@@ -664,7 +731,7 @@ def _list_stats_files(admin_key: str):
 
 @_catch_and_report
 def preview_example(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str):
-    import uuid
+    import uuid  # ensure in-scope
     payload = _build_payload(
         job_id=f"preview-{uuid.uuid4().hex[:8]}",
         product=product_name,
@@ -689,6 +756,7 @@ def preview_example(product_name: str, brand_name: str, model_name: str, badges:
 
 @_catch_and_report
 def _preview_badges_effects(admin_key: str):
+    """Render results/badges_effects.csv as an HTML table for quick inspection."""
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
         return "<p>Invalid or missing admin key.</p>"
 
@@ -721,72 +789,28 @@ def _preview_badges_effects(admin_key: str):
 def _on_badges_change(badges: list[str], auto_checked: bool, manual_checked: bool):
     if auto_checked and not manual_checked:
         n = _auto_iterations_from_badges(badges)
+        # Disabled (non-interactive) shows greyed text, signalling system-set value
         return gr.update(value=n, interactive=False)
+    # Manual mode: keep field editable; do not override user value
     return gr.update(interactive=True)
 
 @_catch_and_report
 def _toggle_auto(auto_checked: bool, badges: list[str]):
     if auto_checked:
+        # Enforce exclusivity: turning Auto on turns Manual off and disables input
         n = _auto_iterations_from_badges(badges)
         return gr.update(value=False), gr.update(value=n, interactive=False)
+    # If Auto is unticked, fall back to Manual enabled
     return gr.update(value=True), gr.update(value=100, interactive=True)
 
 @_catch_and_report
 def _toggle_manual(manual_checked: bool, badges: list[str]):
     if manual_checked:
+        # Enforce exclusivity: turning Manual on turns Auto off and enables input (default 100)
         return gr.update(value=False), gr.update(value=100, interactive=True)
+    # If Manual is unticked, return to Auto
     n = _auto_iterations_from_badges(badges)
     return gr.update(value=True), gr.update(value=n, interactive=False)
-
-
-# ---------- Async UI helpers (state-based auto-poll) ----------
-
-@_catch_and_report
-def _submit_async_and_start(product, brand, model, badges, price, currency, n_iterations):
-    err = _validate_inputs(product, price, currency, n_iterations)
-    if err:
-        return (
-            gr.update(value=""),
-            gr.update(value=f"❌ {escape(err)}"),
-            gr.update(value=""),
-            gr.update(value="{}"),
-            gr.update(value="")
-        )
-    resp = submit_job_async(product, brand, model, badges, price, currency, n_iterations)
-    jid = resp.get("job_id", "")
-    # Job ID text, status markdown, clear results, clear JSON, and set job_id_state
-    return (
-        gr.update(value=jid),
-        gr.update(value=f"running: {jid}"),   # <- status goes here
-        gr.update(value=""),
-        gr.update(value="{}"),
-        gr.update(value=jid)
-    )
-    
-
-
-@_catch_and_report
-def _poll_tick_state(job_id):
-    """
-    Called every 2s via demo.load(..., every=2).
-    Returns: results_md, results_json, status_md, next_job_id_state
-             (set next_job_id_state="" to stop doing work on later ticks)
-    """
-    if not job_id:
-        return gr.update(), gr.update(), gr.update(), gr.update(value="")
-    st = poll_job(job_id)
-    if not st.get("ok") and st.get("status") == "unknown":
-        return gr.update(), gr.update(), gr.update(value="unknown job"), gr.update(value="")
-    s = st.get("status", "unknown")
-    if s == "done":
-        fj = fetch_job(job_id)
-        if fj.get("ok"):
-            return fj["msg"], fj["results_json"], gr.update(value="done"), gr.update(value="")
-        return gr.update(value=""), gr.update(value="{}"), gr.update(value=f"error: {fj.get('error','?')}"), gr.update(value="")
-    if s == "error":
-        return gr.update(value=""), gr.update(value="{}"), gr.update(value=f"error: {st.get('error','?')}"), gr.update(value="")
-    # queued or running → keep polling
-    return gr.update(), gr.update(), gr.update(value=f"{s}…"), gr.update(value=job_id)
 
 
 # ---------- UI ----------
@@ -805,10 +829,12 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         price = gr.Number(label="Price", value=0.0, precision=2)
         currency = gr.Dropdown(choices=CURRENCY_CHOICES, value=CURRENCY_CHOICES[0], label="Currency")
 
+    # Iterations controls: two tick boxes above the iterations field
     with gr.Row():
         auto_iter = gr.Checkbox(label="Automatic calculations of iterations", value=True, scale=1)
         manual_iter = gr.Checkbox(label="Manual calculations of iterations", value=False, scale=1)
 
+    # Default auto value based on zero selected badges: ceil_to_8(max(100, 0)) = 104
     default_auto_iters = _auto_iterations_from_badges([])
     n_iterations = gr.Number(label="Iterations", value=default_auto_iters, precision=0, interactive=False)
 
@@ -816,54 +842,63 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
     # Search-first workflow
     search_btn = gr.Button("Search our database", variant="secondary")
-    # Legacy synchronous small-run path — keep but hide (not wired)
+
+    # Async job controls (Railway-safe)
+    with gr.Row():
+        submit_async_btn = gr.Button("Submit long run (async)", variant="primary")
+        job_id_box = gr.Textbox(label="Job ID", placeholder="Will appear after submit", interactive=False)
+    with gr.Row():
+        poll_btn = gr.Button("Poll status", variant="secondary")
+        fetch_btn = gr.Button("Fetch results", variant="secondary")
+    async_status = gr.Markdown()
+
+    # Legacy synchronous small-run path (kept for quick previews)
     run_btn = gr.Button("Run simulation now", variant="secondary", visible=False)
+
     preview_btn = gr.Button("Preview one example screen", variant="secondary")
     preview_view = gr.HTML(label="Preview")
-
-    # Async controls with auto-poll (state-based)
-    submit_btn = gr.Button("Submit long run (async)", variant="primary")
-    with gr.Row():
-        job_id_box = gr.Textbox(label="Job ID", value="", placeholder="Will appear after submit", interactive=False, scale=2)
-        status_md = gr.Markdown()
-    job_id_state = gr.State("")  # hidden; drives the poll loop
 
     # Main results area: table markdown + JSON for debugging
     results_md = gr.Markdown()
     results_json = gr.Code(label="Results JSON", language="json")
 
-    # Wire search and preview
+    # Wire search to show results exactly where the table normally appears
     search_btn.click(
         fn=search_database,
         inputs=[product],
         outputs=[results_md, results_json],
     )
 
+    # Async bindings
+    submit_async_btn.click(
+        fn=submit_job_ui,
+        inputs=[product, brand, model, badges, price, currency, n_iterations],
+        outputs=[job_id_box, async_status],
+    )
+    poll_btn.click(
+        fn=poll_job_ui,
+        inputs=[job_id_box],
+        outputs=[async_status],
+    )
+    fetch_btn.click(
+        fn=fetch_job_ui,
+        inputs=[job_id_box],
+        outputs=[results_md, results_json],
+    )
+
+    # Preview and sync run
     preview_btn.click(
         fn=preview_example,
         inputs=[product, brand, model, badges, price, currency],
         outputs=[preview_view],
     )
-
-    # submit → start polling every 2s
-    chain = submit_btn.click(
-        fn=_submit_async_and_start,
+    run_btn.click(
+        fn=run_now,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
-        outputs=[job_id_box, status_md, results_md, results_json, job_id_state],
-        concurrency_limit=1,         # <- per-listener limit (replaces concurrency_count)
-    )
-    
-    chain.then(
-        fn=_poll_tick_state,
-        inputs=[job_id_state],
-        outputs=[results_md, results_json, status_md, job_id_state],
-        every=2.0,
-        concurrency_limit=1,         # <- safe: one poll at a time
+        outputs=[results_md, results_json],
     )
 
-
-
-    # Iteration controls
+    # --- Interactions for Automatic / Manual iterations and badges changes ---
     auto_iter.change(
         fn=_toggle_auto,
         inputs=[auto_iter, badges],
@@ -896,8 +931,9 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     stats_choice = gr.File(label="df_choice.csv")
     stats_long = gr.File(label="df_long.csv")
     stats_log = gr.File(label="log_compare.jsonl")
-    stats_badges = gr.File(label="badges_effects.csv")
+    stats_badges = gr.File(label="badges_effects.csv")  # shows latest effects export
 
+    # Preview of badges_effects.csv inside the app
     stats_badges_preview_btn = gr.Button("Preview badges_effects table")
     stats_badges_preview_html = gr.HTML(label="badges_effects preview")
 
@@ -915,11 +951,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    demo.queue()                                  # <- no arguments
-    demo.launch(server_name="0.0.0.0",
-                server_port=port,
-                show_error=True,
-                max_threads=40)                    # optional tuning
-
-
-
+    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
