@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Agentix – Gradio app (Railway) — v1.12 (2025-11-02)
+Agentix – Gradio app (Railway) — v1.13 (2025-11-02)
 
 Notes (what changed in this version)
-    • Async queue (threaded) fixed: removes illegal starred assignment and
-      runs the existing run_now(...) handler in a background thread. Jobs are
-      tracked in an in-memory dict guarded by a lock.
-    • Auto-poller added: a small gr.Timer starts after you submit an async job,
-      polls status every 2 seconds, fetches results when 'done', then stops.
-      This removes the need to click Poll/Fetch repeatedly.
-    • Legacy synchronous button hidden: "Run simulation now" remains defined
-      (for local smoke tests) but is not visible and is not wired to outputs.
-    • No changes to the storefront or the runner contracts: the app still calls
-      run_job_sync(...) via run_now(...), and the UI/exports are unchanged.
+    • Async queue (threaded) kept: the long run executes in a background thread,
+      results cached in-memory with a lock.
+    • Auto-poller (no Timer dependency): uses demo.load(..., every=2) with a hidden
+      gr.State job_id. While job_id is non-empty, the UI polls every 2 seconds;
+      when the job finishes (done/error) the poller clears job_id, which effectively
+      stops work on subsequent ticks. This works on older Gradio versions that do
+      not provide gr.Timer.
+    • Legacy synchronous button hidden: "Run simulation now" is invisible and not wired.
+    • Contracts unchanged: storefront and agent_runner remain as before; results
+      and artifacts are identical to the blocking path.
 
 Why this helps on Railway
-    • Avoids holding a single HTTP request open during long runs, which can
-      exceed the ~15-minute ceiling. The browser submits, then the timer polls.
+    • The browser submits and the server returns immediately; a lightweight poll
+      loop fetches results when ready, avoiding long-held HTTP requests.
 """
 
 import json, uuid, os, time, pathlib, csv, requests
@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------- Async job queue (breaks the 900s ceiling) ----------
+# ---------- Async job queue (threaded) ----------
 import threading
 
 _JOBS = {}
@@ -425,7 +425,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
             try:
                 with open(path, "rb") as _f:
                     import base64 as _b64
-                    _b = _b64.b64encode(_f.read()).decode("utf-8")
+                    _b = _b64.b64encode(fh := _f.read()).decode("utf-8")
                 return (
                     f'\n\n<img alt="{alt_text}" '
                     f'src="data:image/png;base64,{_b}" '
@@ -738,34 +738,41 @@ def _toggle_manual(manual_checked: bool, badges: list[str]):
     return gr.update(value=True), gr.update(value=n, interactive=False)
 
 
-# ---------- Async UI helpers (timer-based) ----------
+# ---------- Async UI helpers (state-based auto-poll) ----------
 
 @_catch_and_report
 def _submit_async_and_start(product, brand, model, badges, price, currency, n_iterations):
     err = _validate_inputs(product, price, currency, n_iterations)
     if err:
-        return gr.update(value=""), gr.update(value=f"❌ {escape(err)}"), gr.update(), gr.update(value="{}"), gr.update(active=False)
+        return gr.update(value=""), gr.update(value=f"❌ {escape(err)}"), gr.update(), gr.update(value="{}"), gr.update(value="")
     resp = submit_job_async(product, brand, model, badges, price, currency, n_iterations)
     jid = resp.get("job_id", "")
     status = f"queued: {jid}"
-    return gr.update(value=jid), gr.update(value=status), gr.update(), gr.update(value="{}"), gr.update(active=True)
+    # return Job ID text, status markdown, clear results, clear JSON, and set job_id_state
+    return gr.update(value=jid), gr.update(value=status), gr.update(value=""), gr.update(value="{}"), gr.update(value=jid)
 
 @_catch_and_report
-def _poll_tick(job_id):
+def _poll_tick_state(job_id):
+    """
+    Called every 2s via demo.load(..., every=2).
+    Returns: results_md, results_json, status_md, next_job_id_state
+             (set next_job_id_state="" to stop doing work on later ticks)
+    """
     if not job_id:
-        return gr.update(), gr.update(), gr.update(value=""), gr.update(active=False)
+        return gr.update(), gr.update(), gr.update(), gr.update(value="")
     st = poll_job(job_id)
     if not st.get("ok") and st.get("status") == "unknown":
-        return gr.update(), gr.update(), gr.update(value="unknown job"), gr.update(active=False)
+        return gr.update(), gr.update(), gr.update(value="unknown job"), gr.update(value="")
     s = st.get("status", "unknown")
     if s == "done":
         fj = fetch_job(job_id)
         if fj.get("ok"):
-            return fj["msg"], fj["results_json"], gr.update(value="done"), gr.update(active=False)
-        return gr.update(value=""), gr.update(value="{}"), gr.update(value=f"error: {fj.get('error','?')}"), gr.update(active=False)
+            return fj["msg"], fj["results_json"], gr.update(value="done"), gr.update(value="")
+        return gr.update(value=""), gr.update(value="{}"), gr.update(value=f"error: {fj.get('error','?')}"), gr.update(value="")
     if s == "error":
-        return gr.update(value=""), gr.update(value="{}"), gr.update(value=f"error: {st.get('error','?')}"), gr.update(active=False)
-    return gr.update(), gr.update(), gr.update(value=f"{s}…"), gr.update(active=True)
+        return gr.update(value=""), gr.update(value="{}"), gr.update(value=f"error: {st.get('error','?')}"), gr.update(value="")
+    # queued or running → keep polling
+    return gr.update(), gr.update(), gr.update(value=f"{s}…"), gr.update(value=job_id)
 
 
 # ---------- UI ----------
@@ -800,12 +807,12 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     preview_btn = gr.Button("Preview one example screen", variant="secondary")
     preview_view = gr.HTML(label="Preview")
 
-    # Async controls with auto-polling timer
+    # Async controls with auto-poll (state-based)
     submit_btn = gr.Button("Submit long run (async)", variant="primary")
     with gr.Row():
         job_id_box = gr.Textbox(label="Job ID", value="", placeholder="Will appear after submit", interactive=False, scale=2)
         status_md = gr.Markdown()
-    auto = gr.Timer(interval=2.0, active=False)
+    job_id_state = gr.State("")  # hidden; drives the poll loop
 
     # Main results area: table markdown + JSON for debugging
     results_md = gr.Markdown()
@@ -824,17 +831,19 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[preview_view],
     )
 
-    # Async submit + auto-poll
+    # Async submit + start polling by setting job_id_state
     submit_btn.click(
         fn=_submit_async_and_start,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
-        outputs=[job_id_box, status_md, results_md, results_json, auto],
+        outputs=[job_id_box, status_md, results_md, results_json, job_id_state],
     )
 
-    auto.tick(
-        fn=_poll_tick,
-        inputs=[job_id_box],
-        outputs=[results_md, results_json, status_md, auto],
+    # Auto-poll every 2 seconds while job_id_state is non-empty
+    demo.load(
+        fn=_poll_tick_state,
+        inputs=[job_id_state],
+        outputs=[results_md, results_json, status_md, job_id_state],
+        every=2.0,
     )
 
     # Iteration controls
