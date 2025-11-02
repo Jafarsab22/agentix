@@ -192,7 +192,7 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     if not rows_sorted:
         return None, None
     ts = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
-    base = f"{ts}_{job_id}_badge_effects"
+    base = f"{ts}_badge_effects"   # no job_id here; PHP will prefix run_id
     csv_path = EFFECTS_DIR / f"{base}.csv"
     html_path = EFFECTS_DIR / f"{base}.html"
     # Extended fields preserved if present in rows
@@ -952,3 +952,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
