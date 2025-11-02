@@ -52,9 +52,10 @@ def submit_job_async(product_name, brand_name, model_name, badges, price, curren
     jid = f"job-{uuid.uuid4().hex[:8]}"
     args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
     with _JOBS_LOCK:
-        _JOBS[jid] = {"status": "queued"}
+        _JOBS[jid] = {"status": "running"}  # was "queued"
     threading.Thread(target=_bg_run_job, args=(jid, args_tuple), name=f"runner-{jid}", daemon=True).start()
     return {"ok": True, "job_id": jid}
+
 
 def poll_job(job_id: str):
     with _JOBS_LOCK:
@@ -744,12 +745,24 @@ def _toggle_manual(manual_checked: bool, badges: list[str]):
 def _submit_async_and_start(product, brand, model, badges, price, currency, n_iterations):
     err = _validate_inputs(product, price, currency, n_iterations)
     if err:
-        return gr.update(value=""), gr.update(value=f"❌ {escape(err)}"), gr.update(), gr.update(value="{}"), gr.update(value="")
+        return (
+            gr.update(value=""),
+            gr.update(value=f"❌ {escape(err)}"),
+            gr.update(value=""),
+            gr.update(value="{}"),
+            gr.update(value="")
+        )
     resp = submit_job_async(product, brand, model, badges, price, currency, n_iterations)
     jid = resp.get("job_id", "")
-    status = f"queued: {jid}"
-    # return Job ID text, status markdown, clear results, clear JSON, and set job_id_state
-    return gr.update(value=jid), gr.update(value=status), gr.update(value=""), gr.update(value="{}"), gr.update(value=jid)
+    # Job ID text, status markdown, clear results, clear JSON, and set job_id_state
+    return (
+        gr.update(value=jid),
+        gr.update(value=f"running: {jid}"),   # <- status goes here
+        gr.update(value=""),
+        gr.update(value="{}"),
+        gr.update(value=jid)
+    )
+
 
 @_catch_and_report
 def _poll_tick_state(job_id):
@@ -831,20 +844,21 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[preview_view],
     )
 
-    # Async submit + start polling by setting job_id_state
-    submit_btn.click(
+    # Async submit – returns job_id_state
+    chain = submit_btn.click(
         fn=_submit_async_and_start,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
         outputs=[job_id_box, status_md, results_md, results_json, job_id_state],
     )
-
-    # Auto-poll every 2 seconds while job_id_state is non-empty
-    demo.load(
+    
+    # Start the periodic poll AFTER submit; runs every 2s while job_id_state is non-empty
+    chain.then(
         fn=_poll_tick_state,
         inputs=[job_id_state],
         outputs=[results_md, results_json, status_md, job_id_state],
         every=2.0,
     )
+
 
     # Iteration controls
     auto_iter.change(
@@ -898,4 +912,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
+    demo.queue(concurrency_count=4, max_size=64)  # needed for periodic events on some builds
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
