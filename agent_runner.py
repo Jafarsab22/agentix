@@ -986,6 +986,21 @@ def submit_job_async(payload: Dict) -> Dict:
     def _worker():
         try:
             res = run_job_sync(payload)
+            # >>>> ADD THIS BLOCK (upload files + DB/effects) <<<<
+            try:
+                from save_to_agentix import persist_results_if_qualify
+                info = persist_results_if_qualify(
+                    res,
+                    payload,
+                    base_url="https://aireadyworkforce.pro/Agentix",
+                    app_version="app-1",
+                    est_model="logit-1",
+                    alpha=0.05,
+                )
+                res.setdefault("artifacts", {})["agentix_persist"] = info
+            except Exception as e:
+                res.setdefault("artifacts", {})["agentix_persist_error"] = f"{type(e).__name__}: {e}"
+            # <<<< END ADDED BLOCK >>>>
             with _JLOCK:
                 js.status = "done"
                 js.results_json = json.dumps(res, ensure_ascii=False)
@@ -1016,3 +1031,4 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
