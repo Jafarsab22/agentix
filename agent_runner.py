@@ -976,3 +976,4 @@ def fetch_job(job_id: str) -> Dict:  # NEW
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
