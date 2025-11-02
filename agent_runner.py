@@ -884,7 +884,7 @@ def run_job_sync(payload: Dict) -> Dict:
                         str(choice_path),
                         out_dir=str(RESULTS_DIR),
                         title_prefix=f"{category} · {ui_label}",
-                        file_tag=job_id
+                        file_tag=None
                     )
                     artifacts.update(hm)
                 except Exception as e:
@@ -1031,4 +1031,5 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
