@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*- 
+# -*- coding: utf-8 -*-
 """
 Agentix — Vision Runner (jpeg_b64) for two-stage design
-Version: v1.11 (2025-11-2) — patched
+Version: v1.11 (2025-11-02) — patched
 
 Key assumptions and alignment
     1) One choice per screen; each screen has exactly 8 alternatives (2×4).
@@ -26,7 +26,10 @@ Patch summary
     • Removes runner-side heatmap generation; heatmaps are owned by logit_badges only.
 NEW
     • Submit-and-poll async wrapper added at bottom: submit_job_async(), poll_job(), fetch_job().
-      This avoids long-held HTTP streams; run_job_sync(...) is unchanged.
+      This avoids long-held HTTP streams; run_job_sync(...) is unchanged in interface.
+    • Honour payload["job_id"] as RUN_ID for coherent file tagging across async jobs.
+    • Add a process-wide semaphore so only one long run owns Selenium at a time on small instances.
+    • Persist lightweight progress to jobs/{job_id}.json for resilience across restarts.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ import time
 import base64
 import pathlib
 import math
+import threading
 from datetime import datetime
 from typing import Dict, List, Tuple, Iterable
 
@@ -61,6 +65,7 @@ import logit_badges  # exposes run_logit
 # ---------------- paths / version ----------------
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR    = pathlib.Path("runs");    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR    = pathlib.Path("jobs");    JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 VERSION = "Agentix MC runner – inline-render or URL – 2025-10-31 (v1.10, patched)"
 print(f"[agent_runner] {VERSION}", flush=True)
@@ -72,6 +77,9 @@ CHOICE_COLS = [
     "frame","assurance","scarcity","strike","timer","social_proof","voucher","bundle",
     "chosen","case_valid","price","ln_price"
 ]
+
+# ---------------- concurrency: single-run semaphore ----------------
+_SIM_SEMAPHORE = threading.Semaphore(1)
 
 # ---------------- small helpers ----------------
 def _load_html(driver, html: str):
@@ -103,6 +111,23 @@ def _next_serial_for_today(path="run_serial.json") -> str:
     return f"{today}-{serial:03d}"
 
 RUN_ID = _next_serial_for_today()
+
+def _write_progress(job_id: str, status: str, done: int | None = None, total: int | None = None,
+                    last_set: str | None = None, artifacts: Dict[str, str] | None = None, error: str | None = None) -> None:
+    try:
+        rec = {
+            "job_id": job_id,
+            "status": status,
+            "done": done,
+            "total": total,
+            "last_set": last_set,
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "artifacts": artifacts or {},
+            "error": error
+        }
+        (JOBS_DIR / f"{job_id}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # ---------------- models / schema ----------------
 MODEL_MAP = {
@@ -294,7 +319,7 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
 
 # --- Robust POST with retries (OpenAI) ---
 def _post_with_retries_openai(url, headers, payload,
-                              timeout=(90, 1800),       # (connect, read)
+                              timeout=(90, 1800),
                               max_attempts=20,
                               backoff_base=0.75,
                               backoff_cap=12.0):
@@ -350,7 +375,6 @@ def call_openai(image_b64, category, model_name=None):
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        # Allow enough tokens for a proper tool call with string title + ints
         "max_tokens": 64,
         "temperature": 0
     }
@@ -608,7 +632,6 @@ def _episode(
 
             image_b64 = _jpeg_b64_from_driver(driver, quality=72)
 
-            # Try to get a valid decision; if the model call fails once, retry this once.
             try:
                 model_label, decision = _choose_with_model(image_b64, category, ui_label)
             except Exception:
@@ -636,7 +659,6 @@ def _append_choice(df_choice: pd.DataFrame, path: pathlib.Path):
             if existing == CHOICE_COLS:
                 write_header = False
             else:
-                # rotate the inconsistent file to avoid header drift
                 backup = path.with_suffix(".old.csv")
                 try:
                     if backup.exists():
@@ -655,7 +677,6 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
     products = _products_from_gt(gt)
     case_valid = 1 if len(products) == 8 else 0
 
-    # ------- df_choice: exactly 8 rows per screen -------
     for p in products:
         r_p = int(p.get("row", 0)); c_p = int(p.get("col", 0))
         r_d = int(decision.get("row", -9)); c_d = int(decision.get("col", -9))
@@ -698,12 +719,10 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         if c in df_choice.columns:
             df_choice[c] = pd.to_numeric(df_choice[c], errors="coerce").fillna(0).astype(int)
 
-    # lock column order and append (header written once)
     df_choice = df_choice.reindex(columns=CHOICE_COLS)
     agg_choice = RESULTS_DIR / "df_choice.csv"
-    df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False, encoding="utf-8")
+    df_choice.to_csv(agg_choice, mode="a", header=not agg_choice.exists(), index=False, encoding="utf-8-sig")
 
-    # ------- df_long: one row per screen (for auditing) -------
     rows_long.append({
         "run_id": RUN_ID, "iter": int(set_id[1:]), "category": category, "set_id": set_id, "model": model_label,
         "chosen_title": decision.get("chosen_title"),
@@ -724,7 +743,6 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
                    mode="a", header=not (RESULTS_DIR / "df_long.csv").exists(),
                    index=False, encoding="utf-8")
 
-    # JSONL snapshot (unchanged)
     rec = {"run_id": RUN_ID, "ts": datetime.utcnow().isoformat(),
            "category": category, "set_id": set_id, "model": model_label,
            "groundtruth": gt, "decision": decision}
@@ -734,208 +752,230 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
 
 # ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
-    ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
-    vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
-    if not os.getenv(env_key, ""):
-        raise RuntimeError(f"{env_key} not set for model '{ui_label}'. Set the API key in the Space settings.")
+    global RUN_ID
 
-    _fresh_reset(bool(payload.get("fresh", True)))
-
-    n = int(payload.get("n_iterations", 100) or 100)
-    category = str(payload.get("product") or "product")
-    brand    = str(payload.get("brand") or "")
-    badges   = [str(b) for b in (payload.get("badges") or [])]
-    render_tpl = str(payload.get("render_url") or "")
-    catalog_seed = int(payload.get("catalog_seed", 777))
-
+    _SIM_SEMAPHORE.acquire()
     try:
-        price = float(payload.get("price"))
-    except Exception:
-        price = 0.0
-    currency = str(payload.get("currency") or "£")
+        ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
+        vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
+        if not os.getenv(env_key, ""):
+            raise RuntimeError(f"{env_key} not set for model '{ui_label}'. Set the API key in the Space settings.")
 
-    print(f"[runner] badges from UI: {badges}", flush=True)
+        run_id_from_payload = str(payload.get("job_id") or payload.get("run_id") or RUN_ID)
+        old_run_id = RUN_ID
+        RUN_ID = run_id_from_payload
 
-    driver = _new_driver()
-    try:
-        for i in range(1, n + 1):
-            set_id, model_label, gt, image_b64, decision = _episode(
-                driver=driver,
-                category=category,
-                ui_label=ui_label,
-                render_url_tpl=render_tpl,
-                set_index=i,
-                badges=badges,
-                catalog_seed=catalog_seed,
-                price=price,
-                currency=currency,
-                brand=brand,
-            )
-            _write_outputs(category, model_label, set_id, gt, decision, payload)
-            time.sleep(0.03)
+        _fresh_reset(bool(payload.get("fresh", True)))
+
+        n = int(payload.get("n_iterations", 100) or 100)
+        category = str(payload.get("product") or "product")
+        brand    = str(payload.get("brand") or "")
+        badges   = [str(b) for b in (payload.get("badges") or [])]
+        render_tpl = str(payload.get("render_url") or "")
+        catalog_seed = int(payload.get("catalog_seed", 777))
+
+        try:
+            price = float(payload.get("price"))
+        except Exception:
+            price = 0.0
+        currency = str(payload.get("currency") or "£")
+
+        print(f"[runner] badges from UI: {badges}", flush=True)
+
+        _write_progress(RUN_ID, status="running", done=0, total=n, last_set=None, artifacts={})
+
+        driver = _new_driver()
+        try:
+            for i in range(1, n + 1):
+                set_id, model_label, gt, image_b64, decision = _episode(
+                    driver=driver,
+                    category=category,
+                    ui_label=ui_label,
+                    render_url_tpl=render_tpl,
+                    set_index=i,
+                    badges=badges,
+                    catalog_seed=catalog_seed,
+                    price=price,
+                    currency=currency,
+                    brand=brand,
+                )
+                _write_outputs(category, model_label, set_id, gt, decision, payload)
+                _write_progress(RUN_ID, status="running", done=i, total=n, last_set=set_id, artifacts={})
+                time.sleep(0.03)
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+        from uuid import uuid4
+
+        ts = datetime.utcnow().isoformat() + "Z"
+        job_id = RUN_ID
+
+        effects_path = RESULTS_DIR / "badges_effects.csv"
+        effects_path.parent.mkdir(parents=True, exist_ok=True)
+
+        badge_rows: List[dict] = []
+        artifacts: Dict[str, str] = {}
+
+        choice_path = RESULTS_DIR / "df_choice.csv"
+        print("DEBUG choice_path_exists=", choice_path.exists())
+        if choice_path.exists():
+            try:
+                _df_dbg = pd.read_csv(choice_path)
+                print("DEBUG rows=", len(_df_dbg))
+                print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
+                for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
+                    if _c in _df_dbg.columns:
+                        try:
+                            print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
+                        except Exception:
+                            print(f"DEBUG {_c}_unique= NA")
+            except Exception as e:
+                print("DEBUG could not read df_choice.csv:", repr(e))
+
+        print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
+
+        if choice_path.exists() and choice_path.stat().st_size > 0:
+            try:
+                badge_keys = _normalize_badge_filter(badges)
+                print("DEBUG badge_filter_internal=", badge_keys)
+
+                badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
+                if not isinstance(badge_table, pd.DataFrame):
+                    badge_table = pd.DataFrame(badge_table)
+
+                print("DEBUG badge_table_shape=", tuple(badge_table.shape))
+                print("DEBUG badge_table_cols=", list(badge_table.columns))
+
+                if "badge" in badge_table.columns and not badge_table.empty:
+                    pref_cols = [
+                        "badge", "beta", "p", "sign",
+                        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
+                    ]
+                    cols = [c for c in pref_cols if c in badge_table.columns]
+                    df_rich = badge_table[cols].copy()
+
+                    job_meta = {
+                        "job_id": job_id,
+                        "timestamp": ts,
+                        "product": category,
+                        "brand": brand,
+                        "model": ui_label,
+                        "price": price,
+                        "currency": currency,
+                        "n_iteration": n
+                    }
+                    for k in list(job_meta.keys())[::-1]:
+                        df_rich.insert(0, k, job_meta[k])
+
+                    df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
+                    badge_rows = badge_table.to_dict("records")
+
+                    artifacts["badges_effects"] = str(effects_path)
+                    artifacts["effects_csv"] = str(effects_path)
+                    artifacts["table_badges"] = str(effects_path)
+                else:
+                    print("DEBUG empty_or_missing_badge_table")
+
+                try:
+                    hm = logit_badges.generate_heatmaps(
+                        str(choice_path),
+                        out_dir=str(RESULTS_DIR),
+                        title_prefix=f"{category} · {ui_label}",
+                        file_tag=job_id
+                    )
+                    artifacts.update(hm)
+                except Exception as e:
+                    print("DEBUG generate_heatmaps skipped:", repr(e))
+
+            except Exception as e:
+                print("[logit] skipped due to error:", repr(e), flush=True)
+
+        artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
+        artifacts.setdefault("df_long",   str(RESULTS_DIR / "df_long.csv"))
+        artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
+
+        results: Dict = {
+            "job_id": job_id,
+            "ts": ts,
+            "model_requested": ui_label,
+            "vendor": vendor,
+            "n_iterations": n,
+            "inputs": {
+                "product": category,
+                "brand": brand,
+                "price": price,
+                "currency": currency,
+                "badges": badges,
+            },
+            "artifacts": artifacts,
+            "logit_table_rows": badge_rows,
+        }
+
+        _write_progress(RUN_ID, status="done", done=n, total=n, last_set=f"S{n:04d}", artifacts=artifacts, error=None)
+        RUN_ID = old_run_id
+        return results
+
+    except Exception as e:
+        try:
+            _write_progress(RUN_ID, status="error", error=f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise
     finally:
         try:
-            driver.quit()
+            _SIM_SEMAPHORE.release()
         except Exception:
             pass
 
-    # ----- conditional-logit post-processing (single file: badges_effects.csv) -----
-    from uuid import uuid4
-
-    ts = datetime.utcnow().isoformat() + "Z"
-    job_id = payload.get("job_id") or f"run-{uuid4().hex[:8]}"
-
-    effects_path = RESULTS_DIR / "badges_effects.csv"
-    effects_path.parent.mkdir(parents=True, exist_ok=True)
-
-    badge_rows: List[dict] = []
-    artifacts: Dict[str, str] = {}
-
-    choice_path = RESULTS_DIR / "df_choice.csv"
-    print("DEBUG choice_path_exists=", choice_path.exists())
-    if choice_path.exists():
-        try:
-            _df_dbg = pd.read_csv(choice_path)
-            print("DEBUG rows=", len(_df_dbg))
-            print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
-            for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
-                if _c in _df_dbg.columns:
-                    try:
-                        print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
-                    except Exception:
-                        print(f"DEBUG {_c}_unique= NA")
-        except Exception as e:
-            print("DEBUG could not read df_choice.csv:", repr(e))
-
-    print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
-
-    if choice_path.exists() and choice_path.stat().st_size > 0:
-        try:
-            badge_keys = _normalize_badge_filter(badges)
-            print("DEBUG badge_filter_internal=", badge_keys)
-    
-            badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
-            if not isinstance(badge_table, pd.DataFrame):
-                badge_table = pd.DataFrame(badge_table)
-    
-            print("DEBUG badge_table_shape=", tuple(badge_table.shape))
-            print("DEBUG badge_table_cols=", list(badge_table.columns))
-    
-            if "badge" in badge_table.columns and not badge_table.empty:
-                pref_cols = [
-                    "badge", "beta", "p", "sign",
-                    "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
-                ]
-                cols = [c for c in pref_cols if c in badge_table.columns]
-                df_rich = badge_table[cols].copy()
-    
-                job_meta = {
-                    "job_id": job_id,
-                    "timestamp": ts,
-                    "product": category,
-                    "brand": brand,
-                    "model": ui_label,
-                    "price": price,
-                    "currency": currency,
-                    "n_iteration": n
-                }
-                for k in list(job_meta.keys())[::-1]:
-                    df_rich.insert(0, k, job_meta[k])
-    
-                df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
-                badge_rows = badge_table.to_dict("records")
-    
-                artifacts["badges_effects"] = str(effects_path)
-                artifacts["effects_csv"] = str(effects_path)
-                artifacts["table_badges"] = str(effects_path)
-            else:
-                print("DEBUG empty_or_missing_badge_table")
-    
-            # Delegate heatmap generation to logit_badges (logit owns plotting)
-            try:
-                hm = logit_badges.generate_heatmaps(
-                    str(choice_path),
-                    out_dir=str(RESULTS_DIR),
-                    title_prefix=f"{category} · {ui_label}",
-                    file_tag=job_id
-                )
-                artifacts.update(hm)
-            except Exception as e:
-                print("DEBUG generate_heatmaps skipped:", repr(e))
-    
-        except Exception as e:
-            print("[logit] skipped due to error:", repr(e), flush=True)
-
-
-    # Always expose core file locations
-    artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
-    artifacts.setdefault("df_long",   str(RESULTS_DIR / "df_long.csv"))
-    artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
-
-    results: Dict = {
-        "job_id": job_id,
-        "ts": ts,
-        "model_requested": ui_label,
-        "vendor": vendor,
-        "n_iterations": n,
-        "inputs": {
-            "product": category,
-            "brand": brand,
-            "price": price,
-            "currency": currency,
-            "badges": badges,
-        },
-        "artifacts": artifacts,
-        "logit_table_rows": badge_rows,
-    }
-    return results
-
-
 
 if __name__ == "__main__":
-    # Manual driver: read jobs/*.json and process
     jobs_dir = pathlib.Path("jobs")
     if jobs_dir.exists():
         for p in sorted(jobs_dir.glob("job-*.json")):
             payload = json.loads(p.read_text(encoding="utf-8"))
-            res = run_job_sync(payload)
-            (RESULTS_DIR / f"{payload.get('job_id','job')}.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
-            payload["status"] = "completed"
-            p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                res = run_job_sync(payload)
+                (RESULTS_DIR / f"{payload.get('job_id','job')}.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+                payload["status"] = "completed"
+                p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                _write_progress(payload.get("job_id","job"), status="done", done=payload.get("n_iterations", 0), total=payload.get("n_iterations", 0), artifacts=res.get("artifacts", {}))
+            except Exception as e:
+                payload["status"] = f"error: {type(e).__name__}: {e}"
+                p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                _write_progress(payload.get("job_id","job"), status="error", error=f"{type(e).__name__}: {e}")
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
 
 
 # ======================= NEW: submit-and-poll async wrapper =======================
-# Keeps run_job_sync(...) unchanged. Use from your UI to avoid long-held streams.
-
-from dataclasses import dataclass, field  # NEW
-import threading                           # NEW
-import uuid                                # NEW
+from dataclasses import dataclass, field
+import uuid
 
 @dataclass
-class _JobState:  # NEW
+class _JobState:
     job_id: str
-    status: str = "queued"       # queued | running | done | error
+    status: str = "queued"
     start_ts: float = field(default_factory=time.time)
     end_ts: float | None = None
     results_json: str | None = None
     error: str | None = None
 
-_JOBS: Dict[str, _JobState] = {}           # NEW
-_JLOCK = threading.Lock()                  # NEW
-_TTL_SEC = 6 * 60 * 60                     # NEW
+_JOBS: Dict[str, _JobState] = {}
+_JLOCK = threading.Lock()
+_TTL_SEC = 6 * 60 * 60
 
-def _gc_jobs(now: float | None = None) -> None:  # NEW
+def _gc_jobs(now: float | None = None) -> None:
     t = now or time.time()
     with _JLOCK:
         stale = [k for k, v in _JOBS.items() if v.end_ts and (t - v.end_ts) > _TTL_SEC]
         for k in stale:
             _JOBS.pop(k, None)
 
-def submit_job_async(payload: Dict) -> Dict:  # NEW
-    """Start a run in a background thread and return immediately with job_id."""
+def submit_job_async(payload: Dict) -> Dict:
     jid = str(payload.get("job_id") or f"job-{uuid.uuid4().hex[:8]}")
     payload = dict(payload)
     payload["job_id"] = jid
@@ -961,14 +1001,14 @@ def submit_job_async(payload: Dict) -> Dict:  # NEW
     threading.Thread(target=_worker, name=f"agentix-run-{jid}", daemon=True).start()
     return {"ok": True, "job_id": jid, "status": "running"}
 
-def poll_job(job_id: str) -> Dict:  # NEW
+def poll_job(job_id: str) -> Dict:
     with _JLOCK:
         js = _JOBS.get(job_id)
         if not js:
             return {"ok": False, "error": "unknown_job"}
         return {"ok": True, "job_id": job_id, "status": js.status, "error": js.error}
 
-def fetch_job(job_id: str) -> Dict:  # NEW
+def fetch_job(job_id: str) -> Dict:
     with _JLOCK:
         js = _JOBS.get(job_id)
         if not js:
@@ -976,4 +1016,3 @@ def fetch_job(job_id: str) -> Dict:  # NEW
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
-
