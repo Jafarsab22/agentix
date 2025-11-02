@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*- 
 """
 Agentix — Vision Runner (jpeg_b64) for two-stage design
-Version: v1.10 (2025-10-31) — patched
+Version: v1.11 (2025-11-2) — patched
 
 Key assumptions and alignment
     1) One choice per screen; each screen has exactly 8 alternatives (2×4).
@@ -24,6 +24,9 @@ Patch summary
       - More generous tokens + defensive parsing in ALL vendor calls (OpenAI, Anthropic, Gemini).
       - reconcile(...) no longer coerces missing/invalid row/col to 0; if unresolved, sets row=col=-1.
     • Removes runner-side heatmap generation; heatmaps are owned by logit_badges only.
+NEW
+    • Submit-and-poll async wrapper added at bottom: submit_job_async(), poll_job(), fetch_job().
+      This avoids long-held HTTP streams; run_job_sync(...) is unchanged.
 """
 
 from __future__ import annotations
@@ -291,8 +294,8 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
 
 # --- Robust POST with retries (OpenAI) ---
 def _post_with_retries_openai(url, headers, payload,
-                              timeout=(15, 300),       # (connect, read)
-                              max_attempts=6,
+                              timeout=(90, 1800),       # (connect, read)
+                              max_attempts=20,
                               backoff_base=0.75,
                               backoff_cap=12.0):
     import random
@@ -386,7 +389,7 @@ def call_openai(image_b64, category, model_name=None):
     return args
 
 # ---------- Anthropic ----------
-def _post_with_retries(url, headers, payload, timeout=120, attempts=5, backoff=0.9):
+def _post_with_retries(url, headers, payload, timeout=1200, attempts=5, backoff=0.9):
     import random
     for i in range(attempts):
         try:
@@ -904,3 +907,72 @@ if __name__ == "__main__":
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
 
 
+# ======================= NEW: submit-and-poll async wrapper =======================
+# Keeps run_job_sync(...) unchanged. Use from your UI to avoid long-held streams.
+
+from dataclasses import dataclass, field  # NEW
+import threading                           # NEW
+import uuid                                # NEW
+
+@dataclass
+class _JobState:  # NEW
+    job_id: str
+    status: str = "queued"       # queued | running | done | error
+    start_ts: float = field(default_factory=time.time)
+    end_ts: float | None = None
+    results_json: str | None = None
+    error: str | None = None
+
+_JOBS: Dict[str, _JobState] = {}           # NEW
+_JLOCK = threading.Lock()                  # NEW
+_TTL_SEC = 6 * 60 * 60                     # NEW
+
+def _gc_jobs(now: float | None = None) -> None:  # NEW
+    t = now or time.time()
+    with _JLOCK:
+        stale = [k for k, v in _JOBS.items() if v.end_ts and (t - v.end_ts) > _TTL_SEC]
+        for k in stale:
+            _JOBS.pop(k, None)
+
+def submit_job_async(payload: Dict) -> Dict:  # NEW
+    """Start a run in a background thread and return immediately with job_id."""
+    jid = str(payload.get("job_id") or f"job-{uuid.uuid4().hex[:8]}")
+    payload = dict(payload)
+    payload["job_id"] = jid
+    js = _JobState(job_id=jid, status="running")
+    with _JLOCK:
+        _JOBS[jid] = js
+
+    def _worker():
+        try:
+            res = run_job_sync(payload)
+            with _JLOCK:
+                js.status = "done"
+                js.results_json = json.dumps(res, ensure_ascii=False)
+                js.end_ts = time.time()
+        except Exception as e:
+            with _JLOCK:
+                js.status = "error"
+                js.error = f"{type(e).__name__}: {e}"
+                js.end_ts = time.time()
+        finally:
+            _gc_jobs()
+
+    threading.Thread(target=_worker, name=f"agentix-run-{jid}", daemon=True).start()
+    return {"ok": True, "job_id": jid, "status": "running"}
+
+def poll_job(job_id: str) -> Dict:  # NEW
+    with _JLOCK:
+        js = _JOBS.get(job_id)
+        if not js:
+            return {"ok": False, "error": "unknown_job"}
+        return {"ok": True, "job_id": job_id, "status": js.status, "error": js.error}
+
+def fetch_job(job_id: str) -> Dict:  # NEW
+    with _JLOCK:
+        js = _JOBS.get(job_id)
+        if not js:
+            return {"ok": False, "error": "unknown_job"}
+        if js.status != "done":
+            return {"ok": False, "error": "not_ready", "status": js.status}
+        return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
