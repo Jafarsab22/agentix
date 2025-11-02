@@ -762,6 +762,7 @@ def _submit_async_and_start(product, brand, model, badges, price, currency, n_it
         gr.update(value="{}"),
         gr.update(value=jid)
     )
+    
 
 
 @_catch_and_report
@@ -844,20 +845,22 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[preview_view],
     )
 
-    # Async submit – returns job_id_state
+    # submit → start polling every 2s
     chain = submit_btn.click(
         fn=_submit_async_and_start,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
         outputs=[job_id_box, status_md, results_md, results_json, job_id_state],
+        concurrency_limit=1,         # <- per-listener limit (replaces concurrency_count)
     )
     
-    # Start the periodic poll AFTER submit; runs every 2s while job_id_state is non-empty
     chain.then(
         fn=_poll_tick_state,
         inputs=[job_id_state],
         outputs=[results_md, results_json, status_md, job_id_state],
         every=2.0,
+        concurrency_limit=1,         # <- safe: one poll at a time
     )
+
 
 
     # Iteration controls
@@ -912,6 +915,11 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    demo.queue(concurrency_count=4, max_size=64)  # needed for periodic events on some builds
-    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+    demo.queue()                                  # <- no arguments
+    demo.launch(server_name="0.0.0.0",
+                server_port=port,
+                show_error=True,
+                max_threads=40)                    # optional tuning
+
+
 
