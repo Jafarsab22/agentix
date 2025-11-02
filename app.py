@@ -9,63 +9,47 @@ from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- async job runner (no UI stream timeouts) ----------------
-import threading, uuid, json, time
+# ---------- Async job queue (breaks the 900s ceiling) ----------
+import threading, uuid, json
 
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
 def _bg_run_job(job_id: str, args_tuple: tuple):
-    """Runs your existing run_now(...) in a background thread and stores outputs."""
     try:
-        msg, results_json = run_now(*args_tuple)   # uses your current function
+        msg, results_json = run_now(*args_tuple)  # your existing long function
         with _JOBS_LOCK:
-            _JOBS[job_id]["status"] = "done"
-            _JOBS[job_id]["msg"] = msg
-            _JOBS[job_id]["results_json"] = results_json
+            _JOBS[job_id] = {"status": "done", "msg": msg, "results_json": results_json}
     except Exception as e:
         with _JOBS_LOCK:
-            _JOBS[job_id]["status"] = "error"
-            _JOBS[job_id]["error"] = f"{type(e).__name__}: {e}"
+            _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
-def submit_job_async(product_name: str,
-                     brand_name: str,
-                     model_name: str,
-                     badges: list[str],
-                     price,
-                     currency: str,
-                     n_iterations):
-    """
-    Submit the long run without holding the HTTP connection open.
-    Returns {"ok":True,"job_id":...}.
-    """
-    job_id = f"job-{uuid.uuid4().hex[:8]}"
+def submit_job_async(product_name, brand_name, model_name, badges, price, currency, n_iterations):
+    jid = f"job-{uuid.uuid4().hex[:8]}"
     args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
     with _JOBS_LOCK:
-        _JOBS[job_id] = {"status": "queued"}
-    th = threading.Thread(target=_bg_run_job, args=(job_id, args_tuple), name=f"runner-{job_id}", daemon=True)
-    th.start()
-    return {"ok": True, "job_id": job_id}
+        _JOBS[jid] = {"status": "queued"}
+    threading.Thread(target=_bg_run_job, args=(jid, args_tuple), name=f"runner-{jid}", daemon=True).start()
+    return {"ok": True, "job_id": jid}
 
 def poll_job(job_id: str):
-    """Lightweight status check."""
     with _JOBS_LOCK:
         info = _JOBS.get(job_id)
-        if not info:
-            return {"ok": False, "status": "unknown"}
-        return {"ok": True, "status": info.get("status", "queued")}
+    if not info:
+        return {"ok": False, "status": "unknown"}
+    return {"ok": True, "status": info["status"]}
 
 def fetch_job(job_id: str):
-    """Fetch final outputs when status == 'done' (or error info)."""
     with _JOBS_LOCK:
         info = _JOBS.get(job_id)
-        if not info:
-            return {"ok": False, "status": "unknown"}
-        if info.get("status") == "done":
-            return {"ok": True, "status": "done", "msg": info["msg"], "results_json": info["results_json"]}
-        if info.get("status") == "error":
-            return {"ok": False, "status": "error", "error": info.get("error", "unknown")}
-        return {"ok": True, "status": info.get("status", "queued")}
+    if not info:
+        return {"ok": False, "status": "unknown"}
+    if info["status"] == "done":
+        return {"ok": True, "status": "done", "msg": info["msg"], "results_json": info["results_json"]}
+    if info["status"] == "error":
+        return {"ok": False, "status": "error", "error": info["error"]}
+    return {"ok": True, "status": info["status"]}
+
 
 def _catch_and_report(fn):
     """Wrap a Gradio handler, show a readable error, and log to results/ + console."""
@@ -443,7 +427,6 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         emp_path = artifacts.get("position_heatmap_empirical", "")
         prob_path = artifacts.get("position_heatmap_prob", "") or artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
 
-        # Clear, distinct captions; reaffirm darker = higher selection
         if emp_path:
             msg_parts.append(
                 _embed_png(
@@ -466,7 +449,6 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         msg = "No badge effects computed."
 
     # ---------------- [NEW] Fire-and-forget persistence of artifacts + DB ----------------
-    # Runs in a daemon thread so UI disconnects/timeouts do not block saving to your server/DB.
     try:
         import threading, base64 as _b64, requests, pathlib as _pl
 
@@ -515,7 +497,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         results.setdefault("artifacts", {})["agentix_persist_error_init"] = str(_bg_e)
     # ---------------- [END NEW] ----------------------------------------------------------
 
-    # (Keep the original best-effort DB call as well; harmless if it runs twice server-side.)
+    # Original best-effort DB call (safe if it runs twice server-side).
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -532,6 +514,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
     import json
     return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
 
 
 
@@ -875,6 +858,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
