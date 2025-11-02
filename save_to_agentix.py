@@ -1,16 +1,18 @@
 # save_to_agentix.py  —  Agentix DB + artifact persistence helper
-# v1.10 (2025-11-02)
-#   • Always upload artifacts (df_choice.csv, badges_effects.csv, heatmap PNG)
-#     to Hostinger even when a run does not meet DB persistence criteria.
-#   • DB persistence policy unchanged (requires any significant badge OR
-#     n_iterations ≥ 250).
-#   • New: robust df_choice.csv discovery — if the path is not present in
-#     results/artifacts, we search common locations for the latest
-#     df_choice*.csv and upload it.
+# v1.11 (2025-11-02)
+# Changes (v1.11):
+#   • Robust artifact discovery aligned with the new runner keys:
+#       df_choice, effects_csv, badges_effects, table_badges,
+#       position_heatmap_empirical, position_heatmap_prob,
+#       position_heatmap, position_heatmap_png.
+#   • Absolute path resolution + existence checks before upload.
+#   • Return 'files_tried' for quick debugging.
+#   • Optional debug mode: set AGENTIX_DEBUG_FILES=1 to call ?debug=1.
 
 import base64
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,35 +139,72 @@ def _file_to_b64(path: str | Path) -> tuple[str, str] | None:
         return None
 
 
+def _resolve(p: str | Path | None) -> str | None:
+    if not p:
+        return None
+    try:
+        rp = str(Path(p).resolve())
+        return rp if Path(rp).exists() else None
+    except Exception:
+        return None
+
+
 def _collect_artifact_paths(results: Dict[str, Any], payload: Dict[str, Any]) -> List[str]:
-    a = results.get("artifacts", {})
-    cands = [
-        results.get("df_choice_path"),
-        a.get("df_choice_path"),
-        results.get("choice_csv_path"),
-        a.get("choice_csv_path"),
-        a.get("effects_csv"),
-        a.get("position_heatmap_empirical"),
+    """
+    Gather candidate files from both the new and legacy keys, resolve to absolute
+    paths, keep only existing files, and filter by extension to match the PHP
+    allow-list (csv, png).
+    """
+    a = (results.get("artifacts") or {}) if isinstance(results, dict) else {}
+
+    keys_new = [
+        "df_choice",
+        "effects_csv",
+        "badges_effects",
+        "table_badges",
+        "position_heatmap_empirical",
+        "position_heatmap_png",
+    ]
+    keys_old = [
+        "df_choice_path",
+        "choice_csv_path",
     ]
 
-    # If df_choice path is missing, search common locations for the latest df_choice*.csv
-    have_df = any(p and str(p).lower().endswith('.csv') and 'df_choice' in str(p).lower() for p in cands)
-    if not have_df:
-        patterns = ['df_choice*.csv', 'results/df_choice*.csv', '**/df_choice*.csv']
-        latest = None
-        latest_mtime = -1
-        for pat in patterns:
-            for fp in glob(pat, recursive=True):
-                try:
-                    mt = Path(fp).stat().st_mtime
-                    if mt > latest_mtime:
-                        latest, latest_mtime = fp, mt
-                except Exception:
-                    pass
-        if latest:
-            cands.insert(0, latest)
+    cands: List[str | None] = []
+    # New keys first
+    for k in keys_new:
+        cands.append(a.get(k))
+    # Legacy fallbacks
+    for k in keys_old:
+        cands.append(results.get(k))
+        cands.append(a.get(k))
 
-    return [str(p) for p in cands if p]
+    # Also accept anything explicit on results root for CSVs
+    for k in ("effects_csv", "df_choice_path", "choice_csv_path"):
+        cands.append(results.get(k))
+
+    # If df_choice is still missing, search common locations
+    have_df = any(p and "df_choice" in str(p).lower() for p in cands if p)
+    if not have_df:
+        for pat in ("results/df_choice*.csv", "df_choice*.csv", "**/df_choice*.csv"):
+            for fp in glob(pat, recursive=True):
+                cands.append(fp)
+
+    # Resolve, de-dup, filter by extension (php only accepts csv/png)
+    exts_ok = {".csv", ".png"}
+    out: List[str] = []
+    seen = set()
+    for p in cands:
+        rp = _resolve(p)
+        if not rp:
+            continue
+        ext = Path(rp).suffix.lower()
+        if ext not in exts_ok:
+            continue
+        if rp not in seen:
+            seen.add(rp)
+            out.append(rp)
+    return out
 
 
 def _upload_artifacts(base_url: str, run_id: str, files: List[str]) -> Dict[str, Any]:
@@ -176,9 +215,16 @@ def _upload_artifacts(base_url: str, run_id: str, files: List[str]) -> Dict[str,
             fn, b64 = pair
             packed.append({"filename": fn, "data_base64": b64})
     if not packed:
-        return {"ok": False, "reason": "no_files"}
+        return {"ok": False, "reason": "no_files", "files_tried": files}
+
     url = f"{base_url.rstrip('/')}/sendAgentixFiles.php"
-    return _post_json(url, {"run_id": run_id, "files": packed})
+    # Optional verbosity: ?debug=1
+    if str(os.getenv("AGENTIX_DEBUG_FILES", "")).strip().lower() in ("1", "true", "yes"):
+        url += "?debug=1"
+
+    res = _post_json(url, {"run_id": run_id, "files": packed})
+    res["files_tried"] = files
+    return res
 
 
 # ---------- main entry ----------
@@ -218,10 +264,9 @@ def persist_results_if_qualify(
     upload_info = None
     try:
         artifact_paths = _collect_artifact_paths(results, payload)
-        if artifact_paths:
-            upload_info = _upload_artifacts(base_url, run_id, artifact_paths)
+        upload_info = _upload_artifacts(base_url, run_id, artifact_paths)
     except Exception as e:
-        upload_info = {"ok": False, "error": str(e)}
+        upload_info = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     # If run doesn't meet policy, return early but include upload_info
     if not (has_sig or n_iterations >= 250):
