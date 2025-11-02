@@ -17,7 +17,7 @@ _JOBS_LOCK = threading.Lock()
 
 def _bg_run_job(job_id: str, args_tuple: tuple):
     try:
-        msg, results_json = run_now(*args_tuple)  # your existing long function
+        msg, results_json = (*args_tuple)  # your existing long function
         with _JOBS_LOCK:
             _JOBS[job_id] = {"status": "done", "msg": msg, "results_json": results_json}
     except Exception as e:
@@ -858,6 +858,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
