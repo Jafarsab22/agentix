@@ -467,44 +467,31 @@ def save_position_heatmap(path_csv: str,
 
 # --------- convenience wrapper so logit_badges owns heatmap creation ---------
 
-def generate_heatmaps(path_csv: str,
-                      out_dir: str = "results",
-                      title_prefix: str | None = None,
-                      file_tag: str | None = None) -> dict:
-    """
-    Create both heatmaps and return their file paths in a dict.
-    Keeps generation inside logit_badges while letting callers delegate.
-
-    Returns
-    -------
-    {
-      "position_heatmap_empirical": "<path>",
-      "position_heatmap_prob": "<path>",
-      "position_heatmap": "<path>",           # alias (probability)
-      "position_heatmap_png": "<path>"        # alias (probability)
-    }
-    """
-   def generate_heatmaps(path_csv: str,
-                      out_dir: str = "results",
-                      title_prefix: str | None = None,
-                      file_tag: str | None = None) -> dict:
+def generate_heatmaps(
+    path_csv: str,
+    out_dir: str = "results",
+    title_prefix: str | None = None,
+    file_tag: str | None = None,
+) -> dict:
     """
     Create ONLY the empirical heatmap and return its file path.
-    We deliberately use a fixed filename (no suffix); your PHP endpoint
-    will prefix run_id so filenames don’t duplicate the id.
+    We use a fixed filename (no suffix); your PHP uploader will prefix run_id,
+    preventing job-id duplication.
     """
     od = pathlib.Path(out_dir)
     od.mkdir(parents=True, exist_ok=True)
 
-    # Fixed name; no tag/suffix to avoid duplication when PHP prefixes run_id
+    # Fixed name; no tag/suffix here
     emp_path = od / "heatmap_empirical.png"
     emp_title = f"{title_prefix} — empirical" if title_prefix else None
 
     emp_p = save_position_heatmap_empirical(path_csv, str(emp_path), title=emp_title)
 
-    # Keep backward-compatible keys but all point to the empirical image
+    # Backward-compatible aliases
     return {
         "position_heatmap_empirical": emp_p,
         "position_heatmap": emp_p,
         "position_heatmap_png": emp_p,
     }
+
+
