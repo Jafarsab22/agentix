@@ -52,10 +52,10 @@ import random
 # ------------------------------
 
 _LOG_DELTAS = (
-    -0.3567, -0.2231, -0.1053, -0.0513,
-     0.0513,  0.1053,  0.2231,  0.3567
+-0.2000, -0.1429, -0.0857, -0.0286,
+0.0286, 0.0857, 0.1429, 0.2000,
 )
-_PRICE_MULTIPLIERS = tuple(math.exp(x) for x in _LOG_DELTAS)  # ~ [×0.70 … ×1.43]
+_PRICE_MULTIPLIERS = tuple(math.exp(x) for x in _LOG_DELTAS) # ≈ [×0.82 … ×1.22]
 
 @dataclass(frozen=True)
 class Seeds:
