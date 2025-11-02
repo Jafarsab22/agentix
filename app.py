@@ -1,23 +1,28 @@
-# app.py 
+# app.py
 import json, uuid, os, time, pathlib, csv, requests
 from datetime import datetime
 import gradio as gr
 from agent_runner import run_job_sync
+from agent_runner import submit_job_async as runner_submit_job_async
+from agent_runner import poll_job as runner_poll_job
+from agent_runner import fetch_job as runner_fetch_job
 import traceback, logging
 from html import escape
-from urllib.parse import quote   
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
 # ---------- Async job queue (breaks the 900s ceiling) ----------
-import threading, uuid, json
+# (Kept intact; UI below uses agent_runner's async wrappers via runner_* aliases)
+import threading, uuid, json as _json_shadow
 
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
 def _bg_run_job(job_id: str, args_tuple: tuple):
     try:
-        msg, results_json = (*args_tuple)  # your existing long function
+        # NOTE: this local queue is retained but not wired to the UI; prefer runner_*.
+        msg, results_json = (*args_tuple)  # placeholder; original user draft
         with _JOBS_LOCK:
             _JOBS[job_id] = {"status": "done", "msg": msg, "results_json": results_json}
     except Exception as e:
@@ -66,8 +71,8 @@ def _catch_and_report(fn):
             print(tb, flush=True)
             logging.exception("Gradio handler failed")
             msg = f"❌ {type(e).__name__}: {e}\n\n```\n{tb}\n```"
-            # Handlers return (markdown, json); pad if needed
-            return (msg, "{}") if fn.__name__ in ("run_now",) else msg
+            # Handlers that return (markdown, json); pad if needed
+            return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui") else msg
     return _inner
 
 
@@ -276,6 +281,136 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     return str(csv_path), str(html_path)
 
 
+# ---------- Shared formatter for sync + async paths ----------
+
+def _format_results_from_dict(results: dict) -> tuple[str, dict]:
+    rows = results.get("logit_table_rows") or []
+    inputs = results.get("inputs") or {}
+    model_name = str(results.get("model_requested") or inputs.get("model") or "model")
+    product_name = str(inputs.get("product") or "")
+    artifacts = results.setdefault("artifacts", {}) or {}
+
+    def _fmt(x, nd=3):
+        try:
+            v = float(x)
+            if v != v:
+                return "—"
+            return f"{v:.{nd}f}"
+        except Exception:
+            return "—"
+
+    def _effect_symbol(s):
+        s = (s or "0").strip()
+        if s in ("↑", "+"):
+            return "+"
+        if s in ("↓", "-"):
+            return "-"
+        return "0"
+
+    sec_map = {"Position effects": [], "Badge/lever effects": [], "Attribute effects": []}
+    for r in rows:
+        sec = r.get("section")
+        b = str(r.get("badge", ""))
+        if not sec:
+            if b in ("Row 1", "Column 1", "Column 2", "Column 3"):
+                sec = "Position effects"
+            elif b == "ln(price)":
+                sec = "Attribute effects"
+            else:
+                sec = "Badge/lever effects"
+        sec_map.setdefault(sec, [])
+        sec_map[sec].append(r)
+
+    order_pos = {"Row 1": 0, "Column 1": 1, "Column 2": 2, "Column 3": 3}
+    order_attr = {"ln(price)": 0}
+
+    def _render_section(title, rlist):
+        if not rlist:
+            return ""
+        if title == "Position effects":
+            rlist = sorted(rlist, key=lambda r: order_pos.get(str(r.get("badge", "")), 99))
+        elif title == "Attribute effects":
+            rlist = sorted(rlist, key=lambda r: order_attr.get(str(r.get("badge", "")), 99))
+        lines = [
+            f"\n\n{title}\n",
+            "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        ]
+        for r in rlist:
+            lines.append(
+                f"| {r.get('badge','')} | "
+                f"{_fmt(r.get('beta'))} | "
+                f"{_fmt(r.get('se'))} | "
+                f"{_fmt(r.get('p', r.get('p_value')), nd=4)} | "
+                f"{_fmt(r.get('q_bh'), nd=4)} | "
+                f"{_fmt(r.get('odds_ratio'))} | "
+                f"{_fmt(r.get('ci_low'))} | "
+                f"{_fmt(r.get('ci_high'))} | "
+                f"{_fmt(r.get('ame_pp'))} | "
+                f"{_fmt(r.get('evid_score'))} | "
+                f"{_fmt(r.get('price_eq'))} | "
+                f"{_effect_symbol(r.get('sign'))} |"
+            )
+        return "\n".join(lines)
+
+    title_block = f"*Model = {model_name}*\n\n*Product = {product_name or '(enter product name)'}*\n"
+    if rows:
+        header = "### Estimates of the Conditional Logit Regression\n\n" + title_block
+        msg_parts = [header]
+        msg_parts.append(_render_section("Position effects", sec_map.get("Position effects", [])))
+        msg_parts.append(_render_section("Badge/lever effects", sec_map.get("Badge/lever effects", [])))
+        msg_parts.append(_render_section("Attribute effects", sec_map.get("Attribute effects", [])))
+
+        glossary_md = (
+            "\n\n*Glossary*\n\n"
+            "| Column | Meaning |\n"
+            "|---|---|\n"
+            "| β | Log-odds coefficient for the lever (positive increases choice odds). |\n"
+            "| SE | Standard error of β. |\n"
+            "| p | Two-sided p-value for H₀: β = 0. |\n"
+            "| q_bh | Benjamini–Hochberg FDR-adjusted p across the displayed rows. |\n"
+            "| Odds ratio | exp(β); multiplicative change in odds. |\n"
+            "| CI low / CI high | 95% confidence interval bounds for the odds ratio. |\n"
+            "| AME (pp) | Average marginal effect in percentage points. |\n"
+            "| Evidence | 1 − p (compact signal strength in [0,1]). |\n"
+            "| Price-eq λ | Effect scaled by |β_price|; blank for ln(price). |\n"
+            "| Effect | Sign of β at p < .05: +, −, else 0. |\n"
+        )
+        msg_parts.append(glossary_md)
+
+        def _embed_png(path, alt_text, caption):
+            try:
+                with open(path, "rb") as _f:
+                    import base64 as _b64
+                    _b = _b64.b64encode(_f.read()).decode("utf-8")
+                return (
+                    f'\n\n<img alt="{alt_text}" src="data:image/png;base64,{_b}" '
+                    f'style="max-width:560px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
+                    f"\n{caption}\n"
+                )
+            except Exception:
+                return ""
+
+        emp_path = artifacts.get("position_heatmap_empirical", "")
+        prob_path = artifacts.get("position_heatmap_prob", "") or artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
+        if emp_path:
+            msg_parts.append(_embed_png(
+                emp_path,
+                "Empirical selection heatmap (darker = higher observed selection rate)",
+                "*Empirical selection heatmap (darker = higher observed selection rate)*"
+            ))
+        if prob_path:
+            msg_parts.append(_embed_png(
+                prob_path,
+                "Model-implied probability heatmap (darker = higher predicted selection probability)",
+                "*Model-implied probability heatmap (darker = higher predicted selection probability)*"
+            ))
+
+        return "\n".join([p for p in msg_parts if p]), results
+
+    return "No badge effects computed.", results
+
+
 @_catch_and_report
 def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
@@ -302,151 +437,17 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
     results = run_job_sync(payload)
 
-    # ---- Render grouped tables (Position, Badge/lever, Attribute) ----
+    # Shared formatter
+    msg, _results_obj = _format_results_from_dict(results)
+
+    # ---- Local export (CSV/HTML) – unchanged
     rows = results.get("logit_table_rows") or []
-
-    def _fmt(x, nd=3):
-        try:
-            v = float(x)
-            if v != v:
-                return "—"
-            return f"{v:.{nd}f}"
-        except Exception:
-            return "—"
-
-    def _effect_symbol(s):
-        s = (s or "0").strip()
-        if s in ("↑", "+"):
-            return "+"
-        if s in ("↓", "-"):
-            return "-"
-        return "0"
-
-    # Partition rows into sections (robust to older payloads without 'section')
-    sec_map = {"Position effects": [], "Badge/lever effects": [], "Attribute effects": []}
-    for r in rows:
-        sec = r.get("section")
-        b = str(r.get("badge", ""))
-        if not sec:
-            if b in ("Row 1", "Column 1", "Column 2", "Column 3"):
-                sec = "Position effects"
-            elif b == "ln(price)":
-                sec = "Attribute effects"
-            else:
-                sec = "Badge/lever effects"
-        sec_map.setdefault(sec, [])
-        sec_map[sec].append(r)
-
-    # Order within each section
-    order_pos = {"Row 1": 0, "Column 1": 1, "Column 2": 2, "Column 3": 3}
-    order_attr = {"ln(price)": 0}
-
-    def _render_section(title, rlist):
-        if not rlist:
-            return ""
-        if title == "Position effects":
-            rlist = sorted(rlist, key=lambda r: order_pos.get(str(r.get("badge", "")), 99))
-        elif title == "Attribute effects":
-            rlist = sorted(rlist, key=lambda r: order_attr.get(str(r.get("badge", "")), 99))
-        lines = [
-            f"\n\n{title}\n",
-            "| Badge | β | SE | p | q_bh | Odds ratio | CI low | CI high | AME (pp) | Evidence | Price-eq λ | Effect |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
-        ]
-        for r in rlist:
-            lines.append(
-                f"| {r.get('badge','')} | "
-                f"{_fmt(r.get('beta'))} | "
-                f"{_fmt(r.get('se'))} | "
-                f"{_fmt(r.get('p'), nd=4)} | "
-                f"{_fmt(r.get('q_bh'), nd=4)} | "
-                f"{_fmt(r.get('odds_ratio'))} | "
-                f"{_fmt(r.get('ci_low'))} | "
-                f"{_fmt(r.get('ci_high'))} | "
-                f"{_fmt(r.get('ame_pp'))} | "
-                f"{_fmt(r.get('evid_score'))} | "
-                f"{_fmt(r.get('price_eq'))} | "
-                f"{_effect_symbol(r.get('sign'))} |"
-            )
-        return "\n".join(lines)
-
-    # Title block (model + product)
-    title_block = (
-        f"*Model = {model_name}*\n\n"
-        f"*Product = {product_name or '(enter product name)'}*\n"
-    )
-
-    if rows:
-        header = "### Estimates of the Conditional Logit Regression\n\n" + title_block
-        msg_parts = [header]
-        msg_parts.append(_render_section("Position effects", sec_map.get("Position effects", [])))
-        msg_parts.append(_render_section("Badge/lever effects", sec_map.get("Badge/lever effects", [])))
-        msg_parts.append(_render_section("Attribute effects", sec_map.get("Attribute effects", [])))
-
-        # ---- Glossary (placed immediately after Attribute effects) ----
-        glossary_md = (
-            "\n\n*Glossary*\n\n"
-            "| Column | Meaning |\n"
-            "|---|---|\n"
-            "| β | Log-odds coefficient for the lever (positive increases choice odds). |\n"
-            "| SE | Standard error of β. |\n"
-            "| p | Two-sided p-value for H₀: β = 0. |\n"
-            "| q_bh | Benjamini–Hochberg FDR-adjusted p across the displayed rows. |\n"
-            "| Odds ratio | exp(β); multiplicative change in odds. |\n"
-            "| CI low / CI high | 95% confidence interval bounds for the odds ratio. |\n"
-            "| AME (pp) | Average marginal effect in percentage points. |\n"
-            "| Evidence | 1 − p (compact signal strength in [0,1]). |\n"
-            "| Price-eq λ | Effect scaled by |β_price|; blank for ln(price). |\n"
-            "| Effect | Sign of β at p < .05: +, −, else 0. |\n"
-        )
-        msg_parts.append(glossary_md)
-
-        # Local export (CSV/HTML) – unchanged
-        csv_path, html_path = _export_badge_effects(rows, payload, job_id)
-        artifacts = results.setdefault("artifacts", {})
-        if csv_path:
-            artifacts["effects_csv"] = csv_path
-        if html_path:
-            artifacts["effects_html"] = html_path
-
-        # ---- Inline heat-maps: show BOTH empirical and probability maps ----
-        def _embed_png(path, alt_text, caption):
-            try:
-                with open(path, "rb") as _f:
-                    import base64 as _b64
-                    _b = _b64.b64encode(_f.read()).decode("utf-8")
-                return (
-                    f'\n\n<img alt="{alt_text}" '
-                    f'src="data:image/png;base64,{_b}" '
-                    f'style="max-width:560px;border:1px solid #ddd;border-radius:6px;margin-top:10px" />\n'
-                    f"\n{caption}\n"
-                )
-            except Exception:
-                return ""
-
-        emp_path = artifacts.get("position_heatmap_empirical", "")
-        prob_path = artifacts.get("position_heatmap_prob", "") or artifacts.get("position_heatmap") or artifacts.get("position_heatmap_png") or ""
-
-        if emp_path:
-            msg_parts.append(
-                _embed_png(
-                    emp_path,
-                    "Empirical selection heatmap (darker = higher observed selection rate)",
-                    "*Empirical selection heatmap (darker = higher observed selection rate)*"
-                )
-            )
-        if prob_path:
-            msg_parts.append(
-                _embed_png(
-                    prob_path,
-                    "Model-implied probability heatmap (darker = higher predicted selection probability)",
-                    "*Model-implied probability heatmap (darker = higher predicted selection probability)*"
-                )
-            )
-
-        msg = "\n".join([p for p in msg_parts if p])
-    else:
-        msg = "No badge effects computed."
+    csv_path, html_path = _export_badge_effects(rows, payload, job_id)
+    artifacts = results.setdefault("artifacts", {})
+    if csv_path:
+        artifacts["effects_csv"] = csv_path
+    if html_path:
+        artifacts["effects_html"] = html_path
 
     # ---------------- [NEW] Fire-and-forget persistence of artifacts + DB ----------------
     try:
@@ -512,11 +513,8 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     except Exception as e:
         results.setdefault("artifacts", {})["agentix_persist_error"] = str(e)
 
-    import json
-    return msg, json.dumps(results, ensure_ascii=False, indent=2)
-
-
-
+    import json as _json
+    return msg, _json.dumps(results, ensure_ascii=False, indent=2)
 
 
 @_catch_and_report
@@ -535,7 +533,6 @@ def search_database(product_name: str):
         if "application/json" in ct:
             data = r.json()
         else:
-            # last-chance parse in case the server mislabeled
             data = json.loads(r.text)
     except Exception as e:
         msg = f"Could not reach the database API ({e})."
@@ -604,6 +601,67 @@ def search_database(product_name: str):
     html = f"{table_html}<p style='margin-top:8px'><a href='{dl_url}'>⬇️ Download CSV</a></p>"
 
     return html, json.dumps(data, ensure_ascii=False, indent=2)
+
+
+# ---------- Async UI wrappers delegating to agent_runner ----------
+
+@_catch_and_report
+def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
+    err = _validate_inputs(product_name, price, currency, n_iterations)
+    if err:
+        return "", f"❌ {err}"
+    import uuid as _uuid
+    payload = _build_payload(
+        job_id=f"job-{_uuid.uuid4().hex[:8]}",
+        product=product_name, brand=brand_name, model=model_name,
+        badges=badges, price=price, currency=currency,
+        n_iterations=n_iterations, fresh=True,
+    )
+    try:
+        r = runner_submit_job_async(payload)
+        if r.get("ok"):
+            return r.get("job_id",""), f"✅ Submitted. Job {r.get('job_id')} is {r.get('status','running')}."
+        return "", f"❌ Submit failed: {r}"
+    except Exception as e:
+        return "", f"❌ Submit error: {type(e).__name__}: {e}"
+
+@_catch_and_report
+def poll_job_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "Enter a Job ID first."
+    try:
+        r = runner_poll_job(job_id)
+        if not r.get("ok"):
+            return f"⚠️ {r.get('error','unknown error')}"
+        status = r.get("status","unknown")
+        err = r.get("error")
+        return f"Job {job_id}: {status}" + (f" — {err}" if err else "")
+    except Exception as e:
+        return f"❌ Poll error: {type(e).__name__}: {e}"
+
+@_catch_and_report
+def fetch_job_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "Enter a Job ID first.", "{}"
+    try:
+        r = runner_fetch_job(job_id)
+        if not r.get("ok"):
+            st = r.get("status") or r.get("error","not_ready")
+            return f"Job {job_id}: {st}", "{}"
+        raw = r.get("results_json") or "{}"
+        try:
+            results = json.loads(raw)
+        except Exception:
+            results = {}
+        msg, _res = _format_results_from_dict(results)
+        return msg, json.dumps(results, ensure_ascii=False, indent=2)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        return f"❌ Fetch error: {type(e).__name__}: {e}", "{}"
+
 
 # --- Admin helpers --- (continued from Part 1)
 
@@ -717,7 +775,6 @@ def _preview_badges_effects(admin_key: str):
     return html
 
 
-
 # ---------- UI logic for Automatic / Manual iterations ----------
 
 @_catch_and_report
@@ -777,7 +834,18 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
     # Search-first workflow
     search_btn = gr.Button("Search our database", variant="secondary")
-    run_btn = gr.Button("Run simulation now", variant="primary")
+
+    # Async job controls (Railway-safe)
+    with gr.Row():
+        submit_async_btn = gr.Button("Submit long run (async)", variant="primary")
+        job_id_box = gr.Textbox(label="Job ID", placeholder="Will appear after submit", interactive=False)
+    with gr.Row():
+        poll_btn = gr.Button("Poll status", variant="secondary")
+        fetch_btn = gr.Button("Fetch results", variant="secondary")
+    async_status = gr.Markdown()
+
+    # Legacy synchronous small-run path (kept for quick previews)
+    run_btn = gr.Button("Run simulation now", variant="secondary")
     preview_btn = gr.Button("Preview one example screen", variant="secondary")
     preview_view = gr.HTML(label="Preview")
 
@@ -792,12 +860,29 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[results_md, results_json],
     )
 
+    # Async bindings
+    submit_async_btn.click(
+        fn=submit_job_ui,
+        inputs=[product, brand, model, badges, price, currency, n_iterations],
+        outputs=[job_id_box, async_status],
+    )
+    poll_btn.click(
+        fn=poll_job_ui,
+        inputs=[job_id_box],
+        outputs=[async_status],
+    )
+    fetch_btn.click(
+        fn=fetch_job_ui,
+        inputs=[job_id_box],
+        outputs=[results_md, results_json],
+    )
+
+    # Preview and sync run
     preview_btn.click(
         fn=preview_example,
         inputs=[product, brand, model, badges, price, currency],
         outputs=[preview_view],
     )
-
     run_btn.click(
         fn=run_now,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
@@ -838,11 +923,11 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     stats_long = gr.File(label="df_long.csv")
     stats_log = gr.File(label="log_compare.jsonl")
     stats_badges = gr.File(label="badges_effects.csv")  # shows latest effects export
-    
+
     # Preview of badges_effects.csv inside the app
     stats_badges_preview_btn = gr.Button("Preview badges_effects table")
     stats_badges_preview_html = gr.HTML(label="badges_effects preview")
-    
+
     stats_badges_preview_btn.click(
         _preview_badges_effects,
         inputs=[admin_key_in],
@@ -858,21 +943,3 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
