@@ -1,9 +1,9 @@
 # save_to_agentix.py  —  Agentix DB + artifact persistence helper
-# v1.8 (2025-11-02):
-#   • Keeps v1.7 run persistence (with safe fallbacks for NOT NULL columns).
-#   • NEW: upload artifacts (df_choice.csv, badges_effects.csv, empirical heatmap)
-#          to Hostinger via sendAgentixFiles.php and return their public URLs.
-#   • Backwards compatible: callers still import persist_results_if_qualify(...).
+# v1.9 (2025-11-02):
+#   • Always upload artifacts (df_choice.csv, badges_effects.csv, heatmap PNG)
+#     to Hostinger even when a run does not meet DB persistence criteria.
+#   • DB persistence policy unchanged (requires any significant badge OR
+#     n_iterations ≥ 250). Behaviour otherwise matches v1.8.
 
 import base64
 import hashlib
@@ -120,7 +120,7 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str
     return data
 
 
-# ---------- NEW: artifact upload helpers ----------
+# ---------- artifact upload helpers ----------
 
 def _file_to_b64(path: str | Path) -> tuple[str, str] | None:
     try:
@@ -170,7 +170,7 @@ def persist_results_if_qualify(
     alpha: float = 0.05,
 ) -> Dict[str, Any]:
     """
-    Persist the run + effects to Hostinger and (NEW) upload artifacts to
+    Persist the run + effects to Hostinger and (always) upload artifacts to
     /Agentix/Results using sendAgentixFiles.php so they are downloadable at:
         https://aireadyworkforce.pro/Agentix/Results/<run_id>_...
     """
@@ -192,6 +192,16 @@ def persist_results_if_qualify(
     all_effects = _extract_all_effects(results)
     has_sig = _has_any_significant(all_effects, alpha=alpha)
 
+    # Always attempt to upload artifacts (even if we don't persist to DB)
+    upload_info = None
+    try:
+        artifact_paths = _collect_artifact_paths(results, payload)
+        if artifact_paths:
+            upload_info = _upload_artifacts(base_url, run_id, artifact_paths)
+    except Exception as e:
+        upload_info = {"ok": False, "error": str(e)}
+
+    # If run doesn't meet policy, return early but include upload_info
     if not (has_sig or n_iterations >= 250):
         return {
             "stored": False,
@@ -199,9 +209,11 @@ def persist_results_if_qualify(
             "has_significant": has_sig,
             "n_iterations": n_iterations,
             "effects_count": len(all_effects),
+            "run_id": run_id,
+            "files_response": upload_info,
         }
 
-    # Defaults for NOT NULL columns on agentix_runs
+    # Defaults for NOT NULL columns on agentix_runs (same as v1.8)
     price_anchor_bucket = payload.get("price_anchor_bucket") or f"{price_value:.2f}"
     frame_scheme = payload.get("frame_scheme") or ("all_in" if any(_norm_text(b) == "frame" for b in badges) else "standard")
     badges_sorted = ",".join(sorted([_norm_text(b) for b in (badges or []) if _norm_text(b)]))
@@ -274,6 +286,7 @@ def persist_results_if_qualify(
             "effects_count": len(all_effects),
             "run_id": run_id,
             "run_response": run_res,
+            "files_response": upload_info,
         }
 
     eff_res = {"ok": True, "rows_upserted": 0}
@@ -282,14 +295,6 @@ def persist_results_if_qualify(
         eff_res = _post_json(effects_url, effects_payload)
         if not eff_res.get("ok", False):
             raise AgentixSaverError(f"sendAgentixEffects failed: {eff_res}")
-
-    upload_info = None
-    try:
-        artifact_paths = _collect_artifact_paths(results, payload)
-        if artifact_paths:
-            upload_info = _upload_artifacts(base_url, run_id, artifact_paths)
-    except Exception as e:
-        upload_info = {"ok": False, "error": str(e)}
 
     return {
         "stored": True,
