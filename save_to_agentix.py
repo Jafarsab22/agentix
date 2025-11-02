@@ -1,9 +1,12 @@
 # save_to_agentix.py  —  Agentix DB + artifact persistence helper
-# v1.9 (2025-11-02):
+# v1.10 (2025-11-02)
 #   • Always upload artifacts (df_choice.csv, badges_effects.csv, heatmap PNG)
 #     to Hostinger even when a run does not meet DB persistence criteria.
 #   • DB persistence policy unchanged (requires any significant badge OR
-#     n_iterations ≥ 250). Behaviour otherwise matches v1.8.
+#     n_iterations ≥ 250).
+#   • New: robust df_choice.csv discovery — if the path is not present in
+#     results/artifacts, we search common locations for the latest
+#     df_choice*.csv and upload it.
 
 import base64
 import hashlib
@@ -12,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List
+from glob import glob
 
 import requests
 
@@ -143,6 +147,24 @@ def _collect_artifact_paths(results: Dict[str, Any], payload: Dict[str, Any]) ->
         a.get("effects_csv"),
         a.get("position_heatmap_empirical"),
     ]
+
+    # If df_choice path is missing, search common locations for the latest df_choice*.csv
+    have_df = any(p and str(p).lower().endswith('.csv') and 'df_choice' in str(p).lower() for p in cands)
+    if not have_df:
+        patterns = ['df_choice*.csv', 'results/df_choice*.csv', '**/df_choice*.csv']
+        latest = None
+        latest_mtime = -1
+        for pat in patterns:
+            for fp in glob(pat, recursive=True):
+                try:
+                    mt = Path(fp).stat().st_mtime
+                    if mt > latest_mtime:
+                        latest, latest_mtime = fp, mt
+                except Exception:
+                    pass
+        if latest:
+            cands.insert(0, latest)
+
     return [str(p) for p in cands if p]
 
 
@@ -213,7 +235,7 @@ def persist_results_if_qualify(
             "files_response": upload_info,
         }
 
-    # Defaults for NOT NULL columns on agentix_runs (same as v1.8)
+    # Defaults for NOT NULL columns on agentix_runs (kept for backward compat)
     price_anchor_bucket = payload.get("price_anchor_bucket") or f"{price_value:.2f}"
     frame_scheme = payload.get("frame_scheme") or ("all_in" if any(_norm_text(b) == "frame" for b in badges) else "standard")
     badges_sorted = ",".join(sorted([_norm_text(b) for b in (badges or []) if _norm_text(b)]))
