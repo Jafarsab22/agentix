@@ -16,13 +16,20 @@ logging.basicConfig(level=logging.INFO)
 # (Kept intact; UI below uses agent_runner's async wrappers via runner_* aliases)
 import threading, uuid, json as _json_shadow
 
+# ---------- Async job queue (breaks the 900s ceiling) ----------
+import threading
+
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
 def _bg_run_job(job_id: str, args_tuple: tuple):
+    """
+    Run the existing synchronous handler in a background thread and cache results.
+    args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
+    """
     try:
-        # NOTE: this local queue is retained but not wired to the UI; prefer runner_*.
-        msg, results_json = (*args_tuple)  # placeholder; original user draft
+        # Reuse the exact formatting and side effects of run_now(...)
+        msg, results_json = run_now(*args_tuple)
         with _JOBS_LOCK:
             _JOBS[job_id] = {"status": "done", "msg": msg, "results_json": results_json}
     except Exception as e:
@@ -54,6 +61,7 @@ def fetch_job(job_id: str):
     if info["status"] == "error":
         return {"ok": False, "status": "error", "error": info["error"]}
     return {"ok": True, "status": info["status"]}
+
 
 
 def _catch_and_report(fn):
@@ -943,3 +951,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
