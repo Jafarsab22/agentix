@@ -1,13 +1,13 @@
 # save_to_agentix.py  —  Agentix DB + artifact persistence helper
-# v1.11 (2025-11-02)
-# Changes (v1.11):
-#   • Robust artifact discovery aligned with the new runner keys:
-#       df_choice, effects_csv, badges_effects, table_badges,
-#       position_heatmap_empirical, position_heatmap_prob,
-#       position_heatmap, position_heatmap_png.
-#   • Absolute path resolution + existence checks before upload.
-#   • Return 'files_tried' for quick debugging.
-#   • Optional debug mode: set AGENTIX_DEBUG_FILES=1 to call ?debug=1.
+# v1.12 (2025-11-03)
+# Updates for new DB schemas and PHP endpoints:
+#   • Aligns sendAgentixRuns payload to new agentix_runs schema (job_id, brand, model, currency,
+#     frame_scheme, runner_version) and removes legacy-only fields from payload.
+#   • Aligns sendAgentixEffects payload to new agentix_effects schema and field names
+#     (se, p, q_bh, odds_ratio, ci_low, ci_high, ame_pp, evid_score, price_eq, sign),
+#     and uses job_id rather than run_id.
+#   • Keeps artifact upload flow; continues to send run_id for backward compatibility
+#     with sendAgentixFiles.php, while setting run_id = job_id.
 
 import base64
 import hashlib
@@ -51,62 +51,38 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _make_norm_key(
-    product: str,
-    brand_type: str,
-    model_name: str,
-    badges: List[str],
-    price_value,
-    price_currency: str,
-    est_model: str,
-) -> str:
-    badges_sorted = ",".join(sorted([_norm_text(b) for b in (badges or []) if _norm_text(b)]))
-    price_bucket = f"{float(price_value):.2f}"
-    basis = "|".join(
-        [
-            _norm_text(product),
-            _norm_text(brand_type),
-            _norm_text(model_name),
-            badges_sorted,
-            _norm_text(price_currency),
-            price_bucket,
-            _norm_text(est_model),
-        ]
-    )
-    return _sha256_hex(basis)
-
-
 def _extract_all_effects(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract effects rows from results, mapping to the new agentix_effects schema keys."""
     out: List[Dict[str, Any]] = []
-    for r in results.get("logit_table_rows") or []:
+    rows = results.get("logit_table_rows") or []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
         badge = r.get("badge", "")
         if not str(badge).strip():
             continue
-        beta = r.get("beta", None)
-        p_raw = r.get("p", r.get("p_value"))
-        try:
-            p_value = float(p_raw) if p_raw is not None else None
-        except Exception:
-            p_value = None
-        row = {
+        # Map to new field names
+        eff: Dict[str, Any] = {
             "badge": badge,
-            "beta": beta,
-            "p_value": p_value,
+            "beta": r.get("beta"),
+            "se": r.get("se") or r.get("std_err") or r.get("stderr"),
+            "p": r.get("p", r.get("p_value")),
+            "q_bh": r.get("q_bh") or r.get("q") or r.get("qvalue") or r.get("q_value"),
+            "odds_ratio": r.get("odds_ratio", r.get("or")),
+            "ci_low": r.get("ci_low") or r.get("ci_l") or r.get("ci_lo") or r.get("cil"),
+            "ci_high": r.get("ci_high") or r.get("ci_h") or r.get("ci_hi") or r.get("cih"),
+            "ame_pp": r.get("ame_pp") or r.get("ame") or r.get("marginal_pp"),
+            "evid_score": r.get("evid_score") or r.get("evidence") or r.get("evid"),
+            "price_eq": r.get("price_eq") or r.get("lambda") or r.get("price_equiv") or r.get("price_equivalent"),
             "sign": r.get("sign", "0"),
         }
-        for k in ("se", "ci_low", "ci_high"):
-            if k in r:
-                try:
-                    row[k] = float(r[k])
-                except Exception:
-                    pass
-        out.append(row)
+        out.append(eff)
     return out
 
 
 def _has_any_significant(effects: List[Dict[str, Any]], alpha: float) -> bool:
     for r in effects:
-        p = r.get("p_value")
+        p = r.get("p")
         try:
             if p is not None and float(p) < alpha:
                 return True
@@ -152,8 +128,7 @@ def _resolve(p: str | Path | None) -> str | None:
 def _collect_artifact_paths(results: Dict[str, Any], payload: Dict[str, Any]) -> List[str]:
     """
     Gather candidate files from both the new and legacy keys, resolve to absolute
-    paths, keep only existing files, and filter by extension to match the PHP
-    allow-list (csv, png).
+    paths, keep only existing files, and filter by extension (csv, png).
     """
     a = (results.get("artifacts") or {}) if isinstance(results, dict) else {}
 
@@ -171,26 +146,20 @@ def _collect_artifact_paths(results: Dict[str, Any], payload: Dict[str, Any]) ->
     ]
 
     cands: List[str | None] = []
-    # New keys first
     for k in keys_new:
         cands.append(a.get(k))
-    # Legacy fallbacks
     for k in keys_old:
         cands.append(results.get(k))
         cands.append(a.get(k))
-
-    # Also accept anything explicit on results root for CSVs
     for k in ("effects_csv", "df_choice_path", "choice_csv_path"):
         cands.append(results.get(k))
 
-    # If df_choice is still missing, search common locations
     have_df = any(p and "df_choice" in str(p).lower() for p in cands if p)
     if not have_df:
         for pat in ("results/df_choice*.csv", "df_choice*.csv", "**/df_choice*.csv"):
             for fp in glob(pat, recursive=True):
                 cands.append(fp)
 
-    # Resolve, de-dup, filter by extension (php only accepts csv/png)
     exts_ok = {".csv", ".png"}
     out: List[str] = []
     seen = set()
@@ -207,7 +176,8 @@ def _collect_artifact_paths(results: Dict[str, Any], payload: Dict[str, Any]) ->
     return out
 
 
-def _upload_artifacts(base_url: str, run_id: str, files: List[str]) -> Dict[str, Any]:
+def _upload_artifacts(base_url: str, job_id: str, files: List[str]) -> Dict[str, Any]:
+    """Upload artifacts using sendAgentixFiles.php (keeps legacy run_id param for compatibility)."""
     packed = []
     for f in files:
         pair = _file_to_b64(f)
@@ -218,11 +188,11 @@ def _upload_artifacts(base_url: str, run_id: str, files: List[str]) -> Dict[str,
         return {"ok": False, "reason": "no_files", "files_tried": files}
 
     url = f"{base_url.rstrip('/')}/sendAgentixFiles.php"
-    # Optional verbosity: ?debug=1
     if str(os.getenv("AGENTIX_DEBUG_FILES", "")).strip().lower() in ("1", "true", "yes"):
         url += "?debug=1"
 
-    res = _post_json(url, {"run_id": run_id, "files": packed})
+    # Send both keys for safety with older PHP; they carry the same value.
+    res = _post_json(url, {"run_id": job_id, "job_id": job_id, "files": packed})
     res["files_tried"] = files
     return res
 
@@ -238,37 +208,34 @@ def persist_results_if_qualify(
     alpha: float = 0.05,
 ) -> Dict[str, Any]:
     """
-    Persist the run + effects to Hostinger and (always) upload artifacts to
-    /Agentix/Results using sendAgentixFiles.php so they are downloadable at:
-        https://aireadyworkforce.pro/Agentix/Results/<run_id>_...
+    Persist the run + effects to Hostinger and (always) upload artifacts.
     """
 
-    run_id = results.get("job_id") or payload.get("job_id") or f"run-{uuid.uuid4()}"
+    job_id = results.get("job_id") or payload.get("job_id") or f"job-{uuid.uuid4()}"
     ts_utc = _to_sql_ts(results.get("ts") or payload.get("ts"))
 
     product = payload.get("product") or ""
-    brand_type = payload.get("brand") or payload.get("brand_type") or ""
-    model_name = payload.get("model") or payload.get("model_name") or ""
+    brand = payload.get("brand") or payload.get("brand_type") or ""
+    model = payload.get("model") or payload.get("model_name") or ""
+
     try:
         price_value = float(payload.get("price") or payload.get("price_value") or 0)
     except Exception:
         price_value = 0.0
-    price_currency = payload.get("currency") or payload.get("price_currency") or ""
+    currency = payload.get("currency") or payload.get("price_currency") or ""
     n_iterations = int(payload.get("n_iterations") or 0)
     badges = payload.get("badges") or []
 
     all_effects = _extract_all_effects(results)
     has_sig = _has_any_significant(all_effects, alpha=alpha)
 
-    # Always attempt to upload artifacts (even if we don't persist to DB)
     upload_info = None
     try:
         artifact_paths = _collect_artifact_paths(results, payload)
-        upload_info = _upload_artifacts(base_url, run_id, artifact_paths)
+        upload_info = _upload_artifacts(base_url, job_id, artifact_paths)
     except Exception as e:
         upload_info = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    # If run doesn't meet policy, return early but include upload_info
     if not (has_sig or n_iterations >= 250):
         return {
             "stored": False,
@@ -276,65 +243,27 @@ def persist_results_if_qualify(
             "has_significant": has_sig,
             "n_iterations": n_iterations,
             "effects_count": len(all_effects),
-            "run_id": run_id,
+            "job_id": job_id,
             "files_response": upload_info,
         }
 
-    # Defaults for NOT NULL columns on agentix_runs (kept for backward compat)
-    price_anchor_bucket = payload.get("price_anchor_bucket") or f"{price_value:.2f}"
-    frame_scheme = payload.get("frame_scheme") or ("all_in" if any(_norm_text(b) == "frame" for b in badges) else "standard")
-    badges_sorted = ",".join(sorted([_norm_text(b) for b in (badges or []) if _norm_text(b)]))
-    badge_set_hash = payload.get("badge_set_hash") or _sha256_hex(badges_sorted)
-    seed_in = payload.get("random_seed") or payload.get("seed")
-    try:
-        random_seed = int(seed_in) if seed_in is not None else int(int(_sha256_hex(run_id), 16) % (2**63 - 1))
-    except Exception:
-        random_seed = int(int(_sha256_hex(run_id), 16) % (2**63 - 1))
-    spec_str = json.dumps({
-        "est_model": est_model,
-        "cluster": results.get("vcov_type") or "case_cluster",
-        "ridge_alpha": payload.get("ridge_alpha"),
-        "max_iter": payload.get("max_iter", 500),
-        "features": results.get("features"),
-    }, sort_keys=True, default=str)
-    est_spec_hash = payload.get("est_spec_hash") or _sha256_hex(spec_str)
-    runner_version = payload.get("runner_version") or app_version
-
-    n_cards = results.get("n_cards") or payload.get("n_cards")
-    n_users = results.get("n_users") or payload.get("n_users")
-    balance_pvalue = results.get("balance_pvalue")
-
-    norm_key = _make_norm_key(
-        product, brand_type, model_name, badges, price_value, price_currency, est_model
-    )
-
+    # Required payload for agentix_runs
     run_doc = {
-        "run_id": run_id,
+        "job_id": job_id,
         "ts_utc": ts_utc,
         "product": product,
-        "brand_type": brand_type,
-        "model_name": model_name,
+        "brand": brand,
+        "model": model,
         "price_value": float(price_value),
-        "price_currency": price_currency,
-        "price_anchor_bucket": price_anchor_bucket,
+        "currency": currency,
         "n_iterations": n_iterations,
-        "n_cards": n_cards,
-        "n_users": n_users,
         "badges_csv": ",".join(sorted([str(b).strip() for b in badges if str(b).strip()])),
-        "frame_scheme": frame_scheme,
-        "badge_set_hash": badge_set_hash,
-        "random_seed": random_seed,
+        "frame_scheme": payload.get("frame_scheme") or "standard",
         "has_significant": 1 if has_sig else 0,
-        "n_sig_badges": sum(1 for r in all_effects if (r.get("p_value") is not None and float(r["p_value"]) < alpha)),
-        "est_model": est_model,
-        "est_spec_hash": est_spec_hash,
+        "n_sig_badges": sum(1 for r in all_effects if (r.get("p") is not None and float(r["p"]) < alpha)),
         "app_version": app_version,
-        "runner_version": runner_version,
-        "norm_key": norm_key,
-        "qc_pass": results.get("qc_pass", 1),
-        "balance_pvalue": balance_pvalue,
-        "superseded_by": None,
-        "approved_for_reuse": 1,
+        "runner_version": payload.get("runner_version") or app_version,
+        "est_model": est_model,
     }
 
     runs_url = f"{base_url.rstrip('/')}/sendAgentixRuns.php"
@@ -351,21 +280,22 @@ def persist_results_if_qualify(
             "has_significant": has_sig,
             "n_iterations": n_iterations,
             "effects_count": len(all_effects),
-            "run_id": run_id,
+            "job_id": job_id,
             "run_response": run_res,
             "files_response": upload_info,
         }
 
     eff_res = {"ok": True, "rows_upserted": 0}
     if all_effects:
-        effects_payload = {"run_id": run_id, "effects": all_effects}
+        # Map effects list to ensure numeric coercion happens server-side; here we just pass values through.
+        effects_payload = {"job_id": job_id, "effects": all_effects}
         eff_res = _post_json(effects_url, effects_payload)
         if not eff_res.get("ok", False):
             raise AgentixSaverError(f"sendAgentixEffects failed: {eff_res}")
 
     return {
         "stored": True,
-        "run_id": run_id,
+        "job_id": job_id,
         "run_response": run_res,
         "effects_response": eff_res,
         "files_response": upload_info,
