@@ -1057,6 +1057,131 @@ def _handle_image_upload(file) -> tuple:
         return gr.update(value=None), f"❌ Upload failed: {type(e).__name__}: {e}"
 # === End Scoring helpers =====================================================
 
+# === A/B simulation helpers (logit-style on LEARNED_PARAMS) ==================
+import math, random
+
+def _beta(name: str) -> float:
+    d = LEARNED_PARAMS.get(name)
+    return float(d.get("beta")) if isinstance(d, dict) and "beta" in d else 0.0
+
+def _utility_from_cues(cues: set[str], row: int | None = None, col: int | None = None) -> float:
+    """
+    Sum β over cues; optionally add position β's. ln(price) cancels in A/B if same for both,
+    so we *omit* it to let framing/badges drive differences.
+    """
+    u = 0.0
+    for c in cues:
+        u += _beta(c)
+    if row == 1:
+        u += _beta("Row 1")
+    # columns 1..3 have coefficients; column 4 is baseline in your table
+    if col == 1:
+        u += _beta("Column 1")
+    elif col == 2:
+        u += _beta("Column 2")
+    elif col == 3:
+        u += _beta("Column 3")
+    return u
+
+def _softmax(xs: list[float]) -> list[float]:
+    m = max(xs)
+    es = [math.exp(x - m) for x in xs]
+    s = sum(es)
+    return [e / s for e in es]
+
+def _detect_cues_for_image(filepath: str) -> list[str]:
+    data_url = _file_to_data_url(filepath)
+    cues = _detect_with_agent_or_fallback(data_url, "single")
+    # Map partitioning/all-in: if the detector didn’t explicitly say “All-in framing”,
+    # we leave it absent; do not add any “Partitioned” positive cue.
+    cues = [c for c in cues if c in CUE_CHOICES_SCORER]
+    return cues
+
+@_catch_and_report
+def _ab_run_two_images(file_a: str, file_b: str, n_iter: int):
+    if not file_a or not file_b:
+        return "", "", "Please upload both images."
+    try:
+        n_iter = int(n_iter)
+        if n_iter <= 0:
+            return "", "", "Iterations must be positive."
+    except Exception:
+        return "", "", "Invalid iterations."
+
+    cues_a = set(_detect_cues_for_image(file_a))
+    cues_b = set(_detect_cues_for_image(file_b))
+
+    # We randomise positions uniformly each iteration to wash out position effects.
+    # In each iteration, create 8 slots with 4×A and 4×B, then sample a choice.
+    pick_a = 0
+    pick_b = 0
+
+    # Precompute the 8 grid coordinates (row-major)
+    coords = [(1,1),(1,2),(1,3),(1,4),(2,1),(2,2),(2,3),(2,4)]
+
+    for _ in range(n_iter):
+        labels = ["A"]*4 + ["B"]*4
+        random.shuffle(labels)
+
+        utils = []
+        for k, (r,c) in enumerate(coords):
+            cu = cues_a if labels[k] == "A" else cues_b
+            utils.append(_utility_from_cues(cu, row=r, col=c))
+
+        probs = _softmax(utils)
+        # sample one index according to probs
+        u = random.random()
+        acc = 0.0
+        choice_idx = 0
+        for i,p in enumerate(probs):
+            acc += p
+            if u <= acc:
+                choice_idx = i
+                break
+        if labels[choice_idx] == "A":
+            pick_a += 1
+        else:
+            pick_b += 1
+
+    ra = pick_a / n_iter
+    rb = pick_b / n_iter
+
+    # Two-proportion z-test (pooled)
+    p_pool = (pick_a + pick_b) / (n_iter + n_iter)
+    se = math.sqrt(p_pool*(1 - p_pool)*(1/n_iter + 1/n_iter))
+    z = (ra - rb) / se if se > 0 else 0.0
+
+    # 95% CIs (Wald, for quick read)
+    def ci(p, n):
+        s = math.sqrt(p*(1-p)/n)
+        return (p - 1.96*s, p + 1.96*s)
+    ci_a = ci(ra, n_iter)
+    ci_b = ci(rb, n_iter)
+
+    badges_md = (
+        "#### Detected cues\n\n"
+        f"**Image A:** {', '.join(sorted(cues_a)) if cues_a else '—'}\n\n"
+        f"**Image B:** {', '.join(sorted(cues_b)) if cues_b else '—'}\n"
+    )
+
+    results_md = (
+        "#### A/B selection results\n\n"
+        "| Variant | Picks | Rate | 95% CI |\n"
+        "|---|---:|---:|---|\n"
+        f"| A | {pick_a} | {ra:.3f} | [{ci_a[0]:.3f}, {ci_a[1]:.3f}] |\n"
+        f"| B | {pick_b} | {rb:.3f} | [{ci_b[0]:.3f}, {ci_b[1]:.3f}] |\n"
+        "\n"
+        f"*z* = {z:.2f} (two-proportion, pooled)\n"
+    )
+
+    note = (
+        "Notes: choices are sampled from a softmax over utilities constructed as the sum of "
+        "β for detected cues plus position coefficients for each slot; ln(price) is omitted "
+        "because it cancels across variants when price is the same. Position is randomised "
+        "each iteration, so position effects average out."
+    )
+    return badges_md, results_md, note
+# === End A/B helpers =========================================================
 
 # ---------- UI ----------
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
@@ -1227,7 +1352,22 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
                 inputs=[auto_grid_img],
                 outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
             )
-    
+        ##A/B testing
+        with gr.Tab("A/B — Two images (iterated)"): 
+            ab_img_a = gr.Image(label="Image A (e.g., strike-through)", type="filepath")
+            ab_img_b = gr.Image(label="Image B (e.g., scarcity)", type="filepath")
+            ab_iters = gr.Number(label="Iterations", value=500, precision=0)
+            ab_run = gr.Button("Run A/B simulation", variant="primary")
+            ab_badges_md = gr.Markdown()
+            ab_results_md = gr.Markdown()
+            ab_notes_md = gr.Markdown()
+        
+            ab_run.click(
+                fn=_ab_run_two_images,
+                inputs=[ab_img_a, ab_img_b, ab_iters],
+                outputs=[ab_badges_md, ab_results_md, ab_notes_md],
+            )
+
         # -------- Manual (kept for verification / fallback) --------
         with gr.Tab("Manual — Single card"):
             single_cues = gr.CheckboxGroup(
@@ -1277,6 +1417,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
