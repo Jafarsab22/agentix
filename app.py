@@ -1105,19 +1105,95 @@ def _compose_grid_2x4(file_a: str, file_b: str, labels: list[str]) -> tuple[str,
 
     return _img_to_data_url(canvas, fmt="JPEG", quality=80), matrix  # data URL, 2×4 labels
 
+# --- robust rc extraction (PASTE RIGHT BELOW _compose_grid_2x4) -------------
+def _rc_from_args(args: dict) -> tuple[int | None, int | None]:
+    """
+    Accepts multiple shapes from the tool output:
+      - {'row': 1|2, 'col': 1|2|3|4}  (1-indexed)
+      - {'row': 0|1, 'col': 0|1|2|3}  (0-indexed)
+      - {'index'|'slot'|'position'|'choice'|'chosen_index'|'selected_index': 1..8 or 0..7}
+      - or nested under {'arguments': '{...json...}'} or {'args': {...}}
+    Returns zero-based (r0,c0) or (None,None).
+    """
+    if not isinstance(args, dict):
+        return None, None
+
+    # Try explicit row/col first
+    for rk in ("row", "r", "row_idx", "row_index"):
+        if rk in args:
+            try:
+                rv = args.get(rk)
+            except Exception:
+                rv = None
+            from_indexed = None
+            try:
+                v = int(rv)
+                # 1..K => v-1; 0..K-1 => v
+                if 1 <= v <= 2:
+                    from_indexed = v - 1
+                elif 0 <= v <= 1:
+                    from_indexed = v
+            except Exception:
+                from_indexed = None
+            if from_indexed is None:
+                break
+            for ck in ("col", "c", "col_idx", "col_index"):
+                if ck in args:
+                    try:
+                        cv = int(args.get(ck))
+                        if 1 <= cv <= 4:
+                            c0 = cv - 1
+                        elif 0 <= cv <= 3:
+                            c0 = cv
+                        else:
+                            c0 = None
+                    except Exception:
+                        c0 = None
+                    if c0 is not None:
+                        return from_indexed, c0
+
+    # Single index / slot / position
+    for ik in ("index", "slot", "position", "choice", "chosen_index", "selected_index"):
+        if ik in args:
+            try:
+                v = int(args.get(ik))
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            if 1 <= v <= 8:
+                v -= 1
+            if 0 <= v <= 7:
+                return v // 4, v % 4
+
+    # Nested arguments (common in tool_calls)
+    for vk in ("arguments", "args"):
+        if vk in args and isinstance(args[vk], (str, dict)):
+            try:
+                nested = json.loads(args[vk]) if isinstance(args[vk], str) else dict(args[vk])
+            except Exception:
+                nested = {}
+            r0, c0 = _rc_from_args(nested)
+            if r0 is not None and c0 is not None:
+                return r0, c0
+
+    return None, None
+
+
 def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str | None):
-    # 4×A and 4×B, randomised across 8 slots
+    # 4×A and 4×B randomly assigned across 8 slots
     labels = ["A"] * 4 + ["B"] * 4
     random.shuffle(labels)
     data_url, mat = _compose_grid_2x4(file_a, file_b, labels)
-    from agent_runner import call_openai  # uses your existing tool/function
+
+    from agent_runner import call_openai
     args = call_openai(data_url, category or "", model_name=model_name)
-    r, c = int(args.get("row") or 0), int(args.get("col") or 0)
-    if r in (1, 2) and c in (1, 2, 3, 4):
-        chosen = mat[r-1][c-1]
-    else:
-        chosen = None  # defensive
-    return chosen, mat  # "A" or "B" (or None), and the layout
+
+    # Accept 0/1-indexed row/col OR a single slot/index
+    r0, c0 = _rc_from_args(args)
+    if r0 is None or c0 is None:
+        return None, mat
+    return mat[r0][c0], mat  # "A" or "B"
 
 # --- Async job wrappers (reuse your in-memory _JOBS store) -------------------
 def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, category: str | None, model_name: str | None):
@@ -1747,6 +1823,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
