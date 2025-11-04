@@ -1207,86 +1207,87 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     )
 
    # === Scoring UI (placed at the bottom as requested) ======================
-gr.Markdown("## Scoring from image (auto-detect) and manual check (optional)")
-
-with gr.Tabs():
-    # -------- Auto-detect: Single card --------
-    with gr.Tab("Auto-detect — Single card"):
-        auto_single_img = gr.Image(label="Upload single product image", type="filepath")
-        auto_single_go = gr.Button("Detect badges and score", variant="primary")
-        auto_single_preview = gr.Image(label="Preview", interactive=False)
-        auto_single_badges = gr.Markdown()
-        auto_single_score = gr.Markdown()
-        auto_single_status = gr.Markdown()
-
-        auto_single_go.click(
-            fn=_auto_single_from_image,
-            inputs=[auto_single_img],
-            outputs=[auto_single_preview, auto_single_badges, auto_single_score, auto_single_status],
-        )
-
-    # -------- Auto-detect: 2×4 grid --------
-    with gr.Tab("Auto-detect — Grid 2×4"):
-        auto_grid_img = gr.Image(label="Upload 2×4 grid image", type="filepath")
-        auto_grid_go = gr.Button("Detect badges and score grid", variant="primary")
-        auto_grid_preview = gr.Image(label="Preview", interactive=False)
-        auto_grid_badges = gr.Markdown()
-        auto_grid_score = gr.Markdown()
-        auto_grid_status = gr.Markdown()
-
-        auto_grid_go.click(
-            fn=_auto_grid_from_image,
-            inputs=[auto_grid_img],
-            outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
-        )
-
-    # -------- Manual (kept for verification / fallback) --------
-    with gr.Tab("Manual — Single card"):
-        single_cues = gr.CheckboxGroup(
-            choices=CUE_CHOICES_SCORER,
-            label="Select cues present on the single card (badges)",
-        )
-        single_score_btn = gr.Button("Calculate score", variant="secondary")
-        single_score_md = gr.Markdown()
-        single_score_btn.click(
-            fn=_score_single_card_ui,
-            inputs=[single_cues],
-            outputs=[single_score_md],
-        )
-
-    with gr.Tab("Manual — Grid 2×4"):
-        gr.Markdown("Select cues for each of the eight cards (row-major).")
-        grid_cards = []
-        for r in range(2):
-            with gr.Row():
-                for c in range(4):
-                    idx = r * 4 + c + 1
-                    cb = gr.CheckboxGroup(
-                        choices=CUE_CHOICES_SCORER,
-                        label=f"Card {idx} (Row {r+1}, Col {c+1})",
-                    )
-                    grid_cards.append(cb)
-        grid_score_btn = gr.Button("Calculate score", variant="secondary")
-        grid_score_md = gr.Markdown()
-        grid_score_btn.click(
-            fn=_score_grid_2x4_ui,
-            inputs=grid_cards,   # 8 inputs, row-major
-            outputs=[grid_score_md],
-        )
-
-# Upload button at the very bottom (saves file to /uploads for later reuse)
-gr.Markdown("### Upload image (save only)")
-upload_preview = gr.Image(label="Uploaded image preview", interactive=False)
-upload_btn = gr.UploadButton("Upload image", file_types=["image"], file_count="single")
-upload_status = gr.Markdown()
-upload_btn.upload(
-    fn=_handle_image_upload,
-    inputs=[upload_btn],
-    outputs=[upload_preview, upload_status],
-)
+    gr.Markdown("## Scoring from image (auto-detect) and manual check (optional)")
+    
+    with gr.Tabs():
+        # -------- Auto-detect: Single card --------
+        with gr.Tab("Auto-detect — Single card"):
+            auto_single_img = gr.Image(label="Upload single product image", type="filepath")
+            auto_single_go = gr.Button("Detect badges and score", variant="primary")
+            auto_single_preview = gr.Image(label="Preview", interactive=False)
+            auto_single_badges = gr.Markdown()
+            auto_single_score = gr.Markdown()
+            auto_single_status = gr.Markdown()
+    
+            auto_single_go.click(
+                fn=_auto_single_from_image,
+                inputs=[auto_single_img],
+                outputs=[auto_single_preview, auto_single_badges, auto_single_score, auto_single_status],
+            )
+    
+        # -------- Auto-detect: 2×4 grid --------
+        with gr.Tab("Auto-detect — Grid 2×4"):
+            auto_grid_img = gr.Image(label="Upload 2×4 grid image", type="filepath")
+            auto_grid_go = gr.Button("Detect badges and score grid", variant="primary")
+            auto_grid_preview = gr.Image(label="Preview", interactive=False)
+            auto_grid_badges = gr.Markdown()
+            auto_grid_score = gr.Markdown()
+            auto_grid_status = gr.Markdown()
+    
+            auto_grid_go.click(
+                fn=_auto_grid_from_image,
+                inputs=[auto_grid_img],
+                outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
+            )
+    
+        # -------- Manual (kept for verification / fallback) --------
+        with gr.Tab("Manual — Single card"):
+            single_cues = gr.CheckboxGroup(
+                choices=CUE_CHOICES_SCORER,
+                label="Select cues present on the single card (badges)",
+            )
+            single_score_btn = gr.Button("Calculate score", variant="secondary")
+            single_score_md = gr.Markdown()
+            single_score_btn.click(
+                fn=_score_single_card_ui,
+                inputs=[single_cues],
+                outputs=[single_score_md],
+            )
+    
+        with gr.Tab("Manual — Grid 2×4"):
+            gr.Markdown("Select cues for each of the eight cards (row-major).")
+            grid_cards = []
+            for r in range(2):
+                with gr.Row():
+                    for c in range(4):
+                        idx = r * 4 + c + 1
+                        cb = gr.CheckboxGroup(
+                            choices=CUE_CHOICES_SCORER,
+                            label=f"Card {idx} (Row {r+1}, Col {c+1})",
+                        )
+                        grid_cards.append(cb)
+            grid_score_btn = gr.Button("Calculate score", variant="secondary")
+            grid_score_md = gr.Markdown()
+            grid_score_btn.click(
+                fn=_score_grid_2x4_ui,
+                inputs=grid_cards,   # 8 inputs, row-major
+                outputs=[grid_score_md],
+            )
+    
+    # Upload button at the very bottom (saves file to /uploads for later reuse)
+    gr.Markdown("### Upload image (save only)")
+    upload_preview = gr.Image(label="Uploaded image preview", interactive=False)
+    upload_btn = gr.UploadButton("Upload image", file_types=["image"], file_count="single")
+    upload_status = gr.Markdown()
+    upload_btn.upload(
+        fn=_handle_image_upload,
+        inputs=[upload_btn],
+        outputs=[upload_preview, upload_status],
+    )
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
