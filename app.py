@@ -812,35 +812,32 @@ def _toggle_manual(manual_checked: bool, badges: list[str]):
     return gr.update(value=True), gr.update(value=n, interactive=False)
 
 
-# === Scoring additions: imports, constants, and handlers =====================
-# These do not affect your simulation pipeline; they are self-contained UI hooks.
+# === Scoring helpers (define BEFORE the Blocks UI) ===========================
+import base64, pathlib, time, uuid, os, json, requests
+
+# score_image.py must be alongside app.py
 try:
-    # score_image.py must be in the same directory (as you provided)
     from score_image import score_single_card, score_grid_2x4, LEARNED_PARAMS
-except Exception as _sc_err:
-    # Soft-fail so the rest of the app still runs; the UI will show an error on use
+except Exception:
     score_single_card = None
     score_grid_2x4 = None
     LEARNED_PARAMS = {}
 
-# Try to import a detector from agent_runner if your repo already has one.
-# If not present, we fall back to a local OpenAI Vision call.
+# Optional detector provided by your repo
 try:
-    from agent_runner import detect_levers as _agent_detect_levers  # expected signature: detect_levers(image_b64, mode)
+    from agent_runner import detect_levers as _agent_detect_levers  # (image_b64, mode) -> dict
 except Exception:
     _agent_detect_levers = None
 
-UPLOADS_DIR = pathlib.Path("uploads")
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = pathlib.Path("uploads"); UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Build cue choices from your learned params, excluding position + ln(price)
+# UI cue set = learned keys minus positional + ln(price)
 _CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
 CUE_CHOICES_SCORER = [k for k in LEARNED_PARAMS.keys() if k not in _CUE_EXCLUDE] or [
-    # Fallback to your canonical set names if LEARNED_PARAMS import failed
     "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"
 ]
 
-# Normalise synonyms coming from the detector to match LEARNED_PARAMS keys
+# Normalise detector labels to scorer labels
 _NORMALISE = {
     "all-in framing": "All-in framing",
     "all in framing": "All-in framing",
@@ -852,12 +849,9 @@ _NORMALISE = {
     "strikethrough": "Strike-through",
     "timer": "Timer",
 }
-
 def _norm_label(x: str) -> str:
-    if not x:
-        return ""
-    k = x.strip().lower()
-    return _NORMALISE.get(k, x.strip())
+    k = (x or "").strip().lower()
+    return _NORMALISE.get(k, (x or "").strip())
 
 def _fmt_num(x, nd=3):
     try:
@@ -868,31 +862,23 @@ def _fmt_num(x, nd=3):
 def _file_to_data_url(path_like: str) -> str:
     p = pathlib.Path(path_like)
     b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
-    # Using data URL simplifies passing to vision APIs
-    suffix = (p.suffix or "").lower()
-    mime = "image/png" if suffix not in {".jpg", ".jpeg", ".webp"} else ("image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/webp")
+    ext = (p.suffix or "").lower()
+    mime = "image/png"
+    if ext in {".jpg", ".jpeg"}: mime = "image/jpeg"
+    elif ext == ".webp": mime = "image/webp"
     return f"data:{mime};base64,{b64}"
 
 def _fallback_openai_detect(image_b64: str, mode: str = "single"):
-    """
-    Fallback detector using your existing OpenAI stack.
-    Returns:
-      - for mode='single': list[str] of cues
-      - for mode='grid': list[set[str]] of length 8 (row-major)
-    """
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
-
-    # Simple JSON schema prompt to extract cues; we keep it deterministic
     sys = (
-        "You are an e-commerce UI analyst. Identify which of these cues are present in the image: "
-        f"{', '.join(sorted(CUE_CHOICES_SCORER))}. "
-        "Return JSON only. For a single product image, return {\"cues\": [..]}. "
-        "For a 2x4 grid, return {\"grid\": [[..],[..],...]} with 8 arrays row-major."
+        "You are an e-commerce UI analyst. Identify which of these cues are present: "
+        + ", ".join(sorted(CUE_CHOICES_SCORER))
+        + ". Return ONLY JSON. Single: {\"cues\":[...]}. Grid 2x4: {\"grid\":[[...],...]} (8 arrays row-major)."
     )
     user_text = "Mode: single" if mode == "single" else "Mode: grid_2x4"
     data = {
@@ -914,77 +900,99 @@ def _fallback_openai_detect(image_b64: str, mode: str = "single"):
     try:
         obj = json.loads(txt)
     except Exception:
-        # Try to extract a JSON block heuristically
-        start = txt.find("{")
-        end = txt.rfind("}")
-        obj = json.loads(txt[start:end+1]) if start >= 0 and end > start else {}
-
+        i, j = txt.find("{"), txt.rfind("}")
+        obj = json.loads(txt[i:j+1]) if i >= 0 and j > i else {}
     if mode == "single":
-        raw = obj.get("cues") or []
-        return [ _norm_label(x) for x in raw if isinstance(x, str) ]
-    else:
-        grid = obj.get("grid") or []
-        out = []
-        for cell in grid[:8]:
-            if isinstance(cell, list):
-                out.append(set(_norm_label(x) for x in cell if isinstance(x, str)))
-            else:
-                out.append(set())
-        # pad to 8 if short
-        while len(out) < 8:
+        return [_norm_label(x) for x in (obj.get("cues") or []) if isinstance(x, str)]
+    # grid
+    out = []
+    for cell in (obj.get("grid") or [])[:8]:
+        if isinstance(cell, list):
+            out.append(set(_norm_label(x) for x in cell if isinstance(x, str)))
+        else:
             out.append(set())
-        return out
+    while len(out) < 8: out.append(set())
+    return out
 
 def _detect_with_agent_or_fallback(image_b64: str, mode: str):
-    """
-    Unified detector. If agent_runner.detect_levers exists, use it.
-    Contract:
-      mode='single' -> returns list[str]
-      mode='grid'   -> returns list[set[str]] length 8
-    """
     if _agent_detect_levers is not None:
-        # Expect agent function to return a dict like {"mode": "...", "cues":[...]} or {"grid":[[...],...]}
         res = _agent_detect_levers(image_b64, mode)
         if mode == "single":
-            cues = res.get("cues") or []
-            return [ _norm_label(x) for x in cues if isinstance(x, str) ]
-        else:
-            grid = res.get("grid") or []
-            out = []
-            for cell in grid[:8]:
-                if isinstance(cell, (list, set, tuple)):
-                    out.append(set(_norm_label(x) for x in cell))
-                else:
-                    out.append(set())
-            while len(out) < 8:
+            cues = [x for x in (res.get("cues") or []) if isinstance(x, str)]
+            return [_norm_label(x) for x in cues]
+        grid = res.get("grid") or []
+        out = []
+        for cell in grid[:8]:
+            if isinstance(cell, (list, set, tuple)):
+                out.append(set(_norm_label(x) for x in cell))
+            else:
                 out.append(set())
-            return out
-    # Fallback
-    return _fallback_openai_detect(image_b64, "single" if mode == "single" else "grid")
+        while len(out) < 8: out.append(set())
+        return out
+    return _fallback_openai_detect(image_b64, mode)
+
+@_catch_and_report
+def _score_single_card_ui(cues_list: list[str]) -> str:
+    if score_single_card is None:
+        return "❌ Scoring utility not available. Ensure score_image.py is present."
+    cues = set(cues_list or [])
+    res = score_single_card(cues)
+    md = (
+        "### Single card score\n\n"
+        f"Selected cues: {', '.join(sorted(cues)) if cues else '—'}\n\n"
+        "| Metric | Value |\n|---|---:|\n"
+        f"| raw | {_fmt_num(res.get('raw'))} |\n"
+        f"| price_weight | {_fmt_num(res.get('price_weight'))} |\n"
+        f"| final | {_fmt_num(res.get('final'))} |\n"
+        f"| ∑ s_i | {_fmt_num(res.get('sum_s'))} |\n"
+        f"| ∑ w_i | {_fmt_num(res.get('sum_w'))} |\n"
+    )
+    return md
+
+@_catch_and_report
+def _score_grid_2x4_ui(*cards_lists: list[list[str]]) -> str:
+    if score_grid_2x4 is None:
+        return "❌ Scoring utility not available. Ensure score_image.py is present."
+    if len(cards_lists) != 8:
+        return "❌ Provide cues for all 8 cards (row-major)."
+    grid_sets = [set(lst or []) for lst in cards_lists]
+    res = score_grid_2x4(grid_sets)
+    rows = res.get("cards", [])
+    lines = [
+        "### Grid 2×4 scores", "",
+        "| Card | Row | Col | raw | final | ∑ s_i | ∑ w_i |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for i, r in enumerate(rows, 1):
+        lines.append(
+            f"| {i} | {r.get('row')} | {r.get('col')} | "
+            f"{_fmt_num(r.get('raw'))} | {_fmt_num(r.get('final'))} | "
+            f"{_fmt_num(r.get('sum_s'))} | {_fmt_num(r.get('sum_w'))} |"
+        )
+    lines += [
+        "", "#### Aggregates", "",
+        "| Metric | Value |", "|---|---:|",
+        f"| raw_mean | {_fmt_num(res.get('raw_mean'))} |",
+        f"| final_mean | {_fmt_num(res.get('final_mean'))} |",
+        f"| raw_best | {_fmt_num(res.get('raw_best'))} |",
+        f"| final_best | {_fmt_num(res.get('final_best'))} |",
+        f"| price_weight | {_fmt_num(res.get('price_weight'))} |",
+    ]
+    return "\n".join(lines)
 
 @_catch_and_report
 def _auto_single_from_image(filepath: str) -> tuple:
-    """
-    Upload single image -> detect cues -> score -> show badges + score markdown.
-    Returns (preview_update, badges_md, score_md, status_md)
-    """
     if not filepath:
         return gr.update(value=None), "No image.", "",""
     if score_single_card is None:
         return gr.update(value=None), "Scoring utility not available.", "",""
-
     data_url = _file_to_data_url(filepath)
-    # Detect
     cues = _detect_with_agent_or_fallback(data_url, "single")
-    # Filter to known scorer cues
     cues = [c for c in cues if c in CUE_CHOICES_SCORER]
-    # Score
     res = score_single_card(set(cues))
     badges_md = "#### Identified badges\n" + (", ".join(cues) if cues else "—")
     score_md = (
-        "#### Single card score\n\n"
-        "| Metric | Value |\n"
-        "|---|---:|\n"
+        "#### Single card score\n\n| Metric | Value |\n|---|---:|\n"
         f"| raw | {_fmt_num(res.get('raw'))} |\n"
         f"| price_weight | {_fmt_num(res.get('price_weight'))} |\n"
         f"| final | {_fmt_num(res.get('final'))} |\n"
@@ -995,36 +1003,23 @@ def _auto_single_from_image(filepath: str) -> tuple:
 
 @_catch_and_report
 def _auto_grid_from_image(filepath: str) -> tuple:
-    """
-    Upload 2×4 grid -> detect cues per card -> score -> show badges per card + aggregates.
-    Returns (preview_update, badges_md, score_md, status_md)
-    """
     if not filepath:
         return gr.update(value=None), "No image.","",""
     if score_grid_2x4 is None:
-        return gr.update(value=None), "Scoring utility not available.", "",""
-
+        return gr.update(value=None), "Scoring utility not available.","",""
     data_url = _file_to_data_url(filepath)
     grid_sets = _detect_with_agent_or_fallback(data_url, "grid")
-    # Ensure 8 sets and only known cues
     grid_sets = [set(c for c in cell if c in CUE_CHOICES_SCORER) for cell in (grid_sets[:8] + [set()]*8)[:8]]
-
-    # Score
     res = score_grid_2x4(grid_sets)
     rows = res.get("cards", [])
-
-    # Build badges table
     b_lines = ["#### Identified badges per card (row-major)", "", "| Card | Row | Col | Badges |", "|---:|---:|---:|---|"]
     for i, cell in enumerate(grid_sets, 1):
         r = 1 if i <= 4 else 2
         c = ((i - 1) % 4) + 1
         b_lines.append(f"| {i} | {r} | {c} | {', '.join(sorted(cell)) if cell else '—'} |")
     badges_md = "\n".join(b_lines)
-
-    # Build score table
     s_lines = [
-        "#### Grid 2×4 scores",
-        "",
+        "#### Grid 2×4 scores", "",
         "| Card | Row | Col | raw | final | ∑ s_i | ∑ w_i |",
         "|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -1035,11 +1030,8 @@ def _auto_grid_from_image(filepath: str) -> tuple:
             f"{_fmt_num(r.get('sum_s'))} | {_fmt_num(r.get('sum_w'))} |"
         )
     s_lines += [
-        "",
-        "##### Aggregates",
-        "",
-        "| Metric | Value |",
-        "|---|---:|",
+        "", "##### Aggregates", "",
+        "| Metric | Value |", "|---|---:|",
         f"| raw_mean | {_fmt_num(res.get('raw_mean'))} |",
         f"| final_mean | {_fmt_num(res.get('final_mean'))} |",
         f"| raw_best | {_fmt_num(res.get('raw_best'))} |",
@@ -1047,14 +1039,10 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         f"| price_weight | {_fmt_num(res.get('price_weight'))} |",
     ]
     score_md = "\n".join(s_lines)
-
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
 @_catch_and_report
 def _handle_image_upload(file) -> tuple:
-    """
-    Save the uploaded image under uploads/ and show a preview + saved path.
-    """
     if file is None:
         return gr.update(value=None), "No file selected."
     try:
@@ -1067,7 +1055,7 @@ def _handle_image_upload(file) -> tuple:
         return gr.update(value=str(dest)), f"✅ Saved to {dest}"
     except Exception as e:
         return gr.update(value=None), f"❌ Upload failed: {type(e).__name__}: {e}"
-# === End scoring additions ====================================================
+# === End Scoring helpers =====================================================
 
 
 # ---------- UI ----------
@@ -1289,5 +1277,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
