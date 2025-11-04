@@ -823,6 +823,13 @@ except Exception as _sc_err:
     score_grid_2x4 = None
     LEARNED_PARAMS = {}
 
+# Try to import a detector from agent_runner if your repo already has one.
+# If not present, we fall back to a local OpenAI Vision call.
+try:
+    from agent_runner import detect_levers as _agent_detect_levers  # expected signature: detect_levers(image_b64, mode)
+except Exception:
+    _agent_detect_levers = None
+
 UPLOADS_DIR = pathlib.Path("uploads")
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -833,21 +840,149 @@ CUE_CHOICES_SCORER = [k for k in LEARNED_PARAMS.keys() if k not in _CUE_EXCLUDE]
     "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"
 ]
 
+# Normalise synonyms coming from the detector to match LEARNED_PARAMS keys
+_NORMALISE = {
+    "all-in framing": "All-in framing",
+    "all in framing": "All-in framing",
+    "all-in v. partitioned pricing": "All-in framing",
+    "assurance": "Assurance",
+    "scarcity": "Scarcity tag",
+    "scarcity tag": "Scarcity tag",
+    "strike-through": "Strike-through",
+    "strikethrough": "Strike-through",
+    "timer": "Timer",
+}
+
+def _norm_label(x: str) -> str:
+    if not x:
+        return ""
+    k = x.strip().lower()
+    return _NORMALISE.get(k, x.strip())
+
 def _fmt_num(x, nd=3):
     try:
         return f"{float(x):.{nd}f}"
     except Exception:
         return "—"
 
+def _file_to_data_url(path_like: str) -> str:
+    p = pathlib.Path(path_like)
+    b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+    # Using data URL simplifies passing to vision APIs
+    suffix = (p.suffix or "").lower()
+    mime = "image/png" if suffix not in {".jpg", ".jpeg", ".webp"} else ("image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/webp")
+    return f"data:{mime};base64,{b64}"
+
+def _fallback_openai_detect(image_b64: str, mode: str = "single"):
+    """
+    Fallback detector using your existing OpenAI stack.
+    Returns:
+      - for mode='single': list[str] of cues
+      - for mode='grid': list[set[str]] of length 8 (row-major)
+    """
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
+
+    # Simple JSON schema prompt to extract cues; we keep it deterministic
+    sys = (
+        "You are an e-commerce UI analyst. Identify which of these cues are present in the image: "
+        f"{', '.join(sorted(CUE_CHOICES_SCORER))}. "
+        "Return JSON only. For a single product image, return {\"cues\": [..]}. "
+        "For a 2x4 grid, return {\"grid\": [[..],[..],...]} with 8 arrays row-major."
+    )
+    user_text = "Mode: single" if mode == "single" else "Mode: grid_2x4"
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_b64}}
+            ]},
+        ],
+        "max_tokens": 256,
+        "temperature": 0
+    }
+    r = requests.post(url, headers=headers, json=data, timeout=(12, 240))
+    if r.status_code >= 400:
+        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
+    txt = r.json()["choices"][0]["message"]["content"]
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        # Try to extract a JSON block heuristically
+        start = txt.find("{")
+        end = txt.rfind("}")
+        obj = json.loads(txt[start:end+1]) if start >= 0 and end > start else {}
+
+    if mode == "single":
+        raw = obj.get("cues") or []
+        return [ _norm_label(x) for x in raw if isinstance(x, str) ]
+    else:
+        grid = obj.get("grid") or []
+        out = []
+        for cell in grid[:8]:
+            if isinstance(cell, list):
+                out.append(set(_norm_label(x) for x in cell if isinstance(x, str)))
+            else:
+                out.append(set())
+        # pad to 8 if short
+        while len(out) < 8:
+            out.append(set())
+        return out
+
+def _detect_with_agent_or_fallback(image_b64: str, mode: str):
+    """
+    Unified detector. If agent_runner.detect_levers exists, use it.
+    Contract:
+      mode='single' -> returns list[str]
+      mode='grid'   -> returns list[set[str]] length 8
+    """
+    if _agent_detect_levers is not None:
+        # Expect agent function to return a dict like {"mode": "...", "cues":[...]} or {"grid":[[...],...]}
+        res = _agent_detect_levers(image_b64, mode)
+        if mode == "single":
+            cues = res.get("cues") or []
+            return [ _norm_label(x) for x in cues if isinstance(x, str) ]
+        else:
+            grid = res.get("grid") or []
+            out = []
+            for cell in grid[:8]:
+                if isinstance(cell, (list, set, tuple)):
+                    out.append(set(_norm_label(x) for x in cell))
+                else:
+                    out.append(set())
+            while len(out) < 8:
+                out.append(set())
+            return out
+    # Fallback
+    return _fallback_openai_detect(image_b64, "single" if mode == "single" else "grid")
+
 @_catch_and_report
-def _score_single_card_ui(cues_list: list[str]) -> str:
+def _auto_single_from_image(filepath: str) -> tuple:
+    """
+    Upload single image -> detect cues -> score -> show badges + score markdown.
+    Returns (preview_update, badges_md, score_md, status_md)
+    """
+    if not filepath:
+        return gr.update(value=None), "No image.", "",""
     if score_single_card is None:
-        return "❌ Scoring utility not available. Ensure score_image.py is present and importable."
-    cues = set(cues_list or [])
-    res = score_single_card(cues)
-    md = (
-        "### Single card score\n\n"
-        f"Selected cues: {', '.join(sorted(cues)) if cues else '—'}\n\n"
+        return gr.update(value=None), "Scoring utility not available.", "",""
+
+    data_url = _file_to_data_url(filepath)
+    # Detect
+    cues = _detect_with_agent_or_fallback(data_url, "single")
+    # Filter to known scorer cues
+    cues = [c for c in cues if c in CUE_CHOICES_SCORER]
+    # Score
+    res = score_single_card(set(cues))
+    badges_md = "#### Identified badges\n" + (", ".join(cues) if cues else "—")
+    score_md = (
+        "#### Single card score\n\n"
         "| Metric | Value |\n"
         "|---|---:|\n"
         f"| raw | {_fmt_num(res.get('raw'))} |\n"
@@ -856,34 +991,52 @@ def _score_single_card_ui(cues_list: list[str]) -> str:
         f"| ∑ s_i | {_fmt_num(res.get('sum_s'))} |\n"
         f"| ∑ w_i | {_fmt_num(res.get('sum_w'))} |\n"
     )
-    return md
+    return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
 @_catch_and_report
-def _score_grid_2x4_ui(*cards_lists: list[list[str]]) -> str:
+def _auto_grid_from_image(filepath: str) -> tuple:
+    """
+    Upload 2×4 grid -> detect cues per card -> score -> show badges per card + aggregates.
+    Returns (preview_update, badges_md, score_md, status_md)
+    """
+    if not filepath:
+        return gr.update(value=None), "No image.","",""
     if score_grid_2x4 is None:
-        return "❌ Scoring utility not available. Ensure score_image.py is present and importable."
-    # Expect 8 lists (row-major). Convert each to a set of cues.
-    if len(cards_lists) != 8:
-        return "❌ Please provide cues for all 8 cards (row-major)."
-    grid_sets = [set(lst or []) for lst in cards_lists]
+        return gr.update(value=None), "Scoring utility not available.", "",""
+
+    data_url = _file_to_data_url(filepath)
+    grid_sets = _detect_with_agent_or_fallback(data_url, "grid")
+    # Ensure 8 sets and only known cues
+    grid_sets = [set(c for c in cell if c in CUE_CHOICES_SCORER) for cell in (grid_sets[:8] + [set()]*8)[:8]]
+
+    # Score
     res = score_grid_2x4(grid_sets)
     rows = res.get("cards", [])
-    # Per-card table
-    lines = [
-        "### Grid 2×4 scores",
+
+    # Build badges table
+    b_lines = ["#### Identified badges per card (row-major)", "", "| Card | Row | Col | Badges |", "|---:|---:|---:|---|"]
+    for i, cell in enumerate(grid_sets, 1):
+        r = 1 if i <= 4 else 2
+        c = ((i - 1) % 4) + 1
+        b_lines.append(f"| {i} | {r} | {c} | {', '.join(sorted(cell)) if cell else '—'} |")
+    badges_md = "\n".join(b_lines)
+
+    # Build score table
+    s_lines = [
+        "#### Grid 2×4 scores",
         "",
         "| Card | Row | Col | raw | final | ∑ s_i | ∑ w_i |",
         "|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for i, r in enumerate(rows, 1):
-        lines.append(
+        s_lines.append(
             f"| {i} | {r.get('row')} | {r.get('col')} | "
             f"{_fmt_num(r.get('raw'))} | {_fmt_num(r.get('final'))} | "
             f"{_fmt_num(r.get('sum_s'))} | {_fmt_num(r.get('sum_w'))} |"
         )
-    lines += [
+    s_lines += [
         "",
-        "#### Aggregates",
+        "##### Aggregates",
         "",
         "| Metric | Value |",
         "|---|---:|",
@@ -893,7 +1046,9 @@ def _score_grid_2x4_ui(*cards_lists: list[list[str]]) -> str:
         f"| final_best | {_fmt_num(res.get('final_best'))} |",
         f"| price_weight | {_fmt_num(res.get('price_weight'))} |",
     ]
-    return "\n".join(lines)
+    score_md = "\n".join(s_lines)
+
+    return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
 @_catch_and_report
 def _handle_image_upload(file) -> tuple:
@@ -905,7 +1060,6 @@ def _handle_image_upload(file) -> tuple:
     try:
         import shutil
         src = pathlib.Path(file.name)
-        # Preserve extension if available
         ext = src.suffix if src.suffix else ".png"
         new_name = f"img_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
         dest = UPLOADS_DIR / new_name
@@ -1052,55 +1206,87 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[stats_status, stats_choice, stats_long, stats_log, stats_badges],
     )
 
-    # === Scoring UI (placed at the bottom as requested) ======================
-    gr.Markdown("## Scoring (image or 2×4 grid)")
+   # === Scoring UI (placed at the bottom as requested) ======================
+gr.Markdown("## Scoring from image (auto-detect) and manual check (optional)")
 
-    with gr.Tabs():
-        with gr.Tab("Single card"):
-            single_cues = gr.CheckboxGroup(
-                choices=CUE_CHOICES_SCORER,
-                label="Select cues present on the single card (badges)",
-            )
-            single_score_btn = gr.Button("Calculate score", variant="primary")
-            single_score_md = gr.Markdown()
-            single_score_btn.click(
-                fn=_score_single_card_ui,
-                inputs=[single_cues],
-                outputs=[single_score_md],
-            )
+with gr.Tabs():
+    # -------- Auto-detect: Single card --------
+    with gr.Tab("Auto-detect — Single card"):
+        auto_single_img = gr.Image(label="Upload single product image", type="filepath")
+        auto_single_go = gr.Button("Detect badges and score", variant="primary")
+        auto_single_preview = gr.Image(label="Preview", interactive=False)
+        auto_single_badges = gr.Markdown()
+        auto_single_score = gr.Markdown()
+        auto_single_status = gr.Markdown()
 
-        with gr.Tab("Grid 2×4"):
-            gr.Markdown("Select cues for each of the eight cards (row-major).")
-            grid_cards = []
-            # Build 2 rows × 4 columns of checkboxes
-            for r in range(2):
-                with gr.Row():
-                    for c in range(4):
-                        idx = r * 4 + c + 1
-                        cb = gr.CheckboxGroup(
-                            choices=CUE_CHOICES_SCORER,
-                            label=f"Card {idx} (Row {r+1}, Col {c+1})",
-                        )
-                        grid_cards.append(cb)
-            grid_score_btn = gr.Button("Calculate score", variant="primary")
-            grid_score_md = gr.Markdown()
-            grid_score_btn.click(
-                fn=_score_grid_2x4_ui,
-                inputs=grid_cards,   # 8 inputs, row-major
-                outputs=[grid_score_md],
-            )
+        auto_single_go.click(
+            fn=_auto_single_from_image,
+            inputs=[auto_single_img],
+            outputs=[auto_single_preview, auto_single_badges, auto_single_score, auto_single_status],
+        )
 
-    # Upload button at the very bottom of the screen
-    gr.Markdown("### Upload image")
-    upload_preview = gr.Image(label="Uploaded image preview", interactive=False)
-    upload_btn = gr.UploadButton("Upload image", file_types=["image"], file_count="single")
-    upload_status = gr.Markdown()
-    upload_btn.upload(
-        fn=_handle_image_upload,
-        inputs=[upload_btn],
-        outputs=[upload_preview, upload_status],
-    )
+    # -------- Auto-detect: 2×4 grid --------
+    with gr.Tab("Auto-detect — Grid 2×4"):
+        auto_grid_img = gr.Image(label="Upload 2×4 grid image", type="filepath")
+        auto_grid_go = gr.Button("Detect badges and score grid", variant="primary")
+        auto_grid_preview = gr.Image(label="Preview", interactive=False)
+        auto_grid_badges = gr.Markdown()
+        auto_grid_score = gr.Markdown()
+        auto_grid_status = gr.Markdown()
+
+        auto_grid_go.click(
+            fn=_auto_grid_from_image,
+            inputs=[auto_grid_img],
+            outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
+        )
+
+    # -------- Manual (kept for verification / fallback) --------
+    with gr.Tab("Manual — Single card"):
+        single_cues = gr.CheckboxGroup(
+            choices=CUE_CHOICES_SCORER,
+            label="Select cues present on the single card (badges)",
+        )
+        single_score_btn = gr.Button("Calculate score", variant="secondary")
+        single_score_md = gr.Markdown()
+        single_score_btn.click(
+            fn=_score_single_card_ui,
+            inputs=[single_cues],
+            outputs=[single_score_md],
+        )
+
+    with gr.Tab("Manual — Grid 2×4"):
+        gr.Markdown("Select cues for each of the eight cards (row-major).")
+        grid_cards = []
+        for r in range(2):
+            with gr.Row():
+                for c in range(4):
+                    idx = r * 4 + c + 1
+                    cb = gr.CheckboxGroup(
+                        choices=CUE_CHOICES_SCORER,
+                        label=f"Card {idx} (Row {r+1}, Col {c+1})",
+                    )
+                    grid_cards.append(cb)
+        grid_score_btn = gr.Button("Calculate score", variant="secondary")
+        grid_score_md = gr.Markdown()
+        grid_score_btn.click(
+            fn=_score_grid_2x4_ui,
+            inputs=grid_cards,   # 8 inputs, row-major
+            outputs=[grid_score_md],
+        )
+
+# Upload button at the very bottom (saves file to /uploads for later reuse)
+gr.Markdown("### Upload image (save only)")
+upload_preview = gr.Image(label="Uploaded image preview", interactive=False)
+upload_btn = gr.UploadButton("Upload image", file_types=["image"], file_count="single")
+upload_status = gr.Markdown()
+upload_btn.upload(
+    fn=_handle_image_upload,
+    inputs=[upload_btn],
+    outputs=[upload_preview, upload_status],
+)
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
