@@ -784,7 +784,6 @@ def _preview_badges_effects(admin_key: str):
 
 
 # ---------- UI logic for Automatic / Manual iterations ----------
-
 @_catch_and_report
 def _on_badges_change(badges: list[str], auto_checked: bool, manual_checked: bool):
     if auto_checked and not manual_checked:
@@ -811,6 +810,110 @@ def _toggle_manual(manual_checked: bool, badges: list[str]):
     # If Manual is unticked, return to Auto
     n = _auto_iterations_from_badges(badges)
     return gr.update(value=True), gr.update(value=n, interactive=False)
+
+
+# === Scoring additions: imports, constants, and handlers =====================
+# These do not affect your simulation pipeline; they are self-contained UI hooks.
+try:
+    # score_image.py must be in the same directory (as you provided)
+    from score_image import score_single_card, score_grid_2x4, LEARNED_PARAMS
+except Exception as _sc_err:
+    # Soft-fail so the rest of the app still runs; the UI will show an error on use
+    score_single_card = None
+    score_grid_2x4 = None
+    LEARNED_PARAMS = {}
+
+UPLOADS_DIR = pathlib.Path("uploads")
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Build cue choices from your learned params, excluding position + ln(price)
+_CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
+CUE_CHOICES_SCORER = [k for k in LEARNED_PARAMS.keys() if k not in _CUE_EXCLUDE] or [
+    # Fallback to your canonical set names if LEARNED_PARAMS import failed
+    "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"
+]
+
+def _fmt_num(x, nd=3):
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "—"
+
+@_catch_and_report
+def _score_single_card_ui(cues_list: list[str]) -> str:
+    if score_single_card is None:
+        return "❌ Scoring utility not available. Ensure score_image.py is present and importable."
+    cues = set(cues_list or [])
+    res = score_single_card(cues)
+    md = (
+        "### Single card score\n\n"
+        f"Selected cues: {', '.join(sorted(cues)) if cues else '—'}\n\n"
+        "| Metric | Value |\n"
+        "|---|---:|\n"
+        f"| raw | {_fmt_num(res.get('raw'))} |\n"
+        f"| price_weight | {_fmt_num(res.get('price_weight'))} |\n"
+        f"| final | {_fmt_num(res.get('final'))} |\n"
+        f"| ∑ s_i | {_fmt_num(res.get('sum_s'))} |\n"
+        f"| ∑ w_i | {_fmt_num(res.get('sum_w'))} |\n"
+    )
+    return md
+
+@_catch_and_report
+def _score_grid_2x4_ui(*cards_lists: list[list[str]]) -> str:
+    if score_grid_2x4 is None:
+        return "❌ Scoring utility not available. Ensure score_image.py is present and importable."
+    # Expect 8 lists (row-major). Convert each to a set of cues.
+    if len(cards_lists) != 8:
+        return "❌ Please provide cues for all 8 cards (row-major)."
+    grid_sets = [set(lst or []) for lst in cards_lists]
+    res = score_grid_2x4(grid_sets)
+    rows = res.get("cards", [])
+    # Per-card table
+    lines = [
+        "### Grid 2×4 scores",
+        "",
+        "| Card | Row | Col | raw | final | ∑ s_i | ∑ w_i |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for i, r in enumerate(rows, 1):
+        lines.append(
+            f"| {i} | {r.get('row')} | {r.get('col')} | "
+            f"{_fmt_num(r.get('raw'))} | {_fmt_num(r.get('final'))} | "
+            f"{_fmt_num(r.get('sum_s'))} | {_fmt_num(r.get('sum_w'))} |"
+        )
+    lines += [
+        "",
+        "#### Aggregates",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| raw_mean | {_fmt_num(res.get('raw_mean'))} |",
+        f"| final_mean | {_fmt_num(res.get('final_mean'))} |",
+        f"| raw_best | {_fmt_num(res.get('raw_best'))} |",
+        f"| final_best | {_fmt_num(res.get('final_best'))} |",
+        f"| price_weight | {_fmt_num(res.get('price_weight'))} |",
+    ]
+    return "\n".join(lines)
+
+@_catch_and_report
+def _handle_image_upload(file) -> tuple:
+    """
+    Save the uploaded image under uploads/ and show a preview + saved path.
+    """
+    if file is None:
+        return gr.update(value=None), "No file selected."
+    try:
+        import shutil
+        src = pathlib.Path(file.name)
+        # Preserve extension if available
+        ext = src.suffix if src.suffix else ".png"
+        new_name = f"img_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+        dest = UPLOADS_DIR / new_name
+        shutil.copy(src, dest)
+        return gr.update(value=str(dest)), f"✅ Saved to {dest}"
+    except Exception as e:
+        return gr.update(value=None), f"❌ Upload failed: {type(e).__name__}: {e}"
+# === End scoring additions ====================================================
 
 
 # ---------- UI ----------
@@ -949,7 +1052,55 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[stats_status, stats_choice, stats_long, stats_log, stats_badges],
     )
 
+    # === Scoring UI (placed at the bottom as requested) ======================
+    gr.Markdown("## Scoring (image or 2×4 grid)")
+
+    with gr.Tabs():
+        with gr.Tab("Single card"):
+            single_cues = gr.CheckboxGroup(
+                choices=CUE_CHOICES_SCORER,
+                label="Select cues present on the single card (badges)",
+            )
+            single_score_btn = gr.Button("Calculate score", variant="primary")
+            single_score_md = gr.Markdown()
+            single_score_btn.click(
+                fn=_score_single_card_ui,
+                inputs=[single_cues],
+                outputs=[single_score_md],
+            )
+
+        with gr.Tab("Grid 2×4"):
+            gr.Markdown("Select cues for each of the eight cards (row-major).")
+            grid_cards = []
+            # Build 2 rows × 4 columns of checkboxes
+            for r in range(2):
+                with gr.Row():
+                    for c in range(4):
+                        idx = r * 4 + c + 1
+                        cb = gr.CheckboxGroup(
+                            choices=CUE_CHOICES_SCORER,
+                            label=f"Card {idx} (Row {r+1}, Col {c+1})",
+                        )
+                        grid_cards.append(cb)
+            grid_score_btn = gr.Button("Calculate score", variant="primary")
+            grid_score_md = gr.Markdown()
+            grid_score_btn.click(
+                fn=_score_grid_2x4_ui,
+                inputs=grid_cards,   # 8 inputs, row-major
+                outputs=[grid_score_md],
+            )
+
+    # Upload button at the very bottom of the screen
+    gr.Markdown("### Upload image")
+    upload_preview = gr.Image(label="Uploaded image preview", interactive=False)
+    upload_btn = gr.UploadButton("Upload image", file_types=["image"], file_count="single")
+    upload_status = gr.Markdown()
+    upload_btn.upload(
+        fn=_handle_image_upload,
+        inputs=[upload_btn],
+        outputs=[upload_preview, upload_status],
+    )
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
-
