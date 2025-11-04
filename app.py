@@ -1344,6 +1344,137 @@ def _ab_run_two_images(file_a: str, file_b: str, n_iter: int):
     return badges_md, results_md, note
 # === End A/B helpers =========================================================
 
+# --- indexing helpers ---------------------------------------------------------
+def _to_zero_based(v: int, max_inclusive_1idx: int) -> int | None:
+    try:
+        v = int(v)
+    except Exception:
+        return None
+    # accept 1-indexed [1..K] or 0-indexed [0..K-1]
+    if 1 <= v <= max_inclusive_1idx:
+        return v - 1
+    if 0 <= v <= (max_inclusive_1idx - 1):
+        return v
+    return None
+
+def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str | None):
+    # 4×A and 4×B randomly assigned across 8 slots
+    labels = ["A"] * 4 + ["B"] * 4
+    random.shuffle(labels)
+    data_url, mat = _compose_grid_2x4(file_a, file_b, labels)
+
+    from agent_runner import call_openai
+    args = call_openai(data_url, category or "", model_name=model_name)
+
+    r0 = _to_zero_based(args.get("row", None), 2)   # rows 0..1
+    c0 = _to_zero_based(args.get("col", None), 4)   # cols 0..3
+    if r0 is None or c0 is None:
+        return None, mat
+    chosen = mat[r0][c0]
+    return chosen, mat  # "A" or "B" (or None)
+# --- cancel support -----------------------------------------------------------
+@_catch_and_report
+def cancel_live_ab(job_id: str):
+    job_id = (job_id or "").strip()
+    with _JOBS_LOCK:
+        info = _JOBS.get(job_id)
+        if not info:
+            return "Unknown job ID."
+        info["cancel"] = True
+    return f"🛑 Stop requested for {job_id}. It will halt after the current trial."
+@_catch_and_report
+def submit_live_ab(file_a, file_b, n_trials, category="", model_name=""):
+    if not file_a or not file_b:
+        return "", "❌ Please upload both images."
+    try:
+        n = int(n_trials)
+        if n <= 0:
+            return "", "❌ Trials must be positive."
+    except Exception:
+        return "", "❌ Invalid trials."
+    jid = f"ab-{uuid.uuid4().hex[:8]}"
+    with _JOBS_LOCK:
+        _JOBS[jid] = {"status": "queued", "progress": 0, "total": n, "a": 0, "b": 0, "invalid": 0, "cancel": False}
+    threading.Thread(
+        target=_bg_run_live_ab,
+        args=(jid, file_a, file_b, n, category or "", model_name or None),
+        name=f"live-ab-{jid}",
+        daemon=True
+    ).start()
+    return jid, f"✅ Submitted live A/B job {jid} with {n} trials."
+@_catch_and_report
+def poll_live_ab(job_id: str):
+    job_id = (job_id or "").strip()
+    with _JOBS_LOCK:
+        info = _JOBS.get(job_id)
+    if not info:
+        return "Unknown job."
+    if info.get("status") == "running":
+        p = info.get("progress", 0); tot = info.get("total", 0)
+        a = info.get("a", 0); b = info.get("b", 0); inv = info.get("invalid", 0)
+        return f"Job {job_id}: running — {p}/{tot} trials; A={a}, B={b}, invalid={inv}"
+    return f"Job {job_id}: {info.get('status','unknown')}"
+def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, category: str | None, model_name: str | None):
+    try:
+        a = b = invalid = 0
+        cancelled = False
+        t = 0
+        for t in range(1, n_trials + 1):
+            # check cancellation
+            with _JOBS_LOCK:
+                if _JOBS.get(job_id, {}).get("cancel"):
+                    cancelled = True
+            if cancelled:
+                break
+
+            chosen, layout = _trial_once(file_a, file_b, category, model_name)
+            if chosen == "A":
+                a += 1
+            elif chosen == "B":
+                b += 1
+            else:
+                invalid += 1
+
+            if t % 10 == 0 or t == n_trials:
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {
+                        "status": "running",
+                        "progress": t,
+                        "total": n_trials,
+                        "a": a, "b": b, "invalid": invalid,
+                        "cancel": _JOBS.get(job_id, {}).get("cancel", False),
+                    }
+
+        completed = t if not cancelled else t - 1
+        completed = max(completed, 1)
+
+        # summarise whatever we have (use valid picks only for rates)
+        valid = max(1, a + b)
+        ra = a / valid
+        rb = b / valid
+
+        import math
+        p_pool = (a + b) / (2 * max(1, completed))
+        se = math.sqrt(p_pool * (1 - p_pool) * (2 / max(1, completed)))
+        z = (ra - rb) / se if se > 0 else 0.0
+
+        def ci(p, n):
+            s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
+            return (p - 1.96 * s, p + 1.96 * s)
+
+        res = {
+            "a": a, "b": b, "invalid": invalid, "n_trials": completed,
+            "rate_a": ra, "rate_b": rb,
+            "ci_a": ci(ra, valid), "ci_b": ci(rb, valid),
+            "z_two_prop": z,
+            "detector_note": f"{'Cancelled early; ' if cancelled else ''}one API call per trial; positions randomised each trial.",
+        }
+        with _JOBS_LOCK:
+            _JOBS[job_id] = {"status": "cancelled" if cancelled else "done", "result": res}
+    except Exception as e:
+        with _JOBS_LOCK:
+            _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
 # ---------- UI ----------
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     gr.Markdown(
@@ -1544,6 +1675,12 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
                 inputs=[abJob],
                 outputs=[abMD, abJSON],
             )
+            abStop = gr.Button("Stop")
+            abStop.click(
+                fn=cancel_live_ab,
+                inputs=[abJob],
+                outputs=[abStatus],
+            )
 
         ##A/B testing, NOT live
         with gr.Tab("A/B — Two images-Not Live"): 
@@ -1610,6 +1747,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
