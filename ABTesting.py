@@ -23,21 +23,23 @@ RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=
 
 # ---------------- Tool schema & prompt ----------------
 SCHEMA_JSON = {
-    "type": "object",
-    "properties": {
-        "chosen_title": {"type": "string"},
-        "row": {"type": "integer", "description": "0-based row index (0..1)"},
-        "col": {"type": "integer", "description": "0-based col index (0..3)"}
-    },
-    "required": ["chosen_title", "row", "col"],
-    "additionalProperties": False
+  "type": "object",
+  "properties": {
+    "chosen_title": {"type": "string"},   # optional
+    "row": {"type": "integer"},
+    "col": {"type": "integer"}
+  },
+  "required": ["row", "col"],
+  "additionalProperties": False
 }
 
+
 SYSTEM_PROMPT = (
-    "You are a personal shopping assistant helping someone choose exactly ONE product from a 2×4 grid. "
-    "The grid has 2 rows (0..1) and 4 columns (0..3). Return ONLY a function call named 'choose' with "
-    "fields: chosen_title (string), row (0-based int), col (0-based int). Do not output any prose."
+  "You are a shopping assistant choosing exactly ONE product from a 2×4 grid. "
+  "Return ONLY a function/tool call with fields row and col (0-based). "
+  "If a title field exists, set chosen_title to ''. No prose."
 )
+
 
 # ---------------- Image helpers ----------------
 def _img_to_data_url(img: Image.Image, fmt="JPEG", quality=80) -> str:
@@ -144,7 +146,7 @@ def _openai_choose(image_b64: str, category: str = "", model_name: str | None = 
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        "max_tokens": 64,
+        "max_tokens": 256,
         "temperature": 0
     }
 
