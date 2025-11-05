@@ -146,7 +146,7 @@ def _openai_choose(image_b64: str, category: str = "", model_name: str | None = 
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        "max_tokens": 256,
+        "max_tokens": 512,
         "temperature": 0
     }
 
@@ -339,59 +339,36 @@ def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str 
     return chosen, layout, diag
 
 # ---------------- Background worker ----------------
-def _bg_run_live_ab(
-    job_id: str,
-    file_a: str,
-    file_b: str,
-    n_trials: int,
-    category: str | None,
-    model_name: str | None,
-):
+def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, category: str | None, model_name: str | None):
     try:
         a = b = invalid = 0
-        cancelled = False
-
-        # lightweight diagnostics
-        from typing import Any
-        diag_counts: dict[str, int] = {
-            "api_calls": 0,
-            "tool_missing": 0,
-            "parse_error": 0,
-            "null_coords": 0,
-            "oob_coords": 0,
-        }
-        examples: list[dict[str, Any]] = []
+        diag_counts = {"api_calls": 0, "tool_missing": 0, "parse_error": 0, "null_coords": 0, "oob_coords": 0}
+        examples: list[dict[str, Any]] = []  # keep up to 5 diagnostic examples
 
         dbg_path = RESULTS_DIR / f"ab_debug_{job_id}.jsonl"
-
         with open(dbg_path, "a", encoding="utf-8") as dbg:
             for t in range(1, n_trials + 1):
-                # check for cancel
-                with _JOBS_LOCK:
+                with _JLOCK:
                     if _JOBS.get(job_id, {}).get("cancel", False):
-                        cancelled = True
                         break
 
-                # trial (expects _trial_once to accept dbg handle and return (choice, layout, diag))
                 chosen, layout, diag = _trial_once(file_a, file_b, category, model_name, dbg)
-
-                # counts
                 diag_counts["api_calls"] += 1
                 if not diag.get("tool_calls", False):
                     diag_counts["tool_missing"] += 1
                 if diag.get("parse_error"):
                     diag_counts["parse_error"] += 1
 
-                # tally choice
+                # track A/B or invalid
                 if chosen == "A":
                     a += 1
                 elif chosen == "B":
                     b += 1
                 else:
-                    invalid += 1
                     diag_counts["null_coords"] += 1
+                    invalid += 1
 
-                # keep a few examples
+                # retain a few recent examples
                 if len(examples) < 5:
                     examples.append({
                         "raw_args": diag.get("raw_args"),
@@ -400,78 +377,40 @@ def _bg_run_live_ab(
                         "mapped_choice": chosen
                     })
 
-                # progress pulse
                 if (t % 10 == 0) or (t == n_trials):
-                    with _JOBS_LOCK:
+                    with _JLOCK:
                         _JOBS[job_id] = {
-                            "status": "running",
-                            "progress": t,
-                            "total": n_trials,
-                            "a": a,
-                            "b": b,
-                            "invalid": invalid,
-                            "cancel": _JOBS.get(job_id, {}).get("cancel", False),
+                            "status": "running", "progress": t, "total": n_trials,
+                            "a": a, "b": b, "invalid": invalid, "cancel": _JOBS.get(job_id, {}).get("cancel", False)
                         }
 
-        # summary
-        completed = t if not cancelled else max(t - 1, 0)
-        completed = max(completed, 1)  # avoid division by zero in small/cancelled runs
-
+        # summarise
         valid = max(1, a + b)
         ra, rb = a / valid, b / valid
-
-        # pooled SE for two-proportion z
-        p_pool = (a + b) / (2 * completed)
-        se = math.sqrt(max(p_pool * (1.0 - p_pool) * (2.0 / completed), 0.0))
+        p_pool = (a + b) / (2 * max(1, n_trials))
+        se = math.sqrt(max(p_pool * (1 - p_pool) * (2 / max(1, n_trials)), 0.0))
         z = (ra - rb) / se if se > 0 else 0.0
 
-        # two-sided p via complementary error function (stable)
-        from math import erfc, sqrt
-        p_norm_two = erfc(abs(z) / sqrt(2.0))
-
-        def ci(p: float, n: int) -> tuple[float, float]:
-            s = math.sqrt(max(p * (1.0 - p) / max(1, n), 0.0))
+        def ci(p, n):
+            s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
             return (p - 1.96 * s, p + 1.96 * s)
 
         res = {
-            "a": a,
-            "b": b,
-            "invalid": invalid,
-            "n_trials": completed,
-            "rate_a": ra,
-            "rate_b": rb,
-            "ci_a": ci(ra, valid),
-            "ci_b": ci(rb, valid),
+            "a": a, "b": b, "invalid": invalid, "n_trials": n_trials,
+            "rate_a": ra, "rate_b": rb, "ci_a": ci(ra, valid), "ci_b": ci(rb, valid),
             "z_two_prop": z,
-            "p_two_prop": p_norm_two,
-            "detector_note": (
-                ("Cancelled early; " if cancelled else "")
-                + "one OpenAI call per trial; positions randomised each trial."
-            ),
+            "note": "one OpenAI call per trial; 4×A/4×B with randomised positions each trial.",
             "diagnostics": {
                 "job_debug_file": str(dbg_path),
                 "counts": diag_counts,
-                "examples": examples,
-            },
+                "examples": examples
+            }
         }
-
-        with _JOBS_LOCK:
+        with _JLOCK:
             _JOBS[job_id] = {"status": "done", "result": res}
-
     except Exception as e:
-        import traceback, pathlib, time as _time
-        tb = traceback.format_exc()
-        with _JOBS_LOCK:
+        with _JLOCK:
             _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-        try:
-            pathlib.Path("results").mkdir(parents=True, exist_ok=True)
-            err_path = f"results/ab_error_{job_id}_{int(_time.time())}.log"
-            with open(err_path, "w", encoding="utf-8") as fh:
-                fh.write(tb)
-        except Exception:
-            pass
-
-
 
 # ---------------- Public API ----------------
 def submit_live_ab(file_a, file_b, n_trials, category: str = "", model_name: str = ""):
@@ -506,8 +445,6 @@ def poll_live_ab(job_id: str):
         p = info.get("progress", 0); tot = info.get("total", 0)
         a = info.get("a", 0); b = info.get("b", 0); inv = info.get("invalid", 0)
         return f"Job {job_id}: running — {p}/{tot} trials; A={a}, B={b}, invalid={inv}"
-    if info.get("status") == "error":
-        return f"Job {job_id}: error — {info.get('error','')}"
     return f"Job {job_id}: {info.get('status','unknown')}"
 
 def fetch_live_ab(job_id: str):
@@ -527,11 +464,9 @@ def fetch_live_ab(job_id: str):
         f"[{r.get('ci_a',(0,0))[0]:.3f}, {r.get('ci_a',(0,0))[1]:.3f}] |\n"
         f"| B | {r.get('b',0)} | {r.get('rate_b',0):.3f} | "
         f"[{r.get('ci_b',(0,0))[0]:.3f}, {r.get('ci_b',(0,0))[1]:.3f}] |\n"
-        f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled); "
-        f"*p* = {r.get('p_two_prop',0):.4f}\n\n"
-        f"{r.get('detector_note','')}"
+        f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled)\n\n"
+        f"*{r.get('note','')}*"
     )
-
     # Return summary JSON including diagnostics; your UI already shows this JSON.
     return md, json.dumps(r, ensure_ascii=False, indent=2)
 
