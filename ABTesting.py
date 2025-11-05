@@ -390,7 +390,23 @@ def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, catego
         p_pool = (a + b) / (2 * max(1, n_trials))
         se = math.sqrt(max(p_pool * (1 - p_pool) * (2 / max(1, n_trials)), 0.0))
         z = (ra - rb) / se if se > 0 else 0.0
+      
+        # two-sided p from the normal approximation
+        import math
+        p_norm_two = 1.0 - math.erf(abs(z) / math.sqrt(2.0))  # = 2*(1 - Phi(|z|))
 
+        def ci(p, n):
+            s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
+            return (p - 1.96 * s, p + 1.96 * s)
+
+        res = {
+            "a": a, "b": b, "invalid": invalid, "n_trials": completed,
+            "rate_a": ra, "rate_b": rb,
+            "ci_a": ci(ra, valid), "ci_b": ci(rb, valid),
+            "z_two_prop": z,
+            "p_two_prop": p_norm_two,   # <— add this line
+            "detector_note": f"{'Cancelled early; ' if cancelled else ''}one API call per trial; positions randomised each trial.",
+        }
         def ci(p, n):
             s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
             return (p - 1.96 * s, p + 1.96 * s)
@@ -456,7 +472,7 @@ def fetch_live_ab(job_id: str):
     if info.get("status") != "done":
         return f"Job {job_id}: {info.get('status','not_ready')}", ""
     r = info.get("result") or {}
-    md = (
+        md = (
         "### Live A/B results (agent choices)\n\n"
         "| Variant | Picks | Rate | 95% CI |\n"
         "|---|---:|---:|---|\n"
@@ -464,9 +480,11 @@ def fetch_live_ab(job_id: str):
         f"[{r.get('ci_a',(0,0))[0]:.3f}, {r.get('ci_a',(0,0))[1]:.3f}] |\n"
         f"| B | {r.get('b',0)} | {r.get('rate_b',0):.3f} | "
         f"[{r.get('ci_b',(0,0))[0]:.3f}, {r.get('ci_b',(0,0))[1]:.3f}] |\n"
-        f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled)\n\n"
-        f"*{r.get('note','')}*"
+        f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled); "
+        f"*p* = {r.get('p_two_prop',0):.4f}\n\n"   # <— add this line
+        f"{r.get('detector_note','')}"
     )
+
     # Return summary JSON including diagnostics; your UI already shows this JSON.
     return md, json.dumps(r, ensure_ascii=False, indent=2)
 
