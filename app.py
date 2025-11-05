@@ -80,7 +80,7 @@ def _catch_and_report(fn):
             logging.exception("Gradio handler failed")
             msg = f"❌ {type(e).__name__}: {e}\n\n```\n{tb}\n```"
             # Handlers that return (markdown, json); pad if needed
-            return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui") else msg
+            return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui", "ab_fetch_ui") else msg
     return _inner
 
 
@@ -113,7 +113,7 @@ CURRENCY_CHOICES = ["£", "$", "EUR"]
 SEPARATE_BADGES = {
     "All-in v. partitioned pricing",
     "Assurance",
-    "Strike-through",   # “Strike”
+    "Strike-through",
     "Timer",
 }
 
@@ -1057,409 +1057,14 @@ def _handle_image_upload(file) -> tuple:
         return gr.update(value=None), f"❌ Upload failed: {type(e).__name__}: {e}"
 # === End Scoring helpers =====================================================
 
-# === Live A/B with GPT (async) — helpers =====================================
-import base64, io, random
-from PIL import Image
-
-def _img_to_data_url(img: Image.Image, fmt="JPEG", quality=85) -> str:
-    bio = io.BytesIO()
-    img.save(bio, fmt, quality=quality)
-    b64 = base64.b64encode(bio.getvalue()).decode("utf-8")
-    mime = "image/jpeg" if fmt.upper() == "JPEG" else f"image/{fmt.lower()}"
-    return f"data:{mime};base64,{b64}"
-
-def _load_and_fit(path: str, box_w: int, box_h: int) -> Image.Image:
-    im = Image.open(path).convert("RGB")
-    im.thumbnail((box_w, box_h), Image.LANCZOS)
-    # letterbox to exactly box size
-    bg = Image.new("RGB", (box_w, box_h), (255, 255, 255))
-    x = (box_w - im.width) // 2; y = (box_h - im.height) // 2
-    bg.paste(im, (x, y))
-    return bg
-
-def _compose_grid_2x4(file_a: str, file_b: str, labels: list[str]) -> tuple[str, list[list[str]]]:
-    """
-    labels: length-8 list of "A"/"B" in row-major; returns (data_url, layout_matrix)
-    """
-    # canvas sizes tuned for fast transfer; feel free to adjust
-    cell_w, cell_h = 320, 320
-    pad = 8
-    W = 4 * cell_w + 5 * pad
-    H = 2 * cell_h + 3 * pad
-    canvas = Image.new("RGB", (W, H), (255, 255, 255))
-
-    imgA = _load_and_fit(file_a, cell_w, cell_h)
-    imgB = _load_and_fit(file_b, cell_w, cell_h)
-
-    matrix = []
-    k = 0
-    for r in range(2):
-        row_labels = []
-        for c in range(4):
-            x = pad + c * (cell_w + pad)
-            y = pad + r * (cell_h + pad)
-            lab = labels[k]; k += 1
-            canvas.paste(imgA if lab == "A" else imgB, (x, y))
-            row_labels.append(lab)
-        matrix.append(row_labels)
-
-    return _img_to_data_url(canvas, fmt="JPEG", quality=80), matrix  # data URL, 2×4 labels
-
-# --- robust rc extraction (PASTE RIGHT BELOW _compose_grid_2x4) -------------
-def _rc_from_args(args: dict) -> tuple[int | None, int | None]:
-    """
-    Accepts multiple shapes from the tool output:
-      - {'row': 1|2, 'col': 1|2|3|4}  (1-indexed)
-      - {'row': 0|1, 'col': 0|1|2|3}  (0-indexed)
-      - {'index'|'slot'|'position'|'choice'|'chosen_index'|'selected_index': 1..8 or 0..7}
-      - or nested under {'arguments': '{...json...}'} or {'args': {...}}
-    Returns zero-based (r0,c0) or (None,None).
-    """
-    if not isinstance(args, dict):
-        return None, None
-
-    # Try explicit row/col first
-    for rk in ("row", "r", "row_idx", "row_index"):
-        if rk in args:
-            try:
-                rv = args.get(rk)
-            except Exception:
-                rv = None
-            from_indexed = None
-            try:
-                v = int(rv)
-                # 1..K => v-1; 0..K-1 => v
-                if 1 <= v <= 2:
-                    from_indexed = v - 1
-                elif 0 <= v <= 1:
-                    from_indexed = v
-            except Exception:
-                from_indexed = None
-            if from_indexed is None:
-                break
-            for ck in ("col", "c", "col_idx", "col_index"):
-                if ck in args:
-                    try:
-                        cv = int(args.get(ck))
-                        if 1 <= cv <= 4:
-                            c0 = cv - 1
-                        elif 0 <= cv <= 3:
-                            c0 = cv
-                        else:
-                            c0 = None
-                    except Exception:
-                        c0 = None
-                    if c0 is not None:
-                        return from_indexed, c0
-
-    # Single index / slot / position
-    for ik in ("index", "slot", "position", "choice", "chosen_index", "selected_index"):
-        if ik in args:
-            try:
-                v = int(args.get(ik))
-            except Exception:
-                v = None
-            if v is None:
-                continue
-            if 1 <= v <= 8:
-                v -= 1
-            if 0 <= v <= 7:
-                return v // 4, v % 4
-
-    # Nested arguments (common in tool_calls)
-    for vk in ("arguments", "args"):
-        if vk in args and isinstance(args[vk], (str, dict)):
-            try:
-                nested = json.loads(args[vk]) if isinstance(args[vk], str) else dict(args[vk])
-            except Exception:
-                nested = {}
-            r0, c0 = _rc_from_args(nested)
-            if r0 is not None and c0 is not None:
-                return r0, c0
-
-    return None, None
-
-
-def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str | None):
-    # 4×A and 4×B randomly assigned across 8 slots
-    labels = ["A"] * 4 + ["B"] * 4
-    random.shuffle(labels)
-    data_url, mat = _compose_grid_2x4(file_a, file_b, labels)
-
-    from agent_runner import call_openai
-    args = call_openai(data_url, category or "", model_name=model_name)
-
-    # Accept 0/1-indexed row/col OR a single slot/index
-    r0, c0 = _rc_from_args(args)
-    if r0 is None or c0 is None:
-        return None, mat
-    return mat[r0][c0], mat  # "A" or "B"
-
-# --- Async job wrappers (reuse your in-memory _JOBS store) -------------------
-def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, category: str | None, model_name: str | None):
-    try:
-        a, b = 0, 0
-        logs = []
-        for t in range(1, n_trials + 1):
-            chosen, layout = _trial_once(file_a, file_b, category, model_name)
-            if chosen == "A": a += 1
-            elif chosen == "B": b += 1
-            logs.append({"t": t, "chosen": chosen, "layout": layout})
-            if t % 10 == 0 or t == n_trials:
-                with _JOBS_LOCK:
-                    _JOBS[job_id] = {
-                        "status": "running",
-                        "progress": t,
-                        "total": n_trials,
-                        "a": a, "b": b,
-                    }
-        # finalise with summary stats
-        N = n_trials
-        ra, rb = (a / N), (b / N)
-        p_pool = (a + b) / (2 * N)
-        import math
-        se = math.sqrt(p_pool * (1 - p_pool) * (2 / N))
-        z = (ra - rb) / se if se > 0 else 0.0
-        def ci(p):
-            s = math.sqrt(max(p * (1 - p) / N, 0.0))
-            return (p - 1.96 * s, p + 1.96 * s)
-        res = {
-            "a": a, "b": b, "n": N,
-            "rate_a": ra, "rate_b": rb,
-            "ci_a": ci(ra), "ci_b": ci(rb),
-            "z_two_prop": z,
-            "detector_note": "One API call per trial to agent_runner.call_openai; positions randomised each trial.",
-        }
-        with _JOBS_LOCK:
-            _JOBS[job_id] = {"status": "done", "result": res}
-    except Exception as e:
-        with _JOBS_LOCK:
-            _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+# === Live A/B — UI wrappers calling ABTesting.py =============================
+from ABTesting import submit_live_ab as _ab_submit
+from ABTesting import poll_live_ab as _ab_poll
+from ABTesting import fetch_live_ab as _ab_fetch
+from ABTesting import cancel_live_ab as _ab_cancel
 
 @_catch_and_report
-def submit_live_ab(file_a, file_b, n_trials, category="", model_name=""):
-    if not file_a or not file_b:
-        return "", "❌ Please upload both images."
-    try:
-        n = int(n_trials)
-        if n <= 0:
-            return "", "❌ Iterations must be positive."
-    except Exception:
-        return "", "❌ Invalid iterations."
-    jid = f"ab-{uuid.uuid4().hex[:8]}"
-    with _JOBS_LOCK:
-        _JOBS[jid] = {"status": "queued", "progress": 0, "total": n}
-    threading.Thread(
-        target=_bg_run_live_ab,
-        args=(jid, file_a, file_b, n, category or "", model_name or None),
-        name=f"live-ab-{jid}",
-        daemon=True
-    ).start()
-    return jid, f"✅ Submitted live A/B job {jid} with {n} trials."
-
-@_catch_and_report
-def poll_live_ab(job_id: str):
-    job_id = (job_id or "").strip()
-    with _JOBS_LOCK:
-        info = _JOBS.get(job_id)
-    if not info:
-        return "Unknown job."
-    if info.get("status") == "running":
-        p = info.get("progress", 0); tot = info.get("total", 0)
-        a = info.get("a", 0); b = info.get("b", 0)
-        return f"Job {job_id}: running — {p}/{tot} trials; A={a}, B={b}"
-    return f"Job {job_id}: {info.get('status','unknown')}"
-
-@_catch_and_report
-def fetch_live_ab(job_id: str):
-    job_id = (job_id or "").strip()
-    with _JOBS_LOCK:
-        info = _JOBS.get(job_id)
-    if not info:
-        return "Unknown job.", ""
-    if info.get("status") != "done":
-        return f"Job {job_id}: {info.get('status','not_ready')}", ""
-    r = info.get("result") or {}
-    md = (
-        "### Live A/B results (agent choices)\n\n"
-        "| Variant | Picks | Rate | 95% CI |\n"
-        "|---|---:|---:|---|\n"
-        f"| A | {r.get('a',0)} | {r.get('rate_a',0):.3f} | "
-        f"[{r.get('ci_a',(0,0))[0]:.3f}, {r.get('ci_a',(0,0))[1]:.3f}] |\n"
-        f"| B | {r.get('b',0)} | {r.get('rate_b',0):.3f} | "
-        f"[{r.get('ci_b',(0,0))[0]:.3f}, {r.get('ci_b',(0,0))[1]:.3f}] |\n"
-        f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled)\n\n"
-        f"*{r.get('detector_note','')}*"
-    )
-    return md, json.dumps(r, ensure_ascii=False, indent=2)
-# === End Live A/B helpers ====================================================
-
-# === A/B simulation helpers (logit-style on LEARNED_PARAMS) ==================
-import math, random
-
-def _beta(name: str) -> float:
-    d = LEARNED_PARAMS.get(name)
-    return float(d.get("beta")) if isinstance(d, dict) and "beta" in d else 0.0
-
-def _utility_from_cues(cues: set[str], row: int | None = None, col: int | None = None) -> float:
-    """
-    Sum β over cues; optionally add position β's. ln(price) cancels in A/B if same for both,
-    so we *omit* it to let framing/badges drive differences.
-    """
-    u = 0.0
-    for c in cues:
-        u += _beta(c)
-    if row == 1:
-        u += _beta("Row 1")
-    # columns 1..3 have coefficients; column 4 is baseline in your table
-    if col == 1:
-        u += _beta("Column 1")
-    elif col == 2:
-        u += _beta("Column 2")
-    elif col == 3:
-        u += _beta("Column 3")
-    return u
-
-def _softmax(xs: list[float]) -> list[float]:
-    m = max(xs)
-    es = [math.exp(x - m) for x in xs]
-    s = sum(es)
-    return [e / s for e in es]
-
-def _detect_cues_for_image(filepath: str) -> list[str]:
-    data_url = _file_to_data_url(filepath)
-    cues = _detect_with_agent_or_fallback(data_url, "single")
-    # Map partitioning/all-in: if the detector didn’t explicitly say “All-in framing”,
-    # we leave it absent; do not add any “Partitioned” positive cue.
-    cues = [c for c in cues if c in CUE_CHOICES_SCORER]
-    return cues
-
-@_catch_and_report
-def _ab_run_two_images(file_a: str, file_b: str, n_iter: int):
-    if not file_a or not file_b:
-        return "", "", "Please upload both images."
-    try:
-        n_iter = int(n_iter)
-        if n_iter <= 0:
-            return "", "", "Iterations must be positive."
-    except Exception:
-        return "", "", "Invalid iterations."
-
-    cues_a = set(_detect_cues_for_image(file_a))
-    cues_b = set(_detect_cues_for_image(file_b))
-
-    # We randomise positions uniformly each iteration to wash out position effects.
-    # In each iteration, create 8 slots with 4×A and 4×B, then sample a choice.
-    pick_a = 0
-    pick_b = 0
-
-    # Precompute the 8 grid coordinates (row-major)
-    coords = [(1,1),(1,2),(1,3),(1,4),(2,1),(2,2),(2,3),(2,4)]
-
-    for _ in range(n_iter):
-        labels = ["A"]*4 + ["B"]*4
-        random.shuffle(labels)
-
-        utils = []
-        for k, (r,c) in enumerate(coords):
-            cu = cues_a if labels[k] == "A" else cues_b
-            utils.append(_utility_from_cues(cu, row=r, col=c))
-
-        probs = _softmax(utils)
-        # sample one index according to probs
-        u = random.random()
-        acc = 0.0
-        choice_idx = 0
-        for i,p in enumerate(probs):
-            acc += p
-            if u <= acc:
-                choice_idx = i
-                break
-        if labels[choice_idx] == "A":
-            pick_a += 1
-        else:
-            pick_b += 1
-
-    ra = pick_a / n_iter
-    rb = pick_b / n_iter
-
-    # Two-proportion z-test (pooled)
-    p_pool = (pick_a + pick_b) / (n_iter + n_iter)
-    se = math.sqrt(p_pool*(1 - p_pool)*(1/n_iter + 1/n_iter))
-    z = (ra - rb) / se if se > 0 else 0.0
-
-    # 95% CIs (Wald, for quick read)
-    def ci(p, n):
-        s = math.sqrt(p*(1-p)/n)
-        return (p - 1.96*s, p + 1.96*s)
-    ci_a = ci(ra, n_iter)
-    ci_b = ci(rb, n_iter)
-
-    badges_md = (
-        "#### Detected cues\n\n"
-        f"**Image A:** {', '.join(sorted(cues_a)) if cues_a else '—'}\n\n"
-        f"**Image B:** {', '.join(sorted(cues_b)) if cues_b else '—'}\n"
-    )
-
-    results_md = (
-        "#### A/B selection results\n\n"
-        "| Variant | Picks | Rate | 95% CI |\n"
-        "|---|---:|---:|---|\n"
-        f"| A | {pick_a} | {ra:.3f} | [{ci_a[0]:.3f}, {ci_a[1]:.3f}] |\n"
-        f"| B | {pick_b} | {rb:.3f} | [{ci_b[0]:.3f}, {ci_b[1]:.3f}] |\n"
-        "\n"
-        f"*z* = {z:.2f} (two-proportion, pooled)\n"
-    )
-
-    note = (
-        "Notes: choices are sampled from a softmax over utilities constructed as the sum of "
-        "β for detected cues plus position coefficients for each slot; ln(price) is omitted "
-        "because it cancels across variants when price is the same. Position is randomised "
-        "each iteration, so position effects average out."
-    )
-    return badges_md, results_md, note
-# === End A/B helpers =========================================================
-
-# --- indexing helpers ---------------------------------------------------------
-def _to_zero_based(v: int, max_inclusive_1idx: int) -> int | None:
-    try:
-        v = int(v)
-    except Exception:
-        return None
-    # accept 1-indexed [1..K] or 0-indexed [0..K-1]
-    if 1 <= v <= max_inclusive_1idx:
-        return v - 1
-    if 0 <= v <= (max_inclusive_1idx - 1):
-        return v
-    return None
-
-def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str | None):
-    # 4×A and 4×B randomly assigned across 8 slots
-    labels = ["A"] * 4 + ["B"] * 4
-    random.shuffle(labels)
-    data_url, mat = _compose_grid_2x4(file_a, file_b, labels)
-
-    from agent_runner import call_openai
-    args = call_openai(data_url, category or "", model_name=model_name)
-
-    r0 = _to_zero_based(args.get("row", None), 2)   # rows 0..1
-    c0 = _to_zero_based(args.get("col", None), 4)   # cols 0..3
-    if r0 is None or c0 is None:
-        return None, mat
-    chosen = mat[r0][c0]
-    return chosen, mat  # "A" or "B" (or None)
-# --- cancel support -----------------------------------------------------------
-@_catch_and_report
-def cancel_live_ab(job_id: str):
-    job_id = (job_id or "").strip()
-    with _JOBS_LOCK:
-        info = _JOBS.get(job_id)
-        if not info:
-            return "Unknown job ID."
-        info["cancel"] = True
-    return f"🛑 Stop requested for {job_id}. It will halt after the current trial."
-@_catch_and_report
-def submit_live_ab(file_a, file_b, n_trials, category="", model_name=""):
+def ab_submit_ui(file_a, file_b, n_trials, category="", model_name=""):
     if not file_a or not file_b:
         return "", "❌ Please upload both images."
     try:
@@ -1468,88 +1073,59 @@ def submit_live_ab(file_a, file_b, n_trials, category="", model_name=""):
             return "", "❌ Trials must be positive."
     except Exception:
         return "", "❌ Invalid trials."
-    jid = f"ab-{uuid.uuid4().hex[:8]}"
-    with _JOBS_LOCK:
-        _JOBS[jid] = {"status": "queued", "progress": 0, "total": n, "a": 0, "b": 0, "invalid": 0, "cancel": False}
-    threading.Thread(
-        target=_bg_run_live_ab,
-        args=(jid, file_a, file_b, n, category or "", model_name or None),
-        name=f"live-ab-{jid}",
-        daemon=True
-    ).start()
-    return jid, f"✅ Submitted live A/B job {jid} with {n} trials."
+    r = _ab_submit(file_a, file_b, n, category or "", model_name or "")
+    if not r.get("ok"):
+        return "", f"❌ Submit failed: {r.get('error','unknown error')}"
+    return r["job_id"], f"✅ Submitted live A/B job {r['job_id']} with {n} trials."
+
 @_catch_and_report
-def poll_live_ab(job_id: str):
+def ab_poll_ui(job_id: str):
     job_id = (job_id or "").strip()
-    with _JOBS_LOCK:
-        info = _JOBS.get(job_id)
-    if not info:
-        return "Unknown job."
-    if info.get("status") == "running":
-        p = info.get("progress", 0); tot = info.get("total", 0)
-        a = info.get("a", 0); b = info.get("b", 0); inv = info.get("invalid", 0)
+    if not job_id:
+        return "Enter a Job ID first."
+    r = _ab_poll(job_id)
+    if not r.get("ok"):
+        return f"Unknown job."
+    st = r.get("status","unknown")
+    if st == "running":
+        p = r.get("progress", 0); tot = r.get("total", 0)
+        a = r.get("a", 0); b = r.get("b", 0); inv = r.get("invalid", 0)
         return f"Job {job_id}: running — {p}/{tot} trials; A={a}, B={b}, invalid={inv}"
-    return f"Job {job_id}: {info.get('status','unknown')}"
-def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, category: str | None, model_name: str | None):
-    try:
-        a = b = invalid = 0
-        cancelled = False
-        t = 0
-        for t in range(1, n_trials + 1):
-            # check cancellation
-            with _JOBS_LOCK:
-                if _JOBS.get(job_id, {}).get("cancel"):
-                    cancelled = True
-            if cancelled:
-                break
+    if st == "error":
+        return f"Job {job_id}: error — {r.get('error','')}"
+    return f"Job {job_id}: {st}"
 
-            chosen, layout = _trial_once(file_a, file_b, category, model_name)
-            if chosen == "A":
-                a += 1
-            elif chosen == "B":
-                b += 1
-            else:
-                invalid += 1
+@_catch_and_report
+def ab_fetch_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "Enter a Job ID first.", ""
+    r = _ab_fetch(job_id)
+    if not r.get("ok"):
+        return f"Job {job_id}: {r.get('error','not_ready')}", ""
+    res = r.get("result") or {}
+    md = (
+        "### Live A/B results (agent choices)\n\n"
+        "| Variant | Picks | Rate | 95% CI |\n"
+        "|---|---:|---:|---|\n"
+        f"| A | {res.get('a',0)} | {res.get('rate_a',0):.3f} | "
+        f"[{res.get('ci_a',(0,0))[0]:.3f}, {res.get('ci_a',(0,0))[1]:.3f}] |\n"
+        f"| B | {res.get('b',0)} | {res.get('rate_b',0):.3f} | "
+        f"[{res.get('ci_b',(0,0))[0]:.3f}, {res.get('ci_b',(0,0))[1]:.3f}] |\n"
+        f"\n*z* = {res.get('z_two_prop',0):.2f} (two-proportion, pooled)\n\n"
+        f"*{res.get('detector_note','')}*"
+    )
+    return md, json.dumps(res, ensure_ascii=False, indent=2)
 
-            if t % 10 == 0 or t == n_trials:
-                with _JOBS_LOCK:
-                    _JOBS[job_id] = {
-                        "status": "running",
-                        "progress": t,
-                        "total": n_trials,
-                        "a": a, "b": b, "invalid": invalid,
-                        "cancel": _JOBS.get(job_id, {}).get("cancel", False),
-                    }
+@_catch_and_report
+def ab_stop_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    r = _ab_cancel(job_id)
+    if not r.get("ok"):
+        return r.get("error","Unknown job ID.")
+    return f"🛑 Stop requested for {job_id}. It will halt after the current trial."
+# === End Live A/B UI wrappers ===============================================
 
-        completed = t if not cancelled else t - 1
-        completed = max(completed, 1)
-
-        # summarise whatever we have (use valid picks only for rates)
-        valid = max(1, a + b)
-        ra = a / valid
-        rb = b / valid
-
-        import math
-        p_pool = (a + b) / (2 * max(1, completed))
-        se = math.sqrt(p_pool * (1 - p_pool) * (2 / max(1, completed)))
-        z = (ra - rb) / se if se > 0 else 0.0
-
-        def ci(p, n):
-            s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
-            return (p - 1.96 * s, p + 1.96 * s)
-
-        res = {
-            "a": a, "b": b, "invalid": invalid, "n_trials": completed,
-            "rate_a": ra, "rate_b": rb,
-            "ci_a": ci(ra, valid), "ci_b": ci(rb, valid),
-            "z_two_prop": z,
-            "detector_note": f"{'Cancelled early; ' if cancelled else ''}one API call per trial; positions randomised each trial.",
-        }
-        with _JOBS_LOCK:
-            _JOBS[job_id] = {"status": "cancelled" if cancelled else "done", "result": res}
-    except Exception as e:
-        with _JOBS_LOCK:
-            _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 # ---------- UI ----------
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
@@ -1720,7 +1296,8 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
                 inputs=[auto_grid_img],
                 outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
             )
-        #A/B testing, Live
+
+        # -------- Live A/B — GPT choices (async) --------
         with gr.Tab("Live A/B — GPT choices (async)"):
             lab = gr.Markdown("Upload your two variants and choose the number of trials. Each trial builds a fresh 2×4 grid (4×A, 4×B) with randomised positions and calls the agent once.")
             abA = gr.Image(label="Image A (e.g., strike-through)", type="filepath")
@@ -1735,46 +1312,30 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
             abFetch = gr.Button("Fetch results")
             abMD = gr.Markdown()
             abJSON = gr.Code(label="Result JSON", language="json")
+            abStop = gr.Button("Stop")
         
             abSubmit.click(
-                fn=submit_live_ab,
+                fn=ab_submit_ui,
                 inputs=[abA, abB, abN, abCategory, abModel],
                 outputs=[abJob, abStatus],
             )
             abPoll.click(
-                fn=poll_live_ab,
+                fn=ab_poll_ui,
                 inputs=[abJob],
                 outputs=[abStatus],
             )
             abFetch.click(
-                fn=fetch_live_ab,
+                fn=ab_fetch_ui,
                 inputs=[abJob],
                 outputs=[abMD, abJSON],
             )
-            abStop = gr.Button("Stop")
             abStop.click(
-                fn=cancel_live_ab,
+                fn=ab_stop_ui,
                 inputs=[abJob],
                 outputs=[abStatus],
             )
 
-        ##A/B testing, NOT live
-        with gr.Tab("A/B — Two images-Not Live"): 
-            ab_img_a = gr.Image(label="Image A (e.g., strike-through)", type="filepath")
-            ab_img_b = gr.Image(label="Image B (e.g., scarcity)", type="filepath")
-            ab_iters = gr.Number(label="Iterations", value=500, precision=0)
-            ab_run = gr.Button("Run A/B simulation", variant="primary")
-            ab_badges_md = gr.Markdown()
-            ab_results_md = gr.Markdown()
-            ab_notes_md = gr.Markdown()
-        
-            ab_run.click(
-                fn=_ab_run_two_images,
-                inputs=[ab_img_a, ab_img_b, ab_iters],
-                outputs=[ab_badges_md, ab_results_md, ab_notes_md],
-            )
-
-        # -------- Manual (kept for verification / fallback) --------
+        # -------- Manual — Single card --------
         with gr.Tab("Manual — Single card"):
             single_cues = gr.CheckboxGroup(
                 choices=CUE_CHOICES_SCORER,
@@ -1788,6 +1349,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
                 outputs=[single_score_md],
             )
     
+        # -------- Manual — Grid 2×4 --------
         with gr.Tab("Manual — Grid 2×4"):
             gr.Markdown("Select cues for each of the eight cards (row-major).")
             grid_cards = []
@@ -1823,10 +1385,3 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
-
-
-
-
-
-
-
