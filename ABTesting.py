@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Live A/B tester (self-contained) — uses OpenAI Vision tool-calls directly.
-Creates a 2×4 grid (4×A, 4×B) with randomised positions per trial and asks the
-agent to choose exactly one card. Tracks A/B pick counts asynchronously.
+Live A/B tester — instrumented for debugging.
+Builds a 2×4 grid (4×A, 4×B) per trial, calls OpenAI with a forced tool call,
+extracts a single selection, and tracks A/B picks.
 
-Exports:
-    submit_live_ab(file_a, file_b, n_trials, category="", model_name="")
-    poll_live_ab(job_id)
-    fetch_live_ab(job_id)
-    cancel_live_ab(job_id)
+Adds:
+  • Robust parsing of many tool-call formats.
+  • Per-trial diagnostics (written to results/ab_debug_<job_id>.jsonl).
+  • Aggregate diagnostic counters returned in the JSON you already fetch in the UI.
 """
 
 from __future__ import annotations
-import os, io, json, time, threading, random, base64, math
-from typing import Dict, Tuple
+import os, io, json, time, threading, random, base64, math, pathlib
+from typing import Dict, Tuple, Any
 from PIL import Image
 
 # ---------------- In-memory job store ----------------
 _JOBS: Dict[str, dict] = {}
 _JLOCK = threading.Lock()
+
+RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------- Tool schema & prompt ----------------
 SCHEMA_JSON = {
@@ -34,9 +35,8 @@ SCHEMA_JSON = {
 
 SYSTEM_PROMPT = (
     "You are a personal shopping assistant helping someone choose exactly ONE product from a 2×4 grid. "
-    "Each trial shows 8 cards in two rows and four columns. "
-    "Select precisely one card and return ONLY a tool/function call named 'choose' with fields: "
-    "chosen_title (string), row (0-based int), col (0-based int)."
+    "The grid has 2 rows (0..1) and 4 columns (0..3). Return ONLY a function call named 'choose' with "
+    "fields: chosen_title (string), row (0-based int), col (0-based int). Do not output any prose."
 )
 
 # ---------------- Image helpers ----------------
@@ -81,18 +81,15 @@ def _compose_grid_2x4(file_a: str, file_b: str, labels: list[str]) -> Tuple[str,
             row.append(lab)
         matrix.append(row)
 
-    # Optional thin grid lines to make cells obvious to the model
+    # light grid lines (helps some models localise cells)
     try:
         from PIL import ImageDraw
         draw = ImageDraw.Draw(canvas)
-        # vertical lines
-        for c in range(5):
-            x = pad + c * (cell_w + pad) - 4 if c > 0 else pad - 4
+        for c in range(1, 4):
+            x = pad + c * (cell_w + pad) - (pad // 2)
             draw.line([(x, pad), (x, H - pad)], fill=(220, 220, 220), width=1)
-        # horizontal lines
-        for r in range(3):
-            y = pad + r * (cell_h + pad) - 4 if r > 0 else pad - 4
-            draw.line([(pad, y), (W - pad, y)], fill=(220, 220, 220), width=1)
+        y = pad + cell_h + pad // 2
+        draw.line([(pad, y), (W - pad, y)], fill=(220, 220, 220), width=1)
     except Exception:
         pass
 
@@ -122,10 +119,8 @@ def _post_with_retries_openai(url, headers, payload,
             _t.sleep(sleep_s)
     raise RuntimeError("OpenAI retry exhausted without success.")
 
-def _openai_choose(image_b64: str, category: str = "", model_name: str | None = None) -> dict:
-    """
-    Calls OpenAI with a forced function call 'choose' and returns parsed args.
-    """
+def _openai_choose(image_b64: str, category: str = "", model_name: str | None = None) -> tuple[dict, dict]:
+    import requests
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -154,113 +149,240 @@ def _openai_choose(image_b64: str, category: str = "", model_name: str | None = 
     }
 
     r = _post_with_retries_openai(url, headers, data)
+    diag = {"model": model, "status_code": r.status_code, "tool_calls": False, "raw_args": None, "parse_error": None}
     if r.status_code >= 400:
-        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
+        diag["error_text"] = r.text[:600]
+        return {}, diag
 
-    msg = r.json()["choices"][0]["message"]
+    js = r.json()
+    msg = js["choices"][0]["message"]
     tcs = msg.get("tool_calls", [])
-    if not tcs:
-        raw_text = (msg.get("content") or "").strip()
+    # Preferred: tool call
+    if tcs:
+        diag["tool_calls"] = True
+        raw = tcs[0]["function"].get("arguments")
+        diag["raw_args"] = raw if isinstance(raw, str) else (json.dumps(raw) if isinstance(raw, dict) else str(raw))
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw), diag
+            except Exception as e:
+                diag["parse_error"] = f"tool_args_json_parse: {type(e).__name__}"
+                return {}, diag
+        if isinstance(raw, dict):
+            return raw, diag
+        diag["parse_error"] = "tool_args_unexpected_type"
+        return {}, diag
+
+    # Fallback: model put JSON in content instead of tool
+    raw_text = (msg.get("content") or "").strip()
+    diag["tool_calls"] = False
+    diag["raw_args"] = raw_text[:600]
+    if raw_text:
+        # try to extract the first {...} block
         try:
             obj = json.loads(raw_text)
-            return obj if isinstance(obj, dict) else {}
+            if isinstance(obj, dict):
+                return obj, diag
         except Exception:
-            return {}
-    raw = tcs[0]["function"].get("arguments")
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {}
-    if isinstance(raw, dict):
-        return raw
-    return {}
+            i, j = raw_text.find("{"), raw_text.rfind("}")
+            if i >= 0 and j > i:
+                try:
+                    obj = json.loads(raw_text[i:j+1])
+                    if isinstance(obj, dict):
+                        return obj, diag
+                except Exception as e:
+                    diag["parse_error"] = f"content_json_slice_parse: {type(e).__name__}"
+                    return {}, diag
+    return {}, diag
 
-# ---------------- Robust coordinate extraction ----------------
-def _rc_from_args(args: dict) -> Tuple[int | None, int | None]:
+
+def _rc_from_args(args: dict) -> tuple[int | None, int | None]:
     """
-    Accept:
-      • row/col (0- or 1-indexed)
-      • single index via keys: index/slot/position/choice/chosen_index/selected_index
-      • nested args under 'arguments' or 'args'
-    Returns zero-based (row, col) or (None, None).
+    Robustly extract zero-based (row, col) from a wide variety of shapes:
+      - row/col (0- or 1-indexed), possibly as strings or floats
+      - single index under: index/slot/position/choice/chosen_index/selected_index
+      - 'coordinates': {'row':..., 'column':...} or {'r':..., 'c':...}
+      - alternate names: 'column', 'col_index', 'row_index'
+      - string patterns: 'r2c3', 'row 2, col 3', 'top-left', 'bottom right', etc.
+      - nested JSON under 'arguments' or 'args'
     """
+    def _to_int(x):
+        try:
+            if isinstance(x, (int,)):
+                return x
+            if isinstance(x, float):
+                return int(x)
+            if isinstance(x, str):
+                s = x.strip().lower()
+                # handle numerals inside strings e.g. "2", " 3 "
+                return int(float(s))
+        except Exception:
+            return None
+        return None
+
     if not isinstance(args, dict):
         return None, None
 
-    try:
-        if "row" in args and "col" in args:
-            r = int(args["row"]); c = int(args["col"])
-            r = r - 1 if 1 <= r <= 2 else r
-            c = c - 1 if 1 <= c <= 4 else c
-            if (0 <= r <= 1) and (0 <= c <= 3):
-                return r, c
-    except Exception:
-        pass
+    # direct row/col under several names
+    row_keys = ("row", "r", "row_idx", "row_index")
+    col_keys = ("col", "c", "col_idx", "col_index", "column", "column_index")
+    r = c = None
+    for rk in row_keys:
+        if rk in args:
+            r = _to_int(args[rk])
+            break
+    for ck in col_keys:
+        if ck in args:
+            c = _to_int(args[ck])
+            break
+    if r is not None and c is not None:
+        # normalise 1-based to 0-based if it looks like 1..2 or 1..4
+        if 1 <= r <= 2: r -= 1
+        if 1 <= c <= 4: c -= 1
+        if 0 <= r <= 1 and 0 <= c <= 3:
+            return r, c
 
+    # single index
     for k in ("index", "slot", "position", "choice", "chosen_index", "selected_index"):
         if k in args:
-            try:
-                v = int(args[k])
-            except Exception:
+            v = _to_int(args[k])
+            if v is None:
                 continue
-            v = v - 1 if 1 <= v <= 8 else v
+            if 1 <= v <= 8: v -= 1
             if 0 <= v <= 7:
                 return v // 4, v % 4
 
-    for k in ("arguments", "args"):
-        if k in args:
+    # nested coordinates blocks
+    for key in ("coordinates", "coord", "pos"):
+        if key in args and isinstance(args[key], dict):
+            r2, c2 = _rc_from_args(args[key])
+            if r2 is not None and c2 is not None:
+                return r2, c2
+
+    # nested tool-args in strings or dicts
+    for vk in ("arguments", "args"):
+        if vk in args and isinstance(args[vk], (str, dict)):
             try:
-                nested = json.loads(args[k]) if isinstance(args[k], str) else dict(args[k])
+                nested = json.loads(args[vk]) if isinstance(args[vk], str) else dict(args[vk])
             except Exception:
                 nested = {}
-            r, c = _rc_from_args(nested)
-            if r is not None and c is not None:
-                return r, c
+            r2, c2 = _rc_from_args(nested)
+            if r2 is not None and c2 is not None:
+                return r2, c2
+
+    # string patterns
+    for k, v in list(args.items()):
+        if isinstance(v, str):
+            s = v.strip().lower()
+            # r2c3 pattern
+            if s.startswith("r") and "c" in s:
+                try:
+                    parts = s.replace("row", "r").replace("col", "c").replace(" ", "")
+                    rpart = parts.split("c")[0][1:]
+                    cpart = parts.split("c")[1]
+                    rr, cc = _to_int(rpart), _to_int(cpart)
+                    if rr is not None and cc is not None:
+                        if 1 <= rr <= 2: rr -= 1
+                        if 1 <= cc <= 4: cc -= 1
+                        if 0 <= rr <= 1 and 0 <= cc <= 3:
+                            return rr, cc
+                except Exception:
+                    pass
+            # 'row 2, col 3'
+            if "row" in s and "col" in s:
+                try:
+                    import re
+                    m = re.search(r"row\s*([0-9]+).*(col|column)\s*([0-9]+)", s)
+                    if m:
+                        rr, cc = _to_int(m.group(1)), _to_int(m.group(3))
+                        if 1 <= rr <= 2: rr -= 1
+                        if 1 <= cc <= 4: cc -= 1
+                        if 0 <= rr <= 1 and 0 <= cc <= 3:
+                            return rr, cc
+                except Exception:
+                    pass
+            # 'top-left', 'bottom right'
+            if any(w in s for w in ("top", "bottom", "left", "right")):
+                rr = 0 if "top" in s else (1 if "bottom" in s else None)
+                cc = 0 if "left" in s else (1 if "center" in s else (3 if "far right" in s else (2 if "right" in s else None)))
+                if rr is not None and cc is not None:
+                    return rr, cc
 
     return None, None
 
 # ---------------- One trial ----------------
-def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str | None):
+def _trial_once(file_a: str, file_b: str, category: str | None, model_name: str | None, dbg_file) -> tuple[str | None, list[list[str]], dict]:
     labels = ["A"] * 4 + ["B"] * 4
     random.shuffle(labels)
     data_url, layout = _compose_grid_2x4(file_a, file_b, labels)
 
-    args = _openai_choose(data_url, category or "", model_name=model_name)
+    args, diag = _openai_choose(data_url, category or "", model_name=model_name)
     r0, c0 = _rc_from_args(args)
-    if r0 is None or c0 is None:
-        return None, layout
-    return layout[r0][c0], layout   # "A" or "B" (or None)
+    chosen = None if (r0 is None or c0 is None) else layout[r0][c0]
+
+    # write one compact line per trial to JSONL
+    try:
+        dbg_file.write(json.dumps({
+            "t": int(time.time()),
+            "tool_calls": diag.get("tool_calls", False),
+            "parse_error": diag.get("parse_error"),
+            "args": args,
+            "r0": r0, "c0": c0,
+            "chosen": chosen
+        }, ensure_ascii=False) + "\n")
+        dbg_file.flush()
+    except Exception:
+        pass
+
+    return chosen, layout, diag
 
 # ---------------- Background worker ----------------
 def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, category: str | None, model_name: str | None):
     try:
         a = b = invalid = 0
-        cancelled = False
+        diag_counts = {"api_calls": 0, "tool_missing": 0, "parse_error": 0, "null_coords": 0, "oob_coords": 0}
+        examples: list[dict[str, Any]] = []  # keep up to 5 diagnostic examples
 
-        for t in range(1, n_trials + 1):
-            with _JLOCK:
-                if _JOBS.get(job_id, {}).get("cancel", False):
-                    cancelled = True
-            if cancelled:
-                break
-
-            chosen, _layout = _trial_once(file_a, file_b, category, model_name)
-            if chosen == "A":
-                a += 1
-            elif chosen == "B":
-                b += 1
-            else:
-                invalid += 1
-
-            if (t % 10 == 0) or (t == n_trials):
+        dbg_path = RESULTS_DIR / f"ab_debug_{job_id}.jsonl"
+        with open(dbg_path, "a", encoding="utf-8") as dbg:
+            for t in range(1, n_trials + 1):
                 with _JLOCK:
-                    _JOBS[job_id] = {
-                        "status": "running", "progress": t, "total": n_trials,
-                        "a": a, "b": b, "invalid": invalid, "cancel": _JOBS.get(job_id, {}).get("cancel", False)
-                    }
+                    if _JOBS.get(job_id, {}).get("cancel", False):
+                        break
 
-        completed = max(1, a + b + invalid)
+                chosen, layout, diag = _trial_once(file_a, file_b, category, model_name, dbg)
+                diag_counts["api_calls"] += 1
+                if not diag.get("tool_calls", False):
+                    diag_counts["tool_missing"] += 1
+                if diag.get("parse_error"):
+                    diag_counts["parse_error"] += 1
+
+                # track A/B or invalid
+                if chosen == "A":
+                    a += 1
+                elif chosen == "B":
+                    b += 1
+                else:
+                    diag_counts["null_coords"] += 1
+                    invalid += 1
+
+                # retain a few recent examples
+                if len(examples) < 5:
+                    examples.append({
+                        "raw_args": diag.get("raw_args"),
+                        "tool_calls": diag.get("tool_calls", False),
+                        "parse_error": diag.get("parse_error"),
+                        "mapped_choice": chosen
+                    })
+
+                if (t % 10 == 0) or (t == n_trials):
+                    with _JLOCK:
+                        _JOBS[job_id] = {
+                            "status": "running", "progress": t, "total": n_trials,
+                            "a": a, "b": b, "invalid": invalid, "cancel": _JOBS.get(job_id, {}).get("cancel", False)
+                        }
+
+        # summarise
         valid = max(1, a + b)
         ra, rb = a / valid, b / valid
         p_pool = (a + b) / (2 * max(1, n_trials))
@@ -272,14 +394,18 @@ def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, catego
             return (p - 1.96 * s, p + 1.96 * s)
 
         res = {
-            "a": a, "b": b, "invalid": invalid, "n_trials": n_trials, "completed": completed,
+            "a": a, "b": b, "invalid": invalid, "n_trials": n_trials,
             "rate_a": ra, "rate_b": rb, "ci_a": ci(ra, valid), "ci_b": ci(rb, valid),
             "z_two_prop": z,
-            "note": ("Cancelled early; " if cancelled else "") +
-                    "one OpenAI call per trial; 4×A/4×B with randomised positions each trial."
+            "note": "one OpenAI call per trial; 4×A/4×B with randomised positions each trial.",
+            "diagnostics": {
+                "job_debug_file": str(dbg_path),
+                "counts": diag_counts,
+                "examples": examples
+            }
         }
         with _JLOCK:
-            _JOBS[job_id] = {"status": "cancelled" if cancelled else "done", "result": res}
+            _JOBS[job_id] = {"status": "done", "result": res}
     except Exception as e:
         with _JLOCK:
             _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
@@ -325,7 +451,7 @@ def fetch_live_ab(job_id: str):
         info = _JOBS.get(job_id)
     if not info:
         return "Unknown job.", ""
-    if info.get("status") != "done" and info.get("status") != "cancelled":
+    if info.get("status") != "done":
         return f"Job {job_id}: {info.get('status','not_ready')}", ""
     r = info.get("result") or {}
     md = (
@@ -339,6 +465,7 @@ def fetch_live_ab(job_id: str):
         f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled)\n\n"
         f"*{r.get('note','')}*"
     )
+    # Return summary JSON including diagnostics; your UI already shows this JSON.
     return md, json.dumps(r, ensure_ascii=False, indent=2)
 
 def cancel_live_ab(job_id: str):
