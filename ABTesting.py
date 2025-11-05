@@ -392,8 +392,8 @@ def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, catego
         z = (ra - rb) / se if se > 0 else 0.0
       
         # two-sided p from the normal approximation
-        import math
-        p_norm_two = 1.0 - math.erf(abs(z) / math.sqrt(2.0))  # = 2*(1 - Phi(|z|))
+        from math import erfc, sqrt
+        p_norm_two = erfc(abs(z) / sqrt(2.0))  # two-sided p = 2*(1 - Phi(|z|))
 
         def ci(p, n):
             s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
@@ -424,9 +424,18 @@ def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, catego
         }
         with _JLOCK:
             _JOBS[job_id] = {"status": "done", "result": res}
-    except Exception as e:
-        with _JLOCK:
-            _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        except Exception as e:
+            import traceback, pathlib, time
+            tb = traceback.format_exc()
+            with _JOBS_LOCK:
+                _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+            try:
+                pathlib.Path("results").mkdir(parents=True, exist_ok=True)
+                with open(f"results/ab_error_{job_id}_{int(time.time())}.log", "w", encoding="utf-8") as fh:
+                    fh.write(tb)
+            except Exception:
+                pass
+
 
 # ---------------- Public API ----------------
 def submit_live_ab(file_a, file_b, n_trials, category: str = "", model_name: str = ""):
@@ -461,6 +470,8 @@ def poll_live_ab(job_id: str):
         p = info.get("progress", 0); tot = info.get("total", 0)
         a = info.get("a", 0); b = info.get("b", 0); inv = info.get("invalid", 0)
         return f"Job {job_id}: running — {p}/{tot} trials; A={a}, B={b}, invalid={inv}"
+    if info.get("status") == "error":
+        return f"Job {job_id}: error — {info.get('error','')}"
     return f"Job {job_id}: {info.get('status','unknown')}"
 
 def fetch_live_ab(job_id: str):
