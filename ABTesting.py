@@ -461,28 +461,57 @@ def _bg_run_live_ab(
                             "cancel": _JOBS.get(job_id, {}).get("cancel", False),
                         }
 
-        # summarise
-        valid = max(1, a + b)
-        ra, rb = a / valid, b / valid
-        p_pool = (a + b) / (2 * max(1, n_trials))
-        se = math.sqrt(max(p_pool * (1 - p_pool) * (2 / max(1, n_trials)), 0.0))
-        z = (ra - rb) / se if se > 0 else 0.0
+        # -------------------- summarise (binomial test + Wilson CIs) --------------------
+        N = a + b  # valid trials
+        from math import comb, sqrt
 
-        def ci(p, n):
-            s = math.sqrt(max(p * (1 - p) / max(1, n), 0.0))
-            return (p - 1.96 * s, p + 1.96 * s)
+        def binom_test_two_sided(k: int, n: int, p0: float = 0.5) -> float:
+            if n <= 0:
+                return 1.0
+            pmf = lambda i: comb(n, i) * (p0 ** i) * ((1 - p0) ** (n - i))
+            p_obs = pmf(k)
+            p = sum(pmf(i) for i in range(n + 1) if pmf(i) <= p_obs)
+            return min(1.0, p)
+
+        def wilson_ci(k: int, n: int, z: float = 1.96):
+            if n <= 0:
+                return (0.0, 0.0)
+            phat = k / n
+            denom = 1.0 + (z * z) / n
+            center = (phat + (z * z) / (2 * n)) / denom
+            half = z * sqrt((phat * (1 - phat) / n) + (z * z) / (4 * n * n)) / denom
+            return (center - half, center + half)
+
+        # rates
+        pA = (a / N) if N else 0.0
+        pB = (b / N) if N else 0.0
+
+        # exact test for H0: P(A)=0.5
+        p_exact = binom_test_two_sided(a, N, 0.5)
+
+        # Wilson CIs for the two shares
+        ciA = wilson_ci(a, N)
+        ciB = wilson_ci(b, N)
+
+        # keep the old pooled z for continuity (not relied upon at small N)
+        p_pool = ((a + b) / (2 * N)) if N else 0.0
+        se = sqrt(p_pool * (1 - p_pool) * (2 / N)) if N else 0.0
+        z = ((pA - pB) / se) if se > 0 else 0.0
+        # -------------------------------------------------------------------------------
 
         res = {
             "a": a,
             "b": b,
             "invalid": invalid,
             "n_trials": n_trials,
-            "rate_a": ra,
-            "rate_b": rb,
-            "ci_a": ci(ra, valid),
-            "ci_b": ci(rb, valid),
+            "n_valid": N,
+            "rate_a": pA,
+            "rate_b": pB,
+            "ci_a": ciA,
+            "ci_b": ciB,
             "z_two_prop": z,
-            "note": "one OpenAI call per trial; 4×A/4×B with randomised positions each trial.",
+            "p_exact_binom": p_exact,
+            "note": "Exact binomial test for P(A)=0.5 with Wilson CIs; one OpenAI call per trial; 4×A/4×B with randomised positions each trial.",
             "diagnostics": {
                 "job_debug_file": str(dbg_path),
                 "audit_file": str(audit_path),
@@ -495,6 +524,7 @@ def _bg_run_live_ab(
     except Exception as e:
         with _JLOCK:
             _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
 
 
 # ---------------- Public API ----------------
