@@ -7,82 +7,12 @@ from agent_runner import submit_job_async as runner_submit_job_async
 from agent_runner import poll_job as runner_poll_job
 from agent_runner import fetch_job as runner_fetch_job
 import traceback, logging
-from html import escape
 from urllib.parse import quote
 
+# NEW: delegate live A/B to the dedicated module
+from ABTesting import submit_live_ab, poll_live_ab, fetch_live_ab, cancel_live_ab
+
 logging.basicConfig(level=logging.INFO)
-
-# ---------- Async job queue (breaks the 900s ceiling) ----------
-# (Kept intact; UI below uses agent_runner's async wrappers via runner_* aliases)
-import threading, uuid, json as _json_shadow
-
-# ---------- Async job queue (breaks the 900s ceiling) ----------
-import threading
-
-_JOBS = {}
-_JOBS_LOCK = threading.Lock()
-
-def _bg_run_job(job_id: str, args_tuple: tuple):
-    """
-    Run the existing synchronous handler in a background thread and cache results.
-    args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
-    """
-    try:
-        # Reuse the exact formatting and side effects of run_now(...)
-        msg, results_json = run_now(*args_tuple)
-        with _JOBS_LOCK:
-            _JOBS[job_id] = {"status": "done", "msg": msg, "results_json": results_json}
-    except Exception as e:
-        with _JOBS_LOCK:
-            _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
-def submit_job_async(product_name, brand_name, model_name, badges, price, currency, n_iterations):
-    jid = f"job-{uuid.uuid4().hex[:8]}"
-    args_tuple = (product_name, brand_name, model_name, badges, price, currency, n_iterations)
-    with _JOBS_LOCK:
-        _JOBS[jid] = {"status": "queued"}
-    threading.Thread(target=_bg_run_job, args=(jid, args_tuple), name=f"runner-{jid}", daemon=True).start()
-    return {"ok": True, "job_id": jid}
-
-def poll_job(job_id: str):
-    with _JOBS_LOCK:
-        info = _JOBS.get(job_id)
-    if not info:
-        return {"ok": False, "status": "unknown"}
-    return {"ok": True, "status": info["status"]}
-
-def fetch_job(job_id: str):
-    with _JOBS_LOCK:
-        info = _JOBS.get(job_id)
-    if not info:
-        return {"ok": False, "status": "unknown"}
-    if info["status"] == "done":
-        return {"ok": True, "status": "done", "msg": info["msg"], "results_json": info["results_json"]}
-    if info["status"] == "error":
-        return {"ok": False, "status": "error", "error": info["error"]}
-    return {"ok": True, "status": info["status"]}
-
-
-
-def _catch_and_report(fn):
-    """Wrap a Gradio handler, show a readable error, and log to results/ + console."""
-    def _inner(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            tb = traceback.format_exc()
-            err_path = RESULTS_DIR / f"ui_error_{int(time.time())}.log"
-            try:
-                err_path.write_text(tb, encoding="utf-8")
-            except Exception:
-                pass
-            print(tb, flush=True)
-            logging.exception("Gradio handler failed")
-            msg = f"❌ {type(e).__name__}: {e}\n\n```\n{tb}\n```"
-            # Handlers that return (markdown, json); pad if needed
-            return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui", "ab_fetch_ui") else msg
-    return _inner
-
 
 RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR = pathlib.Path("jobs"); JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -113,7 +43,7 @@ CURRENCY_CHOICES = ["£", "$", "EUR"]
 SEPARATE_BADGES = {
     "All-in v. partitioned pricing",
     "Assurance",
-    "Strike-through",
+    "Strike-through",   # “Strike”
     "Timer",
 }
 
@@ -124,6 +54,25 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 RENDER_URL_TPL = os.environ.get("RENDER_URL_TPL", "")  # empty → inline HTML in agent_runner
 
 # ---------- helpers ----------
+
+def _catch_and_report(fn):
+    """Wrap a Gradio handler, show a readable error, and log to results/ + console."""
+    def _inner(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            tb = traceback.format_exc()
+            err_path = RESULTS_DIR / f"ui_error_{int(time.time())}.log"
+            try:
+                err_path.write_text(tb, encoding="utf-8")
+            except Exception:
+                pass
+            print(tb, flush=True)
+            logging.exception("Gradio handler failed")
+            msg = f"❌ {type(e).__name__}: {e}\n\n```\n{tb}\n```"
+            # Handlers that return (markdown, json); pad if needed
+            return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui") else msg
+    return _inner
 
 def _ceil_to_8(n: int) -> int:
     return int(((int(n) + 7) // 8) * 8)
@@ -159,7 +108,6 @@ def _validate_inputs(product_name, price, currency, n_iterations):
         return "Please enter a valid integer for iterations."
     return ""
 
-
 def _build_payload(*, job_id, product, brand, model, badges, price, currency, n_iterations, fresh=True):
     csv_badges = ",".join([b.strip() for b in (badges or []) if str(b).strip()])
     tpl = (RENDER_URL_TPL or "").strip()
@@ -185,9 +133,7 @@ def _build_payload(*, job_id, product, brand, model, badges, price, currency, n_
         "render_url": render_url,
     }
 
-
 # --- helper to export effects with run metadata (used for local download only) ---
-
 def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     if not rows_sorted:
         return None, None
@@ -288,9 +234,7 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     html_path.write_text("".join(parts), encoding="utf-8")
     return str(csv_path), str(html_path)
 
-
 # ---------- Shared formatter for sync + async paths ----------
-
 def _format_results_from_dict(results: dict) -> tuple[str, dict]:
     rows = results.get("logit_table_rows") or []
     inputs = results.get("inputs") or {}
@@ -418,7 +362,6 @@ def _format_results_from_dict(results: dict) -> tuple[str, dict]:
 
     return "No badge effects computed.", results
 
-
 @_catch_and_report
 def run_now(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
@@ -448,7 +391,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     # Shared formatter
     msg, _results_obj = _format_results_from_dict(results)
 
-    # ---- Local export (CSV/HTML) – unchanged
+    # ---- Local export (CSV/HTML)
     rows = results.get("logit_table_rows") or []
     csv_path, html_path = _export_badge_effects(rows, payload, job_id)
     artifacts = results.setdefault("artifacts", {})
@@ -457,7 +400,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     if html_path:
         artifacts["effects_html"] = html_path
 
-    # ---------------- [NEW] Fire-and-forget persistence of artifacts + DB ----------------
+    # Fire-and-forget persistence
     try:
         import threading, base64 as _b64, requests, pathlib as _pl
 
@@ -504,9 +447,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         results.setdefault("artifacts", {})["agentix_persist_started"] = True
     except Exception as _bg_e:
         results.setdefault("artifacts", {})["agentix_persist_error_init"] = str(_bg_e)
-    # ---------------- [END NEW] ----------------------------------------------------------
 
-    # Original best-effort DB call (safe if it runs twice server-side).
     try:
         from save_to_agentix import persist_results_if_qualify
         persist_info = persist_results_if_qualify(
@@ -524,7 +465,6 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     import json as _json
     return msg, _json.dumps(results, ensure_ascii=False, indent=2)
 
-
 @_catch_and_report
 def search_database(product_name: str):
     """Query Agentix DB and return (HTML table, pretty_json)."""
@@ -534,7 +474,6 @@ def search_database(product_name: str):
 
     base_url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
 
-    # --- Call the browser-proven GET path ---
     try:
         r = requests.get(base_url, params={"product": product, "limit": 50}, timeout=12)
         ct = (r.headers.get("content-type") or "").lower()
@@ -554,15 +493,12 @@ def search_database(product_name: str):
     if not runs:
         return "<p>No relevant results found.</p>", json.dumps(data, ensure_ascii=False, indent=2)
 
-    # Pick the most recent run and its effects
     run = runs[0]
     rid = run.get("run_id")
     rows = [e for e in effects if e.get("run_id") == rid]
-
     if not rows:
         return "<p>No relevant results found.</p>", json.dumps(data, ensure_ascii=False, indent=2)
 
-    # Shared run-level fields
     product_out = run.get("product", product)
     brand_out   = run.get("brand_type", "")
     model_out   = run.get("model_name", "")
@@ -570,7 +506,6 @@ def search_database(product_name: str):
     curr_out    = run.get("price_currency", "")
     n_iter_out  = run.get("n_iterations", "")
 
-    # Build HTML table (renders in Gradio Markdown/HTML)
     header = (
         "<table style='border-collapse:collapse;width:100%'>"
         "<thead><tr>"
@@ -603,16 +538,12 @@ def search_database(product_name: str):
             "</tr>"
         )
     table_html = header + "".join(body) + "</tbody></table>"
-
-    # CSV download (Option A): served by the PHP endpoint
     dl_url = f"{base_url}?product={quote(product)}&limit=50&format=csv"
     html = f"{table_html}<p style='margin-top:8px'><a href='{dl_url}'>⬇️ Download CSV</a></p>"
 
     return html, json.dumps(data, ensure_ascii=False, indent=2)
 
-
 # ---------- Async UI wrappers delegating to agent_runner ----------
-
 @_catch_and_report
 def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
@@ -670,9 +601,7 @@ def fetch_job_ui(job_id: str):
         print(tb, flush=True)
         return f"❌ Fetch error: {type(e).__name__}: {e}", "{}"
 
-
-# --- Admin helpers --- (continued from Part 1)
-
+# --- Admin helpers ---
 @_catch_and_report
 def _list_storefront_jobs(admin_key: str):
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
@@ -684,7 +613,6 @@ def _list_storefront_jobs(admin_key: str):
     if not jobs:
         return gr.update(choices=[], value=None), "No storefront HTML files found."
     return gr.update(choices=jobs, value=jobs[-1]), f"Found {len(jobs)} storefront(s). Select one to preview."
-
 
 @_catch_and_report
 def _preview_storefront(admin_key: str, job_id: str):
@@ -698,7 +626,6 @@ def _preview_storefront(admin_key: str, job_id: str):
     html = html_path.read_text(encoding="utf-8")
     return gr.update(value=html), f"Rendered {html_path}"
 
-
 def _list_stats_files(admin_key: str):
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
         return ("Invalid or missing admin key.", None, None, None, None)
@@ -710,7 +637,7 @@ def _list_stats_files(admin_key: str):
     agg_choice = res / "df_choice.csv"
     agg_long   = res / "df_long.csv"
     agg_log    = res / "log_compare.jsonl"
-    badges_effects_path = res / "badges_effects.csv"  # single source of truth
+    badges_effects_path = res / "badges_effects.csv"
 
     msgs = []
     if agg_choice.exists():        msgs.append(f"• Found {agg_choice}")
@@ -775,47 +702,15 @@ def _preview_badges_effects(admin_key: str):
         "odds_ratio", "ci_low", "ci_high",
         "ame_pp", "evid_score", "price_eq", "sign"
     ]
-    view_cols = [c for c in preferred if c in df.columns]
-    if not view_cols:
-        view_cols = list(df.columns)
+    view_cols = [c for c in df.columns]
+    if preferred and all(c in df.columns for c in preferred):
+        view_cols = preferred
 
     html = df[view_cols].to_html(index=False, border=1, justify="center")
     return html
 
-
-# ---------- UI logic for Automatic / Manual iterations ----------
-@_catch_and_report
-def _on_badges_change(badges: list[str], auto_checked: bool, manual_checked: bool):
-    if auto_checked and not manual_checked:
-        n = _auto_iterations_from_badges(badges)
-        # Disabled (non-interactive) shows greyed text, signalling system-set value
-        return gr.update(value=n, interactive=False)
-    # Manual mode: keep field editable; do not override user value
-    return gr.update(interactive=True)
-
-@_catch_and_report
-def _toggle_auto(auto_checked: bool, badges: list[str]):
-    if auto_checked:
-        # Enforce exclusivity: turning Auto on turns Manual off and disables input
-        n = _auto_iterations_from_badges(badges)
-        return gr.update(value=False), gr.update(value=n, interactive=False)
-    # If Auto is unticked, fall back to Manual enabled
-    return gr.update(value=True), gr.update(value=100, interactive=True)
-
-@_catch_and_report
-def _toggle_manual(manual_checked: bool, badges: list[str]):
-    if manual_checked:
-        # Enforce exclusivity: turning Manual on turns Auto off and enables input (default 100)
-        return gr.update(value=False), gr.update(value=100, interactive=True)
-    # If Manual is unticked, return to Auto
-    n = _auto_iterations_from_badges(badges)
-    return gr.update(value=True), gr.update(value=n, interactive=False)
-
-
-# === Scoring helpers (define BEFORE the Blocks UI) ===========================
-import base64, pathlib, time, uuid, os, json, requests
-
-# score_image.py must be alongside app.py
+# === Scoring helpers (auto-detect only; manual tools removed) =================
+import base64, pathlib, time as _time, uuid as _uuid2, os as _os, json as _json2, requests as _req2
 try:
     from score_image import score_single_card, score_grid_2x4, LEARNED_PARAMS
 except Exception:
@@ -823,21 +718,18 @@ except Exception:
     score_grid_2x4 = None
     LEARNED_PARAMS = {}
 
-# Optional detector provided by your repo
 try:
-    from agent_runner import detect_levers as _agent_detect_levers  # (image_b64, mode) -> dict
+    from agent_runner import detect_levers as _agent_detect_levers  # optional
 except Exception:
     _agent_detect_levers = None
 
 UPLOADS_DIR = pathlib.Path("uploads"); UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# UI cue set = learned keys minus positional + ln(price)
 _CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
 CUE_CHOICES_SCORER = [k for k in LEARNED_PARAMS.keys() if k not in _CUE_EXCLUDE] or [
     "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"
 ]
 
-# Normalise detector labels to scorer labels
 _NORMALISE = {
     "all-in framing": "All-in framing",
     "all in framing": "All-in framing",
@@ -890,7 +782,7 @@ def _fallback_openai_detect(image_b64: str, mode: str = "single"):
                 {"type": "image_url", "image_url": {"url": image_b64}}
             ]},
         ],
-        "max_tokens": 256,
+        "max_tokens": 512,
         "temperature": 0
     }
     r = requests.post(url, headers=headers, json=data, timeout=(12, 240))
@@ -904,7 +796,6 @@ def _fallback_openai_detect(image_b64: str, mode: str = "single"):
         obj = json.loads(txt[i:j+1]) if i >= 0 and j > i else {}
     if mode == "single":
         return [_norm_label(x) for x in (obj.get("cues") or []) if isinstance(x, str)]
-    # grid
     out = []
     for cell in (obj.get("grid") or [])[:8]:
         if isinstance(cell, list):
@@ -930,55 +821,6 @@ def _detect_with_agent_or_fallback(image_b64: str, mode: str):
         while len(out) < 8: out.append(set())
         return out
     return _fallback_openai_detect(image_b64, mode)
-
-@_catch_and_report
-def _score_single_card_ui(cues_list: list[str]) -> str:
-    if score_single_card is None:
-        return "❌ Scoring utility not available. Ensure score_image.py is present."
-    cues = set(cues_list or [])
-    res = score_single_card(cues)
-    md = (
-        "### Single card score\n\n"
-        f"Selected cues: {', '.join(sorted(cues)) if cues else '—'}\n\n"
-        "| Metric | Value |\n|---|---:|\n"
-        f"| raw | {_fmt_num(res.get('raw'))} |\n"
-        f"| price_weight | {_fmt_num(res.get('price_weight'))} |\n"
-        f"| final | {_fmt_num(res.get('final'))} |\n"
-        f"| ∑ s_i | {_fmt_num(res.get('sum_s'))} |\n"
-        f"| ∑ w_i | {_fmt_num(res.get('sum_w'))} |\n"
-    )
-    return md
-
-@_catch_and_report
-def _score_grid_2x4_ui(*cards_lists: list[list[str]]) -> str:
-    if score_grid_2x4 is None:
-        return "❌ Scoring utility not available. Ensure score_image.py is present."
-    if len(cards_lists) != 8:
-        return "❌ Provide cues for all 8 cards (row-major)."
-    grid_sets = [set(lst or []) for lst in cards_lists]
-    res = score_grid_2x4(grid_sets)
-    rows = res.get("cards", [])
-    lines = [
-        "### Grid 2×4 scores", "",
-        "| Card | Row | Col | raw | final | ∑ s_i | ∑ w_i |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for i, r in enumerate(rows, 1):
-        lines.append(
-            f"| {i} | {r.get('row')} | {r.get('col')} | "
-            f"{_fmt_num(r.get('raw'))} | {_fmt_num(r.get('final'))} | "
-            f"{_fmt_num(r.get('sum_s'))} | {_fmt_num(r.get('sum_w'))} |"
-        )
-    lines += [
-        "", "#### Aggregates", "",
-        "| Metric | Value |", "|---|---:|",
-        f"| raw_mean | {_fmt_num(res.get('raw_mean'))} |",
-        f"| final_mean | {_fmt_num(res.get('final_mean'))} |",
-        f"| raw_best | {_fmt_num(res.get('raw_best'))} |",
-        f"| final_best | {_fmt_num(res.get('final_best'))} |",
-        f"| price_weight | {_fmt_num(res.get('price_weight'))} |",
-    ]
-    return "\n".join(lines)
 
 @_catch_and_report
 def _auto_single_from_image(filepath: str) -> tuple:
@@ -1055,77 +897,6 @@ def _handle_image_upload(file) -> tuple:
         return gr.update(value=str(dest)), f"✅ Saved to {dest}"
     except Exception as e:
         return gr.update(value=None), f"❌ Upload failed: {type(e).__name__}: {e}"
-# === End Scoring helpers =====================================================
-
-# === Live A/B — UI wrappers calling ABTesting.py =============================
-from ABTesting import submit_live_ab as _ab_submit
-from ABTesting import poll_live_ab as _ab_poll
-from ABTesting import fetch_live_ab as _ab_fetch
-from ABTesting import cancel_live_ab as _ab_cancel
-
-@_catch_and_report
-def ab_submit_ui(file_a, file_b, n_trials, category="", model_name=""):
-    if not file_a or not file_b:
-        return "", "❌ Please upload both images."
-    try:
-        n = int(n_trials)
-        if n <= 0:
-            return "", "❌ Trials must be positive."
-    except Exception:
-        return "", "❌ Invalid trials."
-    r = _ab_submit(file_a, file_b, n, category or "", model_name or "")
-    if not r.get("ok"):
-        return "", f"❌ Submit failed: {r.get('error','unknown error')}"
-    return r["job_id"], f"✅ Submitted live A/B job {r['job_id']} with {n} trials."
-
-@_catch_and_report
-def ab_poll_ui(job_id: str):
-    job_id = (job_id or "").strip()
-    if not job_id:
-        return "Enter a Job ID first."
-    r = _ab_poll(job_id)
-    if not r.get("ok"):
-        return f"Unknown job."
-    st = r.get("status","unknown")
-    if st == "running":
-        p = r.get("progress", 0); tot = r.get("total", 0)
-        a = r.get("a", 0); b = r.get("b", 0); inv = r.get("invalid", 0)
-        return f"Job {job_id}: running — {p}/{tot} trials; A={a}, B={b}, invalid={inv}"
-    if st == "error":
-        return f"Job {job_id}: error — {r.get('error','')}"
-    return f"Job {job_id}: {st}"
-
-@_catch_and_report
-def ab_fetch_ui(job_id: str):
-    job_id = (job_id or "").strip()
-    if not job_id:
-        return "Enter a Job ID first.", ""
-    r = _ab_fetch(job_id)
-    if not r.get("ok"):
-        return f"Job {job_id}: {r.get('error','not_ready')}", ""
-    res = r.get("result") or {}
-    md = (
-        "### Live A/B results (agent choices)\n\n"
-        "| Variant | Picks | Rate | 95% CI |\n"
-        "|---|---:|---:|---|\n"
-        f"| A | {res.get('a',0)} | {res.get('rate_a',0):.3f} | "
-        f"[{res.get('ci_a',(0,0))[0]:.3f}, {res.get('ci_a',(0,0))[1]:.3f}] |\n"
-        f"| B | {res.get('b',0)} | {res.get('rate_b',0):.3f} | "
-        f"[{res.get('ci_b',(0,0))[0]:.3f}, {res.get('ci_b',(0,0))[1]:.3f}] |\n"
-        f"\n*z* = {res.get('z_two_prop',0):.2f} (two-proportion, pooled)\n\n"
-        f"*{res.get('detector_note','')}*"
-    )
-    return md, json.dumps(res, ensure_ascii=False, indent=2)
-
-@_catch_and_report
-def ab_stop_ui(job_id: str):
-    job_id = (job_id or "").strip()
-    r = _ab_cancel(job_id)
-    if not r.get("ok"):
-        return r.get("error","Unknown job ID.")
-    return f"🛑 Stop requested for {job_id}. It will halt after the current trial."
-# === End Live A/B UI wrappers ===============================================
-
 
 # ---------- UI ----------
 with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
@@ -1148,7 +919,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         auto_iter = gr.Checkbox(label="Automatic calculations of iterations", value=True, scale=1)
         manual_iter = gr.Checkbox(label="Manual calculations of iterations", value=False, scale=1)
 
-    # Default auto value based on zero selected badges: ceil_to_8(max(100, 0)) = 104
     default_auto_iters = _auto_iterations_from_badges([])
     n_iterations = gr.Number(label="Iterations", value=default_auto_iters, precision=0, interactive=False)
 
@@ -1213,6 +983,27 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     )
 
     # --- Interactions for Automatic / Manual iterations and badges changes ---
+    @_catch_and_report
+    def _on_badges_change(badges_sel: list[str], auto_checked: bool, manual_checked: bool):
+        if auto_checked and not manual_checked:
+            n = _auto_iterations_from_badges(badges_sel)
+            return gr.update(value=n, interactive=False)
+        return gr.update(interactive=True)
+
+    @_catch_and_report
+    def _toggle_auto(auto_checked: bool, badges_sel: list[str]):
+        if auto_checked:
+            n = _auto_iterations_from_badges(badges_sel)
+            return gr.update(value=False), gr.update(value=n, interactive=False)
+        return gr.update(value=True), gr.update(value=100, interactive=True)
+
+    @_catch_and_report
+    def _toggle_manual(manual_checked: bool, badges_sel: list[str]):
+        if manual_checked:
+            return gr.update(value=False), gr.update(value=100, interactive=True)
+        n = _auto_iterations_from_badges(badges_sel)
+        return gr.update(value=True), gr.update(value=n, interactive=False)
+
     auto_iter.change(
         fn=_toggle_auto,
         inputs=[auto_iter, badges],
@@ -1245,9 +1036,8 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     stats_choice = gr.File(label="df_choice.csv")
     stats_long = gr.File(label="df_long.csv")
     stats_log = gr.File(label="log_compare.jsonl")
-    stats_badges = gr.File(label="badges_effects.csv")  # shows latest effects export
+    stats_badges = gr.File(label="badges_effects.csv")
 
-    # Preview of badges_effects.csv inside the app
     stats_badges_preview_btn = gr.Button("Preview badges_effects table")
     stats_badges_preview_html = gr.HTML(label="badges_effects preview")
 
@@ -1263,11 +1053,9 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[stats_status, stats_choice, stats_long, stats_log, stats_badges],
     )
 
-   # === Scoring UI (placed at the bottom as requested) ======================
-    gr.Markdown("## Scoring from image (auto-detect) and manual check (optional)")
-    
+    # === Scoring UI (auto-detect only; manual tabs removed) ==================
+    gr.Markdown("## Scoring from image (auto-detect)")
     with gr.Tabs():
-        # -------- Auto-detect: Single card --------
         with gr.Tab("Auto-detect — Single card"):
             auto_single_img = gr.Image(label="Upload single product image", type="filepath")
             auto_single_go = gr.Button("Detect badges and score", variant="primary")
@@ -1275,14 +1063,12 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
             auto_single_badges = gr.Markdown()
             auto_single_score = gr.Markdown()
             auto_single_status = gr.Markdown()
-    
             auto_single_go.click(
                 fn=_auto_single_from_image,
                 inputs=[auto_single_img],
                 outputs=[auto_single_preview, auto_single_badges, auto_single_score, auto_single_status],
             )
-    
-        # -------- Auto-detect: 2×4 grid --------
+
         with gr.Tab("Auto-detect — Grid 2×4"):
             auto_grid_img = gr.Image(label="Upload 2×4 grid image", type="filepath")
             auto_grid_go = gr.Button("Detect badges and score grid", variant="primary")
@@ -1290,14 +1076,13 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
             auto_grid_badges = gr.Markdown()
             auto_grid_score = gr.Markdown()
             auto_grid_status = gr.Markdown()
-    
             auto_grid_go.click(
                 fn=_auto_grid_from_image,
                 inputs=[auto_grid_img],
                 outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
             )
 
-        # -------- Live A/B — GPT choices (async) --------
+        # Live A/B tab (delegates to ABTesting.py)
         with gr.Tab("Live A/B — GPT choices (async)"):
             lab = gr.Markdown("Upload your two variants and choose the number of trials. Each trial builds a fresh 2×4 grid (4×A, 4×B) with randomised positions and calls the agent once.")
             abA = gr.Image(label="Image A (e.g., strike-through)", type="filepath")
@@ -1313,64 +1098,12 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
             abMD = gr.Markdown()
             abJSON = gr.Code(label="Result JSON", language="json")
             abStop = gr.Button("Stop")
-        
-            abSubmit.click(
-                fn=ab_submit_ui,
-                inputs=[abA, abB, abN, abCategory, abModel],
-                outputs=[abJob, abStatus],
-            )
-            abPoll.click(
-                fn=ab_poll_ui,
-                inputs=[abJob],
-                outputs=[abStatus],
-            )
-            abFetch.click(
-                fn=ab_fetch_ui,
-                inputs=[abJob],
-                outputs=[abMD, abJSON],
-            )
-            abStop.click(
-                fn=ab_stop_ui,
-                inputs=[abJob],
-                outputs=[abStatus],
-            )
 
-        # -------- Manual — Single card --------
-        with gr.Tab("Manual — Single card"):
-            single_cues = gr.CheckboxGroup(
-                choices=CUE_CHOICES_SCORER,
-                label="Select cues present on the single card (badges)",
-            )
-            single_score_btn = gr.Button("Calculate score", variant="secondary")
-            single_score_md = gr.Markdown()
-            single_score_btn.click(
-                fn=_score_single_card_ui,
-                inputs=[single_cues],
-                outputs=[single_score_md],
-            )
-    
-        # -------- Manual — Grid 2×4 --------
-        with gr.Tab("Manual — Grid 2×4"):
-            gr.Markdown("Select cues for each of the eight cards (row-major).")
-            grid_cards = []
-            for r in range(2):
-                with gr.Row():
-                    for c in range(4):
-                        idx = r * 4 + c + 1
-                        cb = gr.CheckboxGroup(
-                            choices=CUE_CHOICES_SCORER,
-                            label=f"Card {idx} (Row {r+1}, Col {c+1})",
-                        )
-                        grid_cards.append(cb)
-            grid_score_btn = gr.Button("Calculate score", variant="secondary")
-            grid_score_md = gr.Markdown()
-            grid_score_btn.click(
-                fn=_score_grid_2x4_ui,
-                inputs=grid_cards,   # 8 inputs, row-major
-                outputs=[grid_score_md],
-            )
-    
-    # Upload button at the very bottom (saves file to /uploads for later reuse)
+            abSubmit.click(submit_live_ab, inputs=[abA, abB, abN, abCategory, abModel], outputs=[abJob, abStatus])
+            abPoll.click(poll_live_ab, inputs=[abJob], outputs=[abStatus])
+            abFetch.click(fetch_live_ab, inputs=[abJob], outputs=[abMD, abJSON])
+            abStop.click(cancel_live_ab, inputs=[abJob], outputs=[abStatus])
+
     gr.Markdown("### Upload image (save only)")
     upload_preview = gr.Image(label="Uploaded image preview", interactive=False)
     upload_btn = gr.UploadButton("Upload image", file_types=["image"], file_count="single")
@@ -1380,7 +1113,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         inputs=[upload_btn],
         outputs=[upload_preview, upload_status],
     )
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
