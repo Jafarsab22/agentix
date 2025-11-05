@@ -498,6 +498,18 @@ def _bg_run_live_ab(
 
 
 # ---------------- Public API ----------------
+#to download jsonl file and double check 4x4 distribution of A/B cards
+def list_ab_logs():
+    from glob import glob
+    files = sorted(glob(str(RESULTS_DIR / "ab_trials_*.jsonl")))
+    return files  # absolute paths
+
+def get_ab_log(path: str):
+    path = (path or "").strip()
+    if not path or not os.path.exists(path):
+        return None
+    return path  # Gradio's File/Files component will serve this path for download
+
 def submit_live_ab(file_a, file_b, n_trials, category: str = "", model_name: str = ""):
     if not file_a or not file_b:
         return "", "❌ Please upload both images."
