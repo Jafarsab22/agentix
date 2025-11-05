@@ -472,18 +472,18 @@ def fetch_live_ab(job_id: str):
     if info.get("status") != "done":
         return f"Job {job_id}: {info.get('status','not_ready')}", ""
     r = info.get("result") or {}
-        md = (
-            "### Live A/B results (agent choices)\n\n"
-            "| Variant | Picks | Rate | 95% CI |\n"
-            "|---|---:|---:|---|\n"
-            f"| A | {r.get('a',0)} | {r.get('rate_a',0):.3f} | "
-            f"[{r.get('ci_a',(0,0))[0]:.3f}, {r.get('ci_a',(0,0))[1]:.3f}] |\n"
-            f"| B | {r.get('b',0)} | {r.get('rate_b',0):.3f} | "
-            f"[{r.get('ci_b',(0,0))[0]:.3f}, {r.get('ci_b',(0,0))[1]:.3f}] |\n"
-            f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled); "
-            f"*p* = {r.get('p_two_prop',0):.4f}\n\n"   # <— add this line
-            f"{r.get('detector_note','')}"
-        )
+    md = (
+        "### Live A/B results (agent choices)\n\n"
+        "| Variant | Picks | Rate | 95% CI |\n"
+        "|---|---:|---:|---|\n"
+        f"| A | {r.get('a',0)} | {r.get('rate_a',0):.3f} | "
+        f"[{r.get('ci_a',(0,0))[0]:.3f}, {r.get('ci_a',(0,0))[1]:.3f}] |\n"
+        f"| B | {r.get('b',0)} | {r.get('rate_b',0):.3f} | "
+        f"[{r.get('ci_b',(0,0))[0]:.3f}, {r.get('ci_b',(0,0))[1]:.3f}] |\n"
+        f"\n*z* = {r.get('z_two_prop',0):.2f} (two-proportion, pooled); "
+        f"*p* = {r.get('p_two_prop',0):.4f}\n\n"
+        f"{r.get('detector_note','')}"
+    )
 
     # Return summary JSON including diagnostics; your UI already shows this JSON.
     return md, json.dumps(r, ensure_ascii=False, indent=2)
