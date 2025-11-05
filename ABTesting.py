@@ -422,19 +422,20 @@ def _bg_run_live_ab(job_id: str, file_a: str, file_b: str, n_trials: int, catego
                 "examples": examples
             }
         }
-        with _JLOCK:
-            _JOBS[job_id] = {"status": "done", "result": res}
-        except Exception as e:
-            import traceback, pathlib, time
-            tb = traceback.format_exc()
-            with _JOBS_LOCK:
-                _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-            try:
-                pathlib.Path("results").mkdir(parents=True, exist_ok=True)
-                with open(f"results/ab_error_{job_id}_{int(time.time())}.log", "w", encoding="utf-8") as fh:
-                    fh.write(tb)
-            except Exception:
-                pass
+      with _JOBS_LOCK:
+          _JOBS[job_id] = {"status": "done", "result": res}
+      except Exception as e:
+          import traceback, pathlib, time as _time
+          tb = traceback.format_exc()
+          with _JOBS_LOCK:
+              _JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+          try:
+              pathlib.Path("results").mkdir(parents=True, exist_ok=True)
+              err_path = f"results/ab_error_{job_id}_{int(_time.time())}.log"
+              with open(err_path, "w", encoding="utf-8") as fh:
+                  fh.write(tb)
+          except Exception:
+              pass
 
 
 # ---------------- Public API ----------------
