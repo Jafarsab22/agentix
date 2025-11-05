@@ -160,7 +160,6 @@ def _openai_choose(image_b64: str, category: str = "", model_name: str | None = 
     msg = r.json()["choices"][0]["message"]
     tcs = msg.get("tool_calls", [])
     if not tcs:
-        # Rarely models answer in text; try to salvage JSON
         raw_text = (msg.get("content") or "").strip()
         try:
             obj = json.loads(raw_text)
@@ -189,7 +188,6 @@ def _rc_from_args(args: dict) -> Tuple[int | None, int | None]:
     if not isinstance(args, dict):
         return None, None
 
-    # direct row/col
     try:
         if "row" in args and "col" in args:
             r = int(args["row"]); c = int(args["col"])
@@ -200,7 +198,6 @@ def _rc_from_args(args: dict) -> Tuple[int | None, int | None]:
     except Exception:
         pass
 
-    # single index
     for k in ("index", "slot", "position", "choice", "chosen_index", "selected_index"):
         if k in args:
             try:
@@ -211,7 +208,6 @@ def _rc_from_args(args: dict) -> Tuple[int | None, int | None]:
             if 0 <= v <= 7:
                 return v // 4, v % 4
 
-    # nested
     for k in ("arguments", "args"):
         if k in args:
             try:
