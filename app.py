@@ -1081,6 +1081,32 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
                 inputs=[auto_grid_img],
                 outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
             )
+        # manage jsonl file download
+        with gr.Accordion("A/B logs (download)", open=False):
+            ab_list_btn = gr.Button("Refresh list")
+            ab_logs_dd  = gr.Dropdown(label="Select a log file", choices=[], interactive=True)
+            ab_file_out = gr.File(label="Download selected file")
+        
+            # wire up
+            def _ab_list_ui():
+                try:
+                    from ABTesting import list_ab_logs
+                    files = list_ab_logs()
+                    # show only basenames in the dropdown for readability; keep full path as value
+                    labels = [pathlib.Path(p).name for p in files]
+                    return gr.update(choices=files, value=(files[-1] if files else None), label="Select a log file (" + (labels[-1] if labels else "none") + ")")
+                except Exception as e:
+                    return gr.update(choices=[], value=None, label=f"Error: {e}")
+        
+            def _ab_download_ui(path):
+                try:
+                    from ABTesting import get_ab_log
+                    return get_ab_log(path)
+                except Exception:
+                    return None
+        
+            ab_list_btn.click(_ab_list_ui, inputs=[], outputs=[ab_logs_dd])
+            ab_logs_dd.change(_ab_download_ui, inputs=[ab_logs_dd], outputs=[ab_file_out])
 
         # Live A/B tab (delegates to ABTesting.py)
         with gr.Tab("Live A/B — GPT choices (async)"):
@@ -1117,3 +1143,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
