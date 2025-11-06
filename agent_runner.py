@@ -1017,11 +1017,38 @@ def submit_job_async(payload: Dict) -> Dict:
     return {"ok": True, "job_id": jid, "status": "running"}
 
 def poll_job(job_id: str) -> Dict:
+    # get in-memory status first
     with _JLOCK:
         js = _JOBS.get(job_id)
         if not js:
             return {"ok": False, "error": "unknown_job"}
-        return {"ok": True, "job_id": job_id, "status": js.status, "error": js.error}
+        status = js.status
+        err = js.error
+
+    # read on-disk progress written by _write_progress(...)
+    progress_path = JOBS_DIR / f"{job_id}.json"
+    done = None
+    total = None
+    if progress_path.exists():
+        try:
+            prog = json.loads(progress_path.read_text(encoding="utf-8"))
+            done = prog.get("done")
+            total = prog.get("total")
+        except Exception:
+            pass
+
+    resp = {
+        "ok": True,
+        "job_id": job_id,
+        "status": status,
+        "error": err,
+    }
+    if done is not None:
+        resp["iterations_done"] = done
+    if total is not None:
+        resp["n_iterations"] = total
+    return resp
+
 
 def fetch_job(job_id: str) -> Dict:
     with _JLOCK:
@@ -1031,5 +1058,6 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
