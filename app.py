@@ -545,6 +545,7 @@ def search_database(product_name: str):
 
 # ---------- Async UI wrappers delegating to agent_runner ----------
 @_catch_and_report
+@_catch_and_report
 def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
     if err:
@@ -559,15 +560,16 @@ def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: l
     try:
         r = runner_submit_job_async(payload)
         if r.get("ok"):
-            #return r.get("job_id",""), f"✅ Submitted. Job {r.get('job_id')} is {r.get('status','running')}."
             job_id = r.get("job_id", "")
             status = r.get("status", "running")
-            message = f"✅ Submitted. Job {job_id} is {status}."
-            return job_id, status, message
+            total = r.get("n_iterations", payload.get("n_iterations", 0))
+            message = f"✅ Submitted. Job {job_id} is {status}. 0/{total} iterations."
+            return job_id, message
 
         return "", f"❌ Submit failed: {r}"
     except Exception as e:
         return "", f"❌ Submit error: {type(e).__name__}: {e}"
+
 
 @_catch_and_report
 def poll_job_ui(job_id: str):
@@ -578,9 +580,12 @@ def poll_job_ui(job_id: str):
         r = runner_poll_job(job_id)
         if not r.get("ok"):
             return f"⚠️ {r.get('error','unknown error')}"
-        status = r.get("status","unknown")
-        err = r.get("error")
-        return f"Job {job_id}: {status}" + (f" — {err}" if err else "")
+        status = r.get("status", "unknown")
+        done = r.get("iterations_done", r.get("progress", 0))
+        total = r.get("n_iterations", 0)
+        if total:
+            return f"Job {job_id}: {status} — {done}/{total} iterations"
+        return f"Job {job_id}: {status}"
     except Exception as e:
         return f"❌ Poll error: {type(e).__name__}: {e}"
 
@@ -1148,5 +1153,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
