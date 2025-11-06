@@ -581,15 +581,11 @@ def poll_job_ui(job_id: str):
         if not r.get("ok"):
             return f"⚠️ {r.get('error','unknown error')}"
         status = r.get("status", "unknown")
-
         done = r.get("iterations_done")
-        total = r.get("n_iterations") or r.get("iterations_total")
-
-        if done is not None and total:
+        total = r.get("n_iterations")
+        if done is not None and total is not None:
             return f"Job {job_id}: {status} — {done}/{total} iterations"
-
-        # backend didn't give progress; show raw payload so you see what's available
-        return f"Job {job_id}: {status} — payload: {r}"
+        return f"Job {job_id}: {status}"
     except Exception as e:
         return f"❌ Poll error: {type(e).__name__}: {e}"
 
@@ -1158,6 +1154,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
