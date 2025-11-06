@@ -91,21 +91,28 @@ def _has_any_significant(effects: List[Dict[str, Any]], alpha: float) -> bool:
     return False
 
 
+# --- replace your _post_json with this ---
 def _post_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+    # log request going out
+    print(f"[Agentix][POST] {url}")
+    print(f"[Agentix][POST payload] {json.dumps(payload, ensure_ascii=False)[:800]}")
     resp = requests.post(url, json=payload, timeout=timeout)
+
+    raw_text = resp.text
+    print(f"[Agentix][POST resp {resp.status_code}] {raw_text[:800]}", flush=True)
+
+    # try to parse JSON
     try:
         data = resp.json()
     except Exception:
-        # log raw text so you see PHP notices/warnings in Railway
-        print(f"[Agentix][POST {url}] non-JSON response: {resp.status_code} {resp.text[:500]}", flush=True)
-        data = {"ok": False, "status": resp.status_code, "text": resp.text}
-    if resp.status_code >= 400:
-        print(f"[Agentix][POST {url}] HTTP error: {resp.status_code} {data}", flush=True)
-        raise AgentixSaverError(f"HTTP {resp.status_code} from {url}: {data}")
-    # extra: log if PHP said ok:false
+        data = {"ok": False, "status": resp.status_code, "text": raw_text}
+
+    # log app-level error too
     if not data.get("ok", True):
-        print(f"[Agentix][POST {url}] app-level error: {data}", flush=True)
+        print(f"[Agentix][POST app-level error] {data}", flush=True)
+
     return data
+
 
 
 
@@ -273,6 +280,14 @@ def persist_results_if_qualify(
 
     # 1) always try to upsert the run
     run_res = _post_json(runs_url, run_doc)
+    print(f"[Agentix] run_res = {json.dumps(run_res, ensure_ascii=False)}", flush=True)
+
+    eff_res = {"ok": True, "rows_upserted": 0}
+    if all_effects:
+        effects_payload = {"job_id": job_id, "effects": all_effects}
+        eff_res = _post_json(effects_url, effects_payload)
+        print(f"[Agentix] effects_res = {json.dumps(eff_res, ensure_ascii=False)}", flush=True)
+        
     if not run_res.get("ok", False):
         # if the run insert itself failed (DB error, etc.), we stop here
         raise AgentixSaverError(f"sendAgentixRuns failed: {run_res}")
