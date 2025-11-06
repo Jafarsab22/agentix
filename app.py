@@ -559,7 +559,12 @@ def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: l
     try:
         r = runner_submit_job_async(payload)
         if r.get("ok"):
-            return r.get("job_id",""), f"✅ Submitted. Job {r.get('job_id')} is {r.get('status','running')}."
+            #return r.get("job_id",""), f"✅ Submitted. Job {r.get('job_id')} is {r.get('status','running')}."
+            job_id = r.get("job_id", "")
+            status = r.get("status", "running")
+            message = f"✅ Submitted. Job {job_id} is {status}."
+            return job_id, status, message
+
         return "", f"❌ Submit failed: {r}"
     except Exception as e:
         return "", f"❌ Submit error: {type(e).__name__}: {e}"
@@ -1143,4 +1148,5 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
