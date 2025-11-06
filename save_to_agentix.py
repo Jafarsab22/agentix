@@ -208,7 +208,9 @@ def persist_results_if_qualify(
     alpha: float = 0.05,
 ) -> Dict[str, Any]:
     """
-    Persist the run + effects to Hostinger and (always) upload artifacts.
+    Persist the run + effects to Hostinger and upload artifacts.
+    Important change: even if the run was not newly stored (stored:false)
+    we still POST the effects as long as the run exists in agentix_runs.
     """
 
     job_id = results.get("job_id") or payload.get("job_id") or f"job-{uuid.uuid4()}"
@@ -226,28 +228,18 @@ def persist_results_if_qualify(
     n_iterations = int(payload.get("n_iterations") or 0)
     badges = payload.get("badges") or []
 
+    # extract effects from the results
     all_effects = _extract_all_effects(results)
     has_sig = _has_any_significant(all_effects, alpha=alpha)
 
-    upload_info = None
+    # upload artifacts regardless
     try:
         artifact_paths = _collect_artifact_paths(results, payload)
         upload_info = _upload_artifacts(base_url, job_id, artifact_paths)
     except Exception as e:
         upload_info = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    if not (has_sig or n_iterations >= 2):
-        return {
-            "stored": False,
-            "reason": "does_not_meet_persistence_criteria",
-            "has_significant": has_sig,
-            "n_iterations": n_iterations,
-            "effects_count": len(all_effects),
-            "job_id": job_id,
-            "files_response": upload_info,
-        }
-
-    # Required payload for agentix_runs
+    # build run doc for agentix_runs
     run_doc = {
         "job_id": job_id,
         "ts_utc": ts_utc,
@@ -260,7 +252,10 @@ def persist_results_if_qualify(
         "badges_csv": ",".join(sorted([str(b).strip() for b in badges if str(b).strip()])),
         "frame_scheme": payload.get("frame_scheme") or "standard",
         "has_significant": 1 if has_sig else 0,
-        "n_sig_badges": sum(1 for r in all_effects if (r.get("p") is not None and float(r["p"]) < alpha)),
+        "n_sig_badges": sum(
+            1 for r in all_effects
+            if (r.get("p") is not None and float(r["p"]) < alpha)
+        ),
         "app_version": app_version,
         "runner_version": payload.get("runner_version") or app_version,
         "est_model": est_model,
@@ -269,29 +264,21 @@ def persist_results_if_qualify(
     runs_url = f"{base_url.rstrip('/')}/sendAgentixRuns.php"
     effects_url = f"{base_url.rstrip('/')}/sendAgentixEffects.php"
 
+    # 1) always try to upsert the run
     run_res = _post_json(runs_url, run_doc)
     if not run_res.get("ok", False):
+        # if the run insert itself failed (DB error, etc.), we stop here
         raise AgentixSaverError(f"sendAgentixRuns failed: {run_res}")
 
-    if run_res.get("stored") is False:
-        return {
-            "stored": False,
-            "reason": run_res.get("reason", "unknown"),
-            "has_significant": has_sig,
-            "n_iterations": n_iterations,
-            "effects_count": len(all_effects),
-            "job_id": job_id,
-            "run_response": run_res,
-            "files_response": upload_info,
-        }
-
+    # 2) now always try to send effects if we have any, even if stored == false
     eff_res = {"ok": True, "rows_upserted": 0}
     if all_effects:
-        # Map effects list to ensure numeric coercion happens server-side; here we just pass values through.
         effects_payload = {"job_id": job_id, "effects": all_effects}
         eff_res = _post_json(effects_url, effects_payload)
-        if not eff_res.get("ok", False):
-            raise AgentixSaverError(f"sendAgentixEffects failed: {eff_res}")
+
+    # 3) optional: enforce your “qualify” idea (here with 2)
+    # this is now only an informational flag, not an early return
+    qualifies = bool(has_sig or n_iterations >= 2)
 
     return {
         "stored": True,
@@ -302,4 +289,5 @@ def persist_results_if_qualify(
         "has_significant": has_sig,
         "n_iterations": n_iterations,
         "effects_count": len(all_effects),
+        "qualified_by_rules": qualifies,
     }
