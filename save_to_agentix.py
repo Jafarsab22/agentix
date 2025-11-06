@@ -222,7 +222,7 @@ def persist_results_if_qualify(
     has_sig = _has_any_significant(all_effects, alpha=alpha)
 
     # this is your qualifying flag
-    qualifies = bool(has_sig or n_iterations >= 2)
+    qualifies = bool(has_sig or n_iterations >= 250)
 
     # upload artifacts
     try:
