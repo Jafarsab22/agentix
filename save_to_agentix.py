@@ -74,7 +74,7 @@ def _extract_all_effects(results: Dict[str, Any]) -> List[Dict[str, Any]]:
             "ame_pp": r.get("ame_pp") or r.get("ame") or r.get("marginal_pp"),
             "evid_score": r.get("evid_score") or r.get("evidence") or r.get("evid"),
             "price_eq": r.get("price_eq") or r.get("lambda") or r.get("price_equiv") or r.get("price_equivalent"),
-            "sign": r.get("sign", "0"),
+            "sign": r.get("sign", "null"),
         }
         out.append(eff)
     return out
