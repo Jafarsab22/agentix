@@ -591,26 +591,58 @@ def poll_job_ui(job_id: str):
 
 
 @_catch_and_report
+@_catch_and_report
 def fetch_job_ui(job_id: str):
     job_id = (job_id or "").strip()
     if not job_id:
-        return "Enter a Job ID first.", "{}"
+        return "Enter a Job ID first.", "{}", None, None, None
     try:
         r = runner_fetch_job(job_id)
         if not r.get("ok"):
             st = r.get("status") or r.get("error","not_ready")
-            return f"Job {job_id}: {st}", "{}"
+            return f"Job {job_id}: {st}", "{}", None, None, None
         raw = r.get("results_json") or "{}"
         try:
             results = json.loads(raw)
         except Exception:
             results = {}
         msg, _res = _format_results_from_dict(results)
-        return msg, json.dumps(results, ensure_ascii=False, indent=2)
+
+        arts = results.get("artifacts") or {}
+        badges_src = arts.get("effects_csv") or arts.get("badges_effects")
+        df_choice_src = arts.get("df_choice")
+        log_compare_src = arts.get("log_compare")
+
+        def _copy_with_job(src_path: str | None, job_id: str) -> str | None:
+            if not src_path:
+                return None
+            p = pathlib.Path(src_path)
+            if not p.exists():
+                return None
+            new_name = f"{p.stem}_{job_id}{p.suffix}"
+            dst = p.parent / new_name
+            try:
+                import shutil
+                shutil.copy(p, dst)
+                return str(dst)
+            except Exception:
+                return str(p)
+
+        badges_out = _copy_with_job(badges_src, job_id)
+        df_choice_out = _copy_with_job(df_choice_src, job_id)
+        log_compare_out = _copy_with_job(log_compare_src, job_id)
+
+        return (
+            msg,
+            json.dumps(results, ensure_ascii=False, indent=2),
+            badges_out,
+            df_choice_out,
+            log_compare_out,
+        )
     except Exception as e:
         tb = traceback.format_exc()
         print(tb, flush=True)
-        return f"❌ Fetch error: {type(e).__name__}: {e}", "{}"
+        return f"❌ Fetch error: {type(e).__name__}: {e}", "{}", None, None, None
 
 # --- Admin helpers ---
 @_catch_and_report
@@ -956,6 +988,9 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     # Main results area: table markdown + JSON for debugging
     results_md = gr.Markdown()
     results_json = gr.Code(label="Results JSON", language="json")
+    badges_file = gr.File(label="badges_effects.csv")   # new
+    df_choice_file = gr.File(label="df_choice.csv")     # new
+    log_compare_file = gr.File(label="log_compare.jsonl")  # new
 
     # Wire search to show results exactly where the table normally appears
     search_btn.click(
@@ -978,8 +1013,9 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     fetch_btn.click(
         fn=fetch_job_ui,
         inputs=[job_id_box],
-        outputs=[results_md, results_json],
-    )
+        outputs=[results_md, results_json, badges_file, df_choice_file, log_compare_file],
+)
+
 
     # Preview and sync run
     preview_btn.click(
@@ -1154,6 +1190,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
