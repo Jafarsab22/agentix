@@ -96,10 +96,17 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str
     try:
         data = resp.json()
     except Exception:
+        # log raw text so you see PHP notices/warnings in Railway
+        print(f"[Agentix][POST {url}] non-JSON response: {resp.status_code} {resp.text[:500]}", flush=True)
         data = {"ok": False, "status": resp.status_code, "text": resp.text}
     if resp.status_code >= 400:
+        print(f"[Agentix][POST {url}] HTTP error: {resp.status_code} {data}", flush=True)
         raise AgentixSaverError(f"HTTP {resp.status_code} from {url}: {data}")
+    # extra: log if PHP said ok:false
+    if not data.get("ok", True):
+        print(f"[Agentix][POST {url}] app-level error: {data}", flush=True)
     return data
+
 
 
 # ---------- artifact upload helpers ----------
