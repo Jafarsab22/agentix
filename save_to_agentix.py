@@ -236,7 +236,7 @@ def persist_results_if_qualify(
     except Exception as e:
         upload_info = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    if not (has_sig or n_iterations >= 250):
+    if not (has_sig or n_iterations >= 2):
         return {
             "stored": False,
             "reason": "does_not_meet_persistence_criteria",
