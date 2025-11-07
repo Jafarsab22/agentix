@@ -549,7 +549,7 @@ def _render_html(category: str, set_id: str, badges: List[str], catalog_seed: in
 
 # --- preview: render exactly one screen and return its image (no disk writes) ---
 def preview_one(payload: Dict) -> Dict:
-    ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
+    ui_label = str(payload.get("model") or "GPT-4.1-mini")
     category = str(payload.get("product") or "product")
     brand    = str(payload.get("brand") or "")
     badges   = list(payload.get("badges") or [])
@@ -1058,6 +1058,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
