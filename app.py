@@ -887,39 +887,37 @@ def _auto_single_from_image(filepath: str) -> tuple:
     )
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
+# at top of app.py, once
+SCORE_PARAMS = load_params_somehow()   # e.g. call your PHP endpoint / getCrossParameters.php
+from score_image import score_grid_2x4  # your pure-python scorer
+
 @_catch_and_report
 def _auto_grid_from_image(filepath: str) -> tuple:
+    # 0. basic guards
     if not filepath:
         return gr.update(value=None), "No image.", "", ""
-    if score_grid_2x4 is None:
-        return gr.update(value=None), "Scoring utility not available.", "", ""
+    if SCORE_PARAMS is None or not isinstance(SCORE_PARAMS, dict):
+        return gr.update(value=None), "Scoring utility not available (no params).", "", ""
 
-    # 1) turn file into data URL and run vision
+    # 1) turn file into data URL and run vision → we get up to 8 lists of cue names
     data_url = _file_to_data_url(filepath)
-    # this returns a list of up to 8 cells, each cell = list/set of cue names
     detected_grid = _detect_with_agent_or_fallback(data_url, "grid")
 
-    # 2) normalise + trim to 8, filter to cues we care about
+    # 2) normalise to exactly 8 cells and keep only cues we track
     norm_cells = []
     for cell in (detected_grid[:8] + [set()] * 8)[:8]:
-        # ensure set
         if not isinstance(cell, (list, set, tuple)):
             cell = []
         clean = set(c for c in cell if c in CUE_CHOICES_SCORER)
         norm_cells.append(clean)
 
-    # 3) build cards for the scorer (no price yet → None)
-    # score_image.score_grid_2x4 expects:
-    #   [{"cues": {...}, "price": None}, ...] len=8
+    # 3) build card dicts for scorer (prices unknown here → None)
     cards = [{"cues": cell, "price": None} for cell in norm_cells]
 
-    # 4) call the new scorer with params from DB
-    # make sure SCORE_PARAMS exists globally (load once at startup)
+    # 4) score (this must be a real function defined earlier in app.py)
     res = score_grid_2x4(cards, SCORE_PARAMS)
 
-    rows = res.get("cards", [])
-
-    # 5) markdown: detected badges per card
+    # 5) pretty printing – detected cues
     b_lines = [
         "#### Identified badges per card (row-major)",
         "",
@@ -934,21 +932,20 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         )
     badges_md = "\n".join(b_lines)
 
-    # 6) markdown: scores (Option A = β·x, Option B = M·C·R)
+    # 6) scores table
     s_lines = [
         "#### Grid 2×4 scores",
         "",
-        "| Card | Row | Col | option A (β·x) | option B (scores) | Price |",
-        "|---:|---:|---:|---:|---:|---|",
+        "| Card | Row | Col | option A (β·x) | option B (scores) |",
+        "|---:|---:|---:|---:|---:|",
     ]
-    for i, r in enumerate(rows, 1):
+    for i, card_res in enumerate(res.get("cards", []), 1):
         s_lines.append(
-            f"| {i} | {r.get('row')} | {r.get('col')} | "
-            f"{_fmt_num(r.get('option_a'))} | {_fmt_num(r.get('option_b'))} | "
-            f"{r.get('price') if r.get('price') is not None else '—'} |"
+            f"| {i} | {card_res.get('row')} | {card_res.get('col')} | "
+            f"{_fmt_num(card_res.get('option_a'))} | {_fmt_num(card_res.get('option_b'))} |"
         )
 
-    # aggregates from the scorer
+    # aggregates
     s_lines += [
         "",
         "##### Aggregates",
@@ -960,7 +957,6 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         f"| best_option_a | {_fmt_num(res.get('best_option_a'))} |",
         f"| best_option_b | {_fmt_num(res.get('best_option_b'))} |",
     ]
-
     score_md = "\n".join(s_lines)
 
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
@@ -1230,6 +1226,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
