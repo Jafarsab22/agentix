@@ -1,211 +1,272 @@
 """
-score_image.py — minimal scoring utility for a single product image or a 2x4 grid
+score_image.py
+---------------
+Pure scoring helpers.
 
-Intuition recap (single run): for each lever/cue i
-  s_i = sign(beta_i) * M_i * C_i * R_i
-Card score S = sum(s_i over present cues) / sum(C_i*R_i over present cues)  (clipped to [-1,1])
-Grid score = mean(S_j) across 8 cards and best(S_j) (optionally apply the same clamp)
-Price sanity (from ln(price) beta): price_weight = min(1, abs(beta_price)/BETA_REF)
-Final = raw_score * price_weight
+This module is meant to be called BY your app (e.g. app.py) AFTER the app has:
+1. run vision on an image,
+2. figured out, per card, which badges/cues are present,
+3. (optionally) extracted/parsed the price.
 
-This module deliberately avoids CV. You pass which cues are present.
-You can wire this into your app.py by: (1) uploading an image, (2) collecting which cues appear
-per card, (3) calling these functions.
+We support two scoring options:
 
-Usage examples (programmatic):
+OPTION A: linear utility (like your PHP validator)
+    U = Σ beta_i * x_i
+    - for binary cues (Assurance, Scarcity tag, …) x_i = 1
+    - for ln(price), x_i = ln(actual_price)
+    - we also allow extra_cues (Row 1, Column 2, …)
 
-  from score_image import score_single_card, score_grid_2x4
+OPTION B: readiness (your M, C, R recipe)
+    for each present cue i:
+        s_i = sign(beta_i) * M_i * C_i * R_i   (or use stored s_val if in DB)
+        w_i = C_i * R_i
+    readiness_raw = Σ s_i / Σ w_i  (if Σ w_i > 0 else 0)
+    readiness = clipped to [-1, 1]
+    if ln(price) row has price_weight in DB → multiply by that
 
-  # Single product with badges present
-  card_cues = {"Assurance", "Timer", "Strike-through"}
-  result = score_single_card(card_cues)
+The params are NOT hardcoded here.
+We load them from your PHP endpoint: getCrossParameters.php.
 
-  # Grid 2x4: list of 8 sets of cues (row-major), we add the row/col automatically
-  grid = [
-      {"Assurance"}, {"All-in framing"}, set(), {"Scarcity tag"},
-      {"Timer"}, set(), {"Assurance","Scarcity tag"}, set(),
-  ]
-  result = score_grid_2x4(grid)
+Your app should do something like:
 
-Replace LEARNED_PARAMS below with values loaded from DB if desired.
+    from score_image import load_params_from_php, score_grid_2x4
+
+    PARAMS = load_params_from_php("https://.../getCrossParameters.php?model=GPT-4.1-mini")
+
+    # later, after vision:
+    res = score_grid_2x4(grid_cards, PARAMS)
+
+Where grid_cards is a list of 8 dicts:
+    [
+      {"cues": {"Assurance","Scarcity tag"}, "price": 20.0},
+      {"cues": set(), "price": 24.99},
+      ...
+    ]
+in row-major order (row1: 4 cards, row2: 4 cards).
+We add Row/Column cues automatically inside score_grid_2x4.
 """
+
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
 import math
+from typing import Dict, Any, Iterable, Sequence, Set, Optional, List
 
-# ------------------------------
-# Learned parameters from your phone 500-iteration run (approx)
-# You can swap this dict with values read from your DB.
-# For each lever: beta, M, C, R
-LEARNED_PARAMS: Dict[str, Dict[str, float]] = {
-    "Row 1":            {"beta": 0.824, "M": 0.74, "C": 0.78, "R": 1.00},
-    "Column 1":         {"beta": 0.926, "M": 0.81, "C": 0.72, "R": 1.00},
-    "Column 2":         {"beta": 0.097, "M": 0.13, "C": 0.75, "R": 0.25},
-    "Column 3":         {"beta": -0.224,"M": 0.27, "C": 0.76, "R": 0.70},
-    "All-in framing":   {"beta": -0.705,"M": 0.68, "C": 0.81, "R": 1.00},
-    "Assurance":        {"beta": 1.656, "M": 0.98, "C": 0.70, "R": 1.00},
-    "Scarcity tag":     {"beta": 0.474, "M": 0.62, "C": 0.75, "R": 0.95},
-    "Strike-through":   {"beta": 0.096, "M": 0.13, "C": 0.56, "R": 0.11},
-    "Timer":            {"beta": 0.711, "M": 0.74, "C": 0.55, "R": 0.99},
-    "ln(price)":        {"beta": -0.665,"M": 0.68, "C": 0.92, "R": 1.00},
-}
+import requests
 
-# Saturation constant (k) — shared across cues; shown for completeness in case you recompute M
-K_SAT = 7.2
-# Price sanity reference |beta_lnprice| expected magnitude
-BETA_REF = 0.6
 
-# ------------------------------
-# Core scoring helpers
+# ---------------------------------------------------------------------
+# 1. load parameters from PHP
+# ---------------------------------------------------------------------
+
+def load_params_from_php(url: str) -> Dict[str, Dict[str, float]]:
+    """
+    Call your PHP endpoint and return a dict:
+        { "Badge name": {"beta":..., "M":..., "C":..., "R":..., "s":..., "price_weight":...}, ... }
+    """
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"PHP returned error: {data}")
+    # we just return the 'params' object
+    return data["params"]
+
+
+# ---------------------------------------------------------------------
+# 2. common helpers
+# ---------------------------------------------------------------------
 
 def _sign(x: float) -> int:
     return 1 if x > 0 else (-1 if x < 0 else 0)
 
 
-def cue_score_components(lever: str) -> Tuple[float, float, float, float]:
-    """Return (beta, M, C, R) for lever, raising KeyError if missing."""
-    d = LEARNED_PARAMS[lever]
-    return d["beta"], d["M"], d["C"], d["R"]
+def _ln_or_none(price: Optional[float]) -> Optional[float]:
+    if price is None:
+        return None
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return math.log(price)
 
 
-def cue_contribution(lever: str) -> Tuple[float, float]:
-    """Return (s_i, weight_i) for a single lever present on the card.
-    s_i = sign(beta) * M * C * R; weight_i = C * R
+# ---------------------------------------------------------------------
+# 3. option A: linear utility
+# ---------------------------------------------------------------------
+
+def score_card_option_a(
+    card_cues: Iterable[str],
+    params: Dict[str, Dict[str, float]],
+    *,
+    price: Optional[float] = None,
+    extra_cues: Iterable[str] = (),
+) -> float:
     """
-    beta, M, C, R = cue_score_components(lever)
-    s_i = _sign(beta) * M * C * R
-    w_i = C * R
-    return s_i, w_i
-
-
-def price_weight() -> float:
-    """Compute page/card-level price sanity multiplier from ln(price) beta."""
-    beta = LEARNED_PARAMS["ln(price)"]["beta"]
-    return min(1.0, abs(beta) / BETA_REF) if BETA_REF > 0 else 1.0
-
-
-def score_single_card(cues_present: Iterable[str]) -> Dict[str, float]:
-    """Score a single product/card given the set of present cues (badges).
-    Position levers are NOT applied here (standalone image). ln(price) is applied once.
-    Returns dict with raw, final, and breakdown sums.
+    Linear utility:
+        U = Σ beta_i * x_i
+    - cue present → x_i = 1
+    - ln(price) present → x_i = ln(price)
     """
-    cues = set(cues_present)
-    # Always include ln(price) as a model sanity cue (applies to choice utility globally)
-    cues_with_price = set(cues)
-    if "ln(price)" in LEARNED_PARAMS:
-        cues_with_price.add("ln(price)")
-
-    s_sum = 0.0
-    w_sum = 0.0
-    for lever in cues_with_price:
-        if lever not in LEARNED_PARAMS:
+    U = 0.0
+    # binary cues
+    for cue in card_cues:
+        p = params.get(cue)
+        if p is None:
             continue
-        s_i, w_i = cue_contribution(lever)
-        s_sum += s_i
-        w_sum += w_i
+        beta = p.get("beta")
+        if beta is not None:
+            U += float(beta) * 1.0
 
-    raw = max(-1.0, min(1.0, (s_sum / w_sum) if w_sum > 0 else 0.0))
-    final = raw * price_weight()
-    return {
-        "raw": raw,
-        "final": final,
-        "sum_s": s_sum,
-        "sum_w": w_sum,
-        "price_weight": price_weight(),
-    }
+    # extra cues (positions, etc.)
+    for cue in extra_cues:
+        p = params.get(cue)
+        if p is None:
+            continue
+        beta = p.get("beta")
+        if beta is not None:
+            U += float(beta) * 1.0
+
+    # ln(price)
+    ln_price = _ln_or_none(price)
+    if ln_price is not None:
+        p = params.get("ln(price)")
+        if p is not None and p.get("beta") is not None:
+            U += float(p["beta"]) * ln_price
+
+    return U
 
 
-def score_grid_2x4(cards_cues: Sequence[Set[str]]) -> Dict[str, object]:
-    """Score a 2x4 grid (8 cards) given a sequence of 8 cue-sets (row-major).
-    Adds position levers (Row r, Column c) automatically per slot.
-    Returns per-card scores and aggregate (mean, best) both raw and final.
+# ---------------------------------------------------------------------
+# 4. option B: readiness (M·C·R)
+# ---------------------------------------------------------------------
+
+def score_card_option_b(
+    card_cues: Iterable[str],
+    params: Dict[str, Dict[str, float]],
+    *,
+    price: Optional[float] = None,
+    extra_cues: Iterable[str] = (),
+) -> float:
     """
-    if len(cards_cues) != 8:
-        raise ValueError("cards_cues must be length 8 for a 2x4 grid")
+    Readiness method:
+      s_i = sign(beta_i) * M_i * C_i * R_i   (or stored s)
+      w_i = C_i * R_i
+      readiness = Σ s_i / Σ w_i  (clipped)
+      if ln(price) has price_weight → multiply
+    """
+    sum_s = 0.0
+    sum_w = 0.0
 
-    per_card = []
-    s_price = price_weight()
+    # all cues we want to consider
+    all_cues: Set[str] = set(card_cues) | set(extra_cues)
 
-    for idx, cues in enumerate(cards_cues):
+    # if the card has a price, we "activate" ln(price) as a cue (like our PHP validator did)
+    ln_price = _ln_or_none(price)
+    if ln_price is not None:
+        all_cues.add("ln(price)")
+
+    for cue in all_cues:
+        p = params.get(cue)
+        if p is None:
+            continue
+
+        C = float(p.get("C") or 0.0)
+        R = float(p.get("R") or 0.0)
+        w_i = C * R
+
+        # prefer stored s if present
+        if p.get("s") is not None:
+            s_i = float(p["s"])
+        else:
+            beta = float(p.get("beta") or 0.0)
+            M = float(p.get("M") or 0.0)
+            s_i = _sign(beta) * M * C * R
+
+        sum_s += s_i
+        sum_w += w_i
+
+    if sum_w <= 1e-12:
+        readiness = 0.0
+    else:
+        readiness = sum_s / sum_w
+        readiness = max(-1.0, min(1.0, readiness))
+
+    # optional price_weight (only if price was present)
+    if ln_price is not None:
+        p_price = params.get("ln(price)")
+        if p_price is not None and p_price.get("price_weight") is not None:
+            pw = float(p_price["price_weight"])
+            pw = max(0.0, min(1.0, pw))
+            readiness *= pw
+
+    return readiness
+
+
+# ---------------------------------------------------------------------
+# 5. 2×4 grid scorer (this is what your app calls)
+# ---------------------------------------------------------------------
+
+def score_grid_2x4(
+    cards: Sequence[dict],
+    params: Dict[str, Dict[str, float]],
+) -> dict:
+    """
+    cards: sequence of 8 dicts:
+        {
+          "cues": {"Assurance","Scarcity tag"},   # any strings your vision returned
+          "price": 24.99                          # optional
+        }
+    We will automatically add position cues:
+        row 1/2 and column 1/2/3 (col4 has no cue in your table)
+    Returns a dict with per-card and aggregates, mirroring your app.py style.
+    """
+    if len(cards) != 8:
+        raise ValueError("score_grid_2x4 expects exactly 8 cards (2×4)")
+
+    out_cards: List[dict] = []
+    sum_a = 0.0
+    sum_b = 0.0
+    best_a = float("-inf")
+    best_b = float("-inf")
+
+    for idx, card in enumerate(cards):
         r = 1 if idx < 4 else 2
         c = (idx % 4) + 1
-        position_cues = set()
-        position_cues.add(f"Row {r}")
+
+        extra = [f"Row {r}"]
         if c == 1:
-            position_cues.add("Column 1")
+            extra.append("Column 1")
         elif c == 2:
-            position_cues.add("Column 2")
+            extra.append("Column 2")
         elif c == 3:
-            position_cues.add("Column 3")
-        # Column 4 has no explicit coefficient in the provided table; skip unless added.
+            extra.append("Column 3")
+        # column 4 -> no extra column cue
 
-        s_sum = 0.0
-        w_sum = 0.0
-        # Add badge cues
-        for lever in set(cues):
-            if lever not in LEARNED_PARAMS:
-                continue
-            s_i, w_i = cue_contribution(lever)
-            s_sum += s_i
-            w_sum += w_i
-        # Add position cues
-        for lever in position_cues:
-            if lever not in LEARNED_PARAMS:
-                continue
-            s_i, w_i = cue_contribution(lever)
-            s_sum += s_i
-            w_sum += w_i
-        # Optionally include ln(price) at card level as well (applies uniformly)
-        if "ln(price)" in LEARNED_PARAMS:
-            s_i, w_i = cue_contribution("ln(price)")
-            s_sum += s_i
-            w_sum += w_i
+        cues = set(card.get("cues") or [])
+        price = card.get("price")
 
-        raw = max(-1.0, min(1.0, (s_sum / w_sum) if w_sum > 0 else 0.0))
-        final = raw * s_price
-        per_card.append({"raw": raw, "final": final, "sum_s": s_sum, "sum_w": w_sum, "row": r, "col": c})
+        s_a = score_card_option_a(cues, params, price=price, extra_cues=extra)
+        s_b = score_card_option_b(cues, params, price=price, extra_cues=extra)
 
-    raw_mean = sum(p["raw"] for p in per_card) / 8.0
-    final_mean = sum(p["final"] for p in per_card) / 8.0
-    raw_best = max(p["raw"] for p in per_card)
-    final_best = max(p["final"] for p in per_card)
+        out_cards.append({
+            "row": r,
+            "col": c,
+            "cues": sorted(cues),
+            "price": price,
+            "option_a": s_a,
+            "option_b": s_b,
+        })
+
+        sum_a += s_a
+        sum_b += s_b
+        best_a = max(best_a, s_a)
+        best_b = max(best_b, s_b)
 
     return {
-        "cards": per_card,
-        "raw_mean": max(-1.0, min(1.0, raw_mean)),
-        "final_mean": max(-1.0, min(1.0, final_mean)),
-        "raw_best": raw_best,
-        "final_best": final_best,
-        "price_weight": s_price,
+        "cards": out_cards,
+        "mean_option_a": sum_a / 8.0,
+        "mean_option_b": sum_b / 8.0,
+        "best_option_a": best_a,
+        "best_option_b": best_b,
     }
-
-
-# ------------------------------
-# Optional tiny CLI for quick tests (no CV, you pass cue names)
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Score a single product or 2x4 grid using learned parameters.")
-    sub = parser.add_subparsers(dest="mode", required=True)
-
-    one = sub.add_parser("single", help="Score a single product/card")
-    one.add_argument("--cues", nargs="*", default=[], help="Badge cues present, e.g., Assurance Timer 'All-in framing'")
-
-    grid = sub.add_parser("grid", help="Score a 2x4 grid (8 cards)")
-    grid.add_argument("--card", action="append", nargs="*", default=[], help=(
-        "Provide 8 times. Each --card is the list of cues for that slot (row-major). "
-        "Example: --card Assurance --card 'All-in framing' Scarcity --card ... (8 of them)"
-    ))
-
-    args = parser.parse_args()
-
-    if args.mode == "single":
-        res = score_single_card(set(args.cues))
-        print(res)
-    else:
-        if len(args.card) != 8:
-            raise SystemExit("You must provide exactly 8 --card groups for the grid mode.")
-        grid_sets = [set(c) for c in args.card]
-        res = score_grid_2x4(grid_sets)
-        print(res)
