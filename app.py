@@ -838,7 +838,7 @@ _EXPECTED_CUES = [
     "social",
     "voucher",
     "bundle",
-    "ratings",
+    
 ]
 
 # Build the allowed set from PHP params ∪ expected defaults, then remove exclusions
@@ -921,12 +921,7 @@ _NORMALISE = {
     "buy 1 get 1": "bundle",
     "multi-buy": "bundle",
 
-    # ratings
-    "rating": "ratings",
-    "ratings": "ratings",
-    "reviews": "ratings",
-    "stars": "ratings",
-    "★★★★★": "ratings",
+   
 }
 def _norm_label(x: str) -> str:
     k = (x or "").strip().lower()
@@ -1388,4 +1383,5 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
