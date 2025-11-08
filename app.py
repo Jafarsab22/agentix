@@ -26,14 +26,21 @@ CROSS_PARAMS_URL = os.getenv(
 
 # --- replacement parser (single source of truth) ---
 def load_params_from_php(url: str = CROSS_PARAMS_URL):
-    r = requests.get(url, timeout=10)
+    """
+    Returns dict keyed by cue/badge with numeric values.
+    Accepts either:
+      A) {"ok": true, "model": "...", "params": { "<badge>": {"beta":..., "M":..., "C":..., "R":..., "s":..., "price_weight":...}, ...}}
+      B) [ {"badge":"...", "beta":..., "m_val":..., "c_val":..., "r_val":..., "price_weight": ...}, ... ]
+    """
+    r = requests.get(url, timeout=12)
     r.raise_for_status()
     data = r.json()
 
+    # A: object with "params"
     if isinstance(data, dict) and isinstance(data.get("params"), dict):
         out = {}
         for badge, vals in data["params"].items():
-            if not badge:
+            if not badge or not isinstance(vals, dict):
                 continue
             out[str(badge)] = {
                 "beta": float(vals.get("beta", 0.0)),
@@ -41,10 +48,11 @@ def load_params_from_php(url: str = CROSS_PARAMS_URL):
                 "C": float(vals.get("C", 0.0)),
                 "R": float(vals.get("R", 0.0)),
             }
-            if "price_weight" in vals and vals["price_weight"] is not None:
+            if vals.get("price_weight") is not None:
                 out[str(badge)]["price_weight"] = float(vals["price_weight"])
         return out
 
+    # B: legacy list rows
     if isinstance(data, list):
         out = {}
         for row in data:
@@ -59,7 +67,7 @@ def load_params_from_php(url: str = CROSS_PARAMS_URL):
                 "C": float(row.get("c_val") or 0.0),
                 "R": float(row.get("r_val") or 0.0),
             }
-            if "price_weight" in row and row["price_weight"] is not None:
+            if row.get("price_weight") is not None:
                 out[str(badge)]["price_weight"] = float(row["price_weight"])
         return out
 
@@ -68,26 +76,10 @@ def load_params_from_php(url: str = CROSS_PARAMS_URL):
 # load the parameters (do this once)
 try:
     SCORE_PARAMS = load_params_from_php()
+    logging.info("Loaded %d cue parameters from PHP.", len(SCORE_PARAMS or {}))
 except Exception as e:
-    print("⚠️ could not load cross parameters:", e)
+    logging.exception("Could not load cross parameters from PHP")
     SCORE_PARAMS = None
-
-# cues and normalisation
-_CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
-
-# Keep detector choices aligned with what we actually have params for
-if SCORE_PARAMS and isinstance(SCORE_PARAMS, dict):
-    CUE_CHOICES_SCORER = [k for k in SCORE_PARAMS.keys() if k not in _CUE_EXCLUDE]
-else:
-    CUE_CHOICES_SCORER = ["All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"]
-
-# import only the scorer(s) you use from score_image – do NOT import load_params_from_php from there
-from score_image import score_grid_2x4
-try:
-    from score_image import score_single_card
-except Exception:
-    score_single_card = None
-
 
 # Optional storefront helpers
 try:
@@ -141,7 +133,6 @@ def _catch_and_report(fn):
             print(tb, flush=True)
             logging.exception("Gradio handler failed")
             msg = f"❌ {type(e).__name__}: {e}\n\n```\n{tb}\n```"
-            # Handlers that return (markdown, json); pad if needed
             return (msg, "{}") if fn.__name__ in ("run_now", "fetch_job_ui") else msg
     return _inner
 
@@ -153,7 +144,6 @@ def _auto_iterations_from_badges(badges: list[str]) -> int:
     b = 0
     if "All-in v. partitioned pricing" in sel:
         b += 1
-    # Non-frame levers you currently estimate separately in the logit
     for lab in ("Assurance", "Strike-through", "Timer"):
         if lab in sel:
             b += 1
@@ -209,10 +199,9 @@ def _export_badge_effects(rows_sorted: list[dict], payload: dict, job_id: str):
     if not rows_sorted:
         return None, None
     ts = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
-    base = f"{ts}_badge_effects"   # no job_id here; PHP will prefix run_id
+    base = f"{ts}_badge_effects"
     csv_path = EFFECTS_DIR / f"{base}.csv"
     html_path = EFFECTS_DIR / f"{base}.html"
-    # Extended fields preserved if present in rows
     fieldnames = [
         "job_id", "timestamp", "product", "brand", "model",
         "price", "currency", "n_iterations",
@@ -453,16 +442,13 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         fresh=True,
     )
 
-    # Ensure latest estimator code is used
     import importlib, logit_badges
     logit_badges = importlib.reload(logit_badges)
 
     results = run_job_sync(payload)
 
-    # Shared formatter
     msg, _results_obj = _format_results_from_dict(results)
 
-    # ---- Local export (CSV/HTML)
     rows = results.get("logit_table_rows") or []
     csv_path, html_path = _export_badge_effects(rows, payload, job_id)
     artifacts = results.setdefault("artifacts", {})
@@ -471,10 +457,8 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
     if html_path:
         artifacts["effects_html"] = html_path
 
-    # Fire-and-forget persistence
     try:
         import threading, base64 as _b64, requests, pathlib as _pl
-
         def _persist_async(_results, _payload):
             try:
                 run_id_local = _results.get("job_id") or _payload.get("job_id") or job_id
@@ -538,7 +522,6 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
 
 @_catch_and_report
 def search_database(product_name: str):
-    """Query Agentix DB and return (HTML table, pretty_json)."""
     product = (product_name or "").strip()
     if not product:
         return "<p>Enter a product name to search.</p>", "{}"
@@ -641,7 +624,6 @@ def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: l
     except Exception as e:
         return "", f"❌ Submit error: {type(e).__name__}: {e}"
 
-
 @_catch_and_report
 def poll_job_ui(job_id: str):
     job_id = (job_id or "").strip()
@@ -659,7 +641,6 @@ def poll_job_ui(job_id: str):
         return f"Job {job_id}: {status}"
     except Exception as e:
         return f"❌ Poll error: {type(e).__name__}: {e}"
-
 
 @_catch_and_report
 @_catch_and_report
@@ -797,7 +778,6 @@ def preview_example(product_name: str, brand_name: str, model_name: str, badges:
 
 @_catch_and_report
 def _preview_badges_effects(admin_key: str):
-    """Render results/badges_effects.csv as an HTML table for quick inspection."""
     if not ADMIN_KEY or admin_key != ADMIN_KEY:
         return "<p>Invalid or missing admin key.</p>"
 
@@ -824,14 +804,18 @@ def _preview_badges_effects(admin_key: str):
     return html
 
 # === Scoring helpers (auto-detect only; manual tools removed) =================
-import base64, pathlib, time as _time, uuid as _uuid2, os as _os, json as _json2, requests as _req2
+import base64, time as _time, uuid as _uuid2, os as _os, json as _json2, requests as _req2
+
+# import scorers (do NOT import load_params_from_php from score_image to avoid shadowing)
 try:
-    from score_image import score_grid_2x4, load_params_from_php
-    PARAMS = load_params_from_php("https://aireadyworkforce.pro/Agentix/getCrossParameters.php?model=GPT-4.1-mini") #make it generic
+    from score_image import score_grid_2x4
+except Exception:
+    score_grid_2x4 = None
+
+try:
+    from score_image import score_single_card
 except Exception:
     score_single_card = None
-    score_grid_2x4 = None
-    LEARNED_PARAMS = {}
 
 try:
     from agent_runner import detect_levers as _agent_detect_levers  # optional
@@ -840,56 +824,11 @@ except Exception:
 
 UPLOADS_DIR = pathlib.Path("uploads"); UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Pull weights from PHP and inject into score_image.LEARNED_PARAMS ---
-CROSS_PARAMS_URL = os.getenv(
-    "AGENTIX_CROSS_PARAMS_URL",
-    "https://aireadyworkforce.pro/Agentix/getCrossParameters.php",
-)
-
-def _fetch_params_from_php(url: str = CROSS_PARAMS_URL) -> dict:
-    """
-    Returns dict keyed by cue, with at least beta, M, C, R, s, and optional price_weight.
-    Accepts the { ok, model, params: {...} } shape you see in the browser.
-    """
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, dict) or not isinstance(data.get("params"), dict):
-        raise ValueError("Unexpected JSON shape from cross-parameters endpoint")
-    out = {}
-    for badge, vals in data["params"].items():
-        if not badge or not isinstance(vals, dict):
-            continue
-        out[str(badge)] = {
-            "beta": float(vals.get("beta", 0.0)),
-            "M": float(vals.get("M", 0.0)),
-            "C": float(vals.get("C", 0.0)),
-            "R": float(vals.get("R", 0.0)),
-            "s": float(vals.get("s", 0.0)),   # present in your PHP
-        }
-        if vals.get("price_weight") is not None:
-            out[str(badge)]["price_weight"] = float(vals["price_weight"])
-    return out
-
-# IMPORTANT: overwrite the module-level dict the scorers use
-try:
-    import score_image as _si
-    php_params = _fetch_params_from_php()
-    if isinstance(_si.LEARNED_PARAMS, dict):
-        _si.LEARNED_PARAMS.clear()
-        _si.LEARNED_PARAMS.update(php_params)
-    else:
-        _si.LEARNED_PARAMS = dict(php_params)
-    # keep local alias in sync if you imported it above
-    LEARNED_PARAMS = _si.LEARNED_PARAMS
-    logging.info("Loaded %d cues from PHP into score_image.LEARNED_PARAMS", len(_si.LEARNED_PARAMS))
-except Exception as e:
-    logging.exception("Could not load cross parameters from PHP: %s", e)
-
 _CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
-CUE_CHOICES_SCORER = [k for k in LEARNED_PARAMS.keys() if k not in _CUE_EXCLUDE] or [
-    "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"
-]
+if SCORE_PARAMS and isinstance(SCORE_PARAMS, dict):
+    CUE_CHOICES_SCORER = [k for k in SCORE_PARAMS.keys() if k not in _CUE_EXCLUDE]
+else:
+    CUE_CHOICES_SCORER = ["All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"]
 
 _NORMALISE = {
     "all-in framing": "All-in framing",
@@ -1004,22 +943,18 @@ def _auto_single_from_image(filepath: str) -> tuple:
     )
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
-# at top of app.py, once
-from score_image import score_grid_2x4  # your pure-python scorer
-
 @_catch_and_report
 def _auto_grid_from_image(filepath: str) -> tuple:
-    # 0. basic guards
     if not filepath:
         return gr.update(value=None), "No image.", "", ""
     if SCORE_PARAMS is None or not isinstance(SCORE_PARAMS, dict):
         return gr.update(value=None), "Scoring utility not available (no params).", "", ""
+    if score_grid_2x4 is None:
+        return gr.update(value=None), "Scoring utility not available.", "", ""
 
-    # 1) turn file into data URL and run vision → we get up to 8 lists of cue names
     data_url = _file_to_data_url(filepath)
-    detected_grid = _detect_with_agent_or_fallback(data_url, "grid")
+    detected_grid = _detect_with_agent_or_fallback(data_url, "grid_2x4")
 
-    # 2) normalise to exactly 8 cells and keep only cues we track
     norm_cells = []
     for cell in (detected_grid[:8] + [set()] * 8)[:8]:
         if not isinstance(cell, (list, set, tuple)):
@@ -1027,14 +962,14 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         clean = set(c for c in cell if c in CUE_CHOICES_SCORER)
         norm_cells.append(clean)
 
-    # 3) build card dicts for scorer (prices unknown here → None)
     cards = [{"cues": cell, "price": None} for cell in norm_cells]
 
-    # 4) score (this must be a real function defined earlier in app.py)
-    res = score_grid_2x4(grid_sets)
+    # Try scorer with params; if its signature doesn't accept params, call without.
+    try:
+        res = score_grid_2x4(cards, SCORE_PARAMS)
+    except TypeError:
+        res = score_grid_2x4(cards)
 
-
-    # 5) pretty printing – detected cues
     b_lines = [
         "#### Identified badges per card (row-major)",
         "",
@@ -1049,7 +984,6 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         )
     badges_md = "\n".join(b_lines)
 
-    # 6) scores table
     s_lines = [
         "#### Grid 2×4 scores",
         "",
@@ -1062,7 +996,6 @@ def _auto_grid_from_image(filepath: str) -> tuple:
             f"{_fmt_num(card_res.get('option_a'))} | {_fmt_num(card_res.get('option_b'))} |"
         )
 
-    # aggregates
     s_lines += [
         "",
         "##### Aggregates",
@@ -1077,7 +1010,6 @@ def _auto_grid_from_image(filepath: str) -> tuple:
     score_md = "\n".join(s_lines)
 
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
-
 
 @_catch_and_report
 def _handle_image_upload(file) -> tuple:
@@ -1110,7 +1042,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         price = gr.Number(label="Price", value=0.0, precision=2)
         currency = gr.Dropdown(choices=CURRENCY_CHOICES, value=CURRENCY_CHOICES[0], label="Currency")
 
-    # Iterations controls: two tick boxes above the iterations field
     with gr.Row():
         auto_iter = gr.Checkbox(label="Automatic calculations of iterations", value=True, scale=1)
         manual_iter = gr.Checkbox(label="Manual calculations of iterations", value=False, scale=1)
@@ -1120,10 +1051,8 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
     badges = gr.CheckboxGroup(choices=BADGE_CHOICES, label="Select badges (multi-select)")
 
-    # Search-first workflow
     search_btn = gr.Button("Search our database", variant="secondary")
 
-    # Async job controls (Railway-safe)
     with gr.Row():
         submit_async_btn = gr.Button("Submit long run (async)", variant="primary")
         job_id_box = gr.Textbox(label="Job ID", placeholder="Will appear after submit", interactive=False)
@@ -1132,27 +1061,23 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         fetch_btn = gr.Button("Fetch results", variant="secondary")
     async_status = gr.Markdown()
 
-    # Legacy synchronous small-run path (kept for quick previews)
     run_btn = gr.Button("Run simulation now", variant="secondary", visible=False)
 
     preview_btn = gr.Button("Preview one example screen", variant="secondary")
     preview_view = gr.HTML(label="Preview")
 
-    # Main results area: table markdown + JSON for debugging
     results_md = gr.Markdown()
     results_json = gr.Code(label="Results JSON", language="json")
-    badges_file = gr.File(label="badges_effects.csv")   # new
-    df_choice_file = gr.File(label="df_choice.csv")     # new
-    log_compare_file = gr.File(label="log_compare.jsonl")  # new
+    badges_file = gr.File(label="badges_effects.csv")
+    df_choice_file = gr.File(label="df_choice.csv")
+    log_compare_file = gr.File(label="log_compare.jsonl")
 
-    # Wire search to show results exactly where the table normally appears
     search_btn.click(
         fn=search_database,
         inputs=[product],
         outputs=[results_md, results_json],
     )
 
-    # Async bindings
     submit_async_btn.click(
         fn=submit_job_ui,
         inputs=[product, brand, model, badges, price, currency, n_iterations],
@@ -1167,10 +1092,8 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         fn=fetch_job_ui,
         inputs=[job_id_box],
         outputs=[results_md, results_json, badges_file, df_choice_file, log_compare_file],
-)
+    )
 
-
-    # Preview and sync run
     preview_btn.click(
         fn=preview_example,
         inputs=[product, brand, model, badges, price, currency],
@@ -1182,7 +1105,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[results_md, results_json],
     )
 
-    # --- Interactions for Automatic / Manual iterations and badges changes ---
     @_catch_and_report
     def _on_badges_change(badges_sel: list[str], auto_checked: bool, manual_checked: bool):
         if auto_checked and not manual_checked:
@@ -1253,7 +1175,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         outputs=[stats_status, stats_choice, stats_long, stats_log, stats_badges],
     )
 
-    # === Scoring UI (auto-detect only; manual tabs removed) ==================
     gr.Markdown("## Scoring from image (auto-detect)")
     with gr.Tabs():
         with gr.Tab("Auto-detect — Single card"):
@@ -1281,34 +1202,30 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
                 inputs=[auto_grid_img],
                 outputs=[auto_grid_preview, auto_grid_badges, auto_grid_score, auto_grid_status],
             )
-        # manage jsonl file download
+
         with gr.Accordion("A/B logs (download)", open=False):
             ab_list_btn = gr.Button("Refresh list")
             ab_logs_dd  = gr.Dropdown(label="Select a log file", choices=[], interactive=True)
             ab_file_out = gr.File(label="Download selected file")
-        
-            # wire up
+
             def _ab_list_ui():
                 try:
                     from ABTesting import list_ab_logs
                     files = list_ab_logs()
-                    # show only basenames in the dropdown for readability; keep full path as value
-                    labels = [pathlib.Path(p).name for p in files]
-                    return gr.update(choices=files, value=(files[-1] if files else None), label="Select a log file (" + (labels[-1] if labels else "none") + ")")
+                    return gr.update(choices=files, value=(files[-1] if files else None))
                 except Exception as e:
                     return gr.update(choices=[], value=None, label=f"Error: {e}")
-        
+
             def _ab_download_ui(path):
                 try:
                     from ABTesting import get_ab_log
                     return get_ab_log(path)
                 except Exception:
                     return None
-        
+
             ab_list_btn.click(_ab_list_ui, inputs=[], outputs=[ab_logs_dd])
             ab_logs_dd.change(_ab_download_ui, inputs=[ab_logs_dd], outputs=[ab_file_out])
 
-        # Live A/B tab (delegates to ABTesting.py)
         with gr.Tab("Live A/B — GPT choices (async)"):
             lab = gr.Markdown("Upload your two variants and choose the number of trials. Each trial builds a fresh 2×4 grid (4×A, 4×B) with randomised positions and calls the agent once.")
             abA = gr.Image(label="Image A (e.g., strike-through)", type="filepath")
@@ -1343,15 +1260,3 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
-
-
-
-
-
-
-
-
-
-
-
-
