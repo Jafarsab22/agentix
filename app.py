@@ -824,22 +824,109 @@ except Exception:
 
 UPLOADS_DIR = pathlib.Path("uploads"); UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-_CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
-if SCORE_PARAMS and isinstance(SCORE_PARAMS, dict):
-    CUE_CHOICES_SCORER = [k for k in SCORE_PARAMS.keys() if k not in _CUE_EXCLUDE]
-else:
-    CUE_CHOICES_SCORER = ["All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"]
+# --- Detection vocabulary & prompt (drop-in replacement) ----------------------
 
+_CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
+
+# Canonical cue names we want the model to use (must match your params where possible)
+_EXPECTED_CUES = [
+    "All-in framing",
+    "Assurance",
+    "Scarcity tag",
+    "Strike-through",
+    "Timer",
+    "social",
+    "voucher",
+    "bundle",
+    "ratings",
+]
+
+# Build the allowed set from PHP params ∪ expected defaults, then remove exclusions
+if SCORE_PARAMS and isinstance(SCORE_PARAMS, dict):
+    _param_cues = [k for k in SCORE_PARAMS.keys() if k not in _CUE_EXCLUDE]
+else:
+    _param_cues = []
+_allowed_cues = []
+_seen = set()
+for name in (_param_cues + _EXPECTED_CUES):
+    if name not in _CUE_EXCLUDE and name not in _seen:
+        _allowed_cues.append(name)
+        _seen.add(name)
+CUE_CHOICES_SCORER = _allowed_cues
+
+# Synonym/variant normalisation to the canonical keys above
 _NORMALISE = {
+    # all-in
     "all-in framing": "All-in framing",
     "all in framing": "All-in framing",
     "all-in v. partitioned pricing": "All-in framing",
+    "all-in price": "All-in framing",
+    "price includes tax": "All-in framing",
+    "inc vat": "All-in framing",
+    "including vat": "All-in framing",
+    "including shipping": "All-in framing",
+
+    # assurance
     "assurance": "Assurance",
+    "returns": "Assurance",
+    "free returns": "Assurance",
+    "warranty": "Assurance",
+    "guarantee": "Assurance",
+    "money-back": "Assurance",
+
+    # scarcity
     "scarcity": "Scarcity tag",
     "scarcity tag": "Scarcity tag",
+    "low stock": "Scarcity tag",
+    "only x left": "Scarcity tag",
+    "limited stock": "Scarcity tag",
+    "selling fast": "Scarcity tag",
+
+    # strike-through
     "strike-through": "Strike-through",
     "strikethrough": "Strike-through",
+    "sale price": "Strike-through",
+    "was now": "Strike-through",
+    "was £": "Strike-through",
+    "discounted from": "Strike-through",
+
+    # timer
     "timer": "Timer",
+    "countdown": "Timer",
+    "ends in": "Timer",
+    "limited time": "Timer",
+    "deal ends": "Timer",
+    "hours left": "Timer",
+
+    # social proof
+    "social": "social",
+    "social proof": "social",
+    "x bought": "social",
+    "x sold": "social",
+    "people viewing": "social",
+    "bestseller": "social",
+
+    # voucher / coupon
+    "voucher": "voucher",
+    "coupon": "voucher",
+    "promo code": "voucher",
+    "use code": "voucher",
+    "apply voucher": "voucher",
+    "clip coupon": "voucher",
+
+    # bundle
+    "bundle": "bundle",
+    "bundle & save": "bundle",
+    "2 for": "bundle",
+    "buy 1 get 1": "bundle",
+    "multi-buy": "bundle",
+
+    # ratings
+    "rating": "ratings",
+    "ratings": "ratings",
+    "reviews": "ratings",
+    "stars": "ratings",
+    "★★★★★": "ratings",
 }
 def _norm_label(x: str) -> str:
     k = (x or "").strip().lower()
@@ -860,6 +947,30 @@ def _file_to_data_url(path_like: str) -> str:
     elif ext == ".webp": mime = "image/webp"
     return f"data:{mime};base64,{b64}"
 
+def _build_detection_prompt() -> str:
+    vocab = ", ".join(CUE_CHOICES_SCORER)
+    # Clear definitions, POS/NEG anchors, and pattern hints. Keep it concise but explicit.
+    return (
+        "You are an e-commerce UI analyst. Detect ONLY these cues (use exactly these labels): "
+        f"{vocab}.\n"
+        "Definitions:\n"
+        "• All-in framing: the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT and shipping”, “price includes tax”). "
+        "Do NOT tag strike-throughs as all-in. “Price excludes VAT” is NOT all-in.\n"
+        "• Assurance: returns/warranty/guarantee statements (e.g., “30-day returns”, “2-year warranty”, “money-back guarantee”).\n"
+        "• Scarcity tag: explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”).\n"
+        "• Strike-through: a markdown showing current price beside a crossed-out or “was” higher price (e.g., “£299 was £349”, crossed-out number).\n"
+        "• Timer: a countdown or deadline for the offer (e.g., “Ends in 02:14:10”, “Sale ends today”).\n"
+        "• social: social proof (e.g., “1,234 bought this”, “x people viewing now”, “Bestseller”).\n"
+        "• voucher: coupon/promo/voucher (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
+        "• bundle: multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”).\n"
+        "• ratings: star or numeric ratings and/or review counts (e.g., “4.3/5”, “★★★★★”, “(2,145 reviews)”).\n"
+        "Rules: return a STRICT JSON object using only the allowed labels. If a cue is absent, omit it. "
+        "Do NOT invent new labels. Prefer precision over recall; if uncertain, omit.\n"
+        "Output formats:\n"
+        "Single image → {\"cues\": [<labels>]}\n"
+        "Grid 2×4 (row-major 8 cells) → {\"grid\": [[<labels>], ..., [<labels>]]}\n"
+    )
+
 def _fallback_openai_detect(image_b64: str, mode: str = "single"):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -867,12 +978,10 @@ def _fallback_openai_detect(image_b64: str, mode: str = "single"):
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
-    sys = (
-        "You are an e-commerce UI analyst. Identify which of these cues are present: "
-        + ", ".join(sorted(CUE_CHOICES_SCORER))
-        + ". Return ONLY JSON. Single: {\"cues\":[...]}. Grid 2x4: {\"grid\":[[...],...]} (8 arrays row-major)."
-    )
+
+    sys = _build_detection_prompt()
     user_text = "Mode: single" if mode == "single" else "Mode: grid_2x4"
+
     data = {
         "model": model,
         "messages": [
@@ -882,27 +991,46 @@ def _fallback_openai_detect(image_b64: str, mode: str = "single"):
                 {"type": "image_url", "image_url": {"url": image_b64}}
             ]},
         ],
-        "max_tokens": 512,
+        "max_tokens": 600,
         "temperature": 0
     }
-    r = requests.post(url, headers=headers, json=data, timeout=(12, 240))
+
+    r = requests.post(url, headers=headers, json=data, timeout=(15, 240))
     if r.status_code >= 400:
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
     txt = r.json()["choices"][0]["message"]["content"]
+
+    # Best-effort JSON recovery
     try:
         obj = json.loads(txt)
     except Exception:
         i, j = txt.find("{"), txt.rfind("}")
         obj = json.loads(txt[i:j+1]) if i >= 0 and j > i else {}
+
+    # Post-process to ensure only allowed canonical labels are returned
     if mode == "single":
-        return [_norm_label(x) for x in (obj.get("cues") or []) if isinstance(x, str)]
+        raw = [x for x in (obj.get("cues") or []) if isinstance(x, str)]
+        cues = []
+        for x in raw:
+            canon = _norm_label(x)
+            if canon in CUE_CHOICES_SCORER and canon not in cues:
+                cues.append(canon)
+        return cues
+
+    # grid
     out = []
     for cell in (obj.get("grid") or [])[:8]:
+        clean = set()
         if isinstance(cell, list):
-            out.append(set(_norm_label(x) for x in cell if isinstance(x, str)))
-        else:
-            out.append(set())
-    while len(out) < 8: out.append(set())
+            for x in cell:
+                if not isinstance(x, str):
+                    continue
+                canon = _norm_label(x)
+                if canon in CUE_CHOICES_SCORER:
+                    clean.add(canon)
+        out.append(clean)
+    while len(out) < 8:
+        out.append(set())
     return out
 
 def _detect_with_agent_or_fallback(image_b64: str, mode: str):
@@ -1260,3 +1388,4 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
