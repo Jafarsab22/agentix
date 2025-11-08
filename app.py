@@ -18,6 +18,53 @@ RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=
 JOBS_DIR = pathlib.Path("jobs"); JOBS_DIR.mkdir(parents=True, exist_ok=True)
 EFFECTS_DIR = RESULTS_DIR / "effects"; EFFECTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# URL of your PHP endpoint that prints JSON from agentix_cross_parameters
+CROSS_PARAMS_URL = os.getenv(
+    "AGENTIX_CROSS_PARAMS_URL",
+    "https://yourdomain.com/Agentix/getCrossParameters.php",
+)
+
+def load_params_from_php(url: str = CROSS_PARAMS_URL):
+    """
+    Fetch cross-product parameters from PHP and return dict:
+    {
+        "Row 1": {
+            "beta": ...,
+            "M": ...,
+            "C": ...,
+            "R": ...,
+            "price_weight": ...   # may be None
+        },
+        ...
+    }
+    Expected PHP JSON rows to have fields:
+      badge, beta, m_val, c_val, r_val, price_weight
+    """
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    out = {}
+    for row in data:
+        badge = row.get("badge")
+        if not badge:
+            continue
+        out[badge] = {
+            "beta": float(row.get("beta") or 0.0),
+            "M": float(row.get("m_val") or 0.0),
+            "C": float(row.get("c_val") or 0.0),
+            "R": float(row.get("r_val") or 0.0),
+        }
+        # price_weight is only meaningful for ln(price), but we can store it anyway
+        if "price_weight" in row and row["price_weight"] is not None:
+            out[badge]["price_weight"] = float(row["price_weight"])
+    return out
+#load the parameters
+try:
+    SCORE_PARAMS = load_params_from_php()
+except Exception as e:
+    print("⚠️ could not load cross parameters:", e)
+    SCORE_PARAMS = None
+
 # Optional storefront helpers
 try:
     from storefront import build_storefront_from_payload, save_storefront
@@ -888,7 +935,6 @@ def _auto_single_from_image(filepath: str) -> tuple:
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
 # at top of app.py, once
-SCORE_PARAMS = load_params_somehow()   # e.g. call your PHP endpoint / getCrossParameters.php
 from score_image import score_grid_2x4  # your pure-python scorer
 
 @_catch_and_report
@@ -1226,6 +1272,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
