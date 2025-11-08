@@ -21,7 +21,7 @@ EFFECTS_DIR = RESULTS_DIR / "effects"; EFFECTS_DIR.mkdir(parents=True, exist_ok=
 # URL of your PHP endpoint that prints JSON from agentix_cross_parameters
 CROSS_PARAMS_URL = os.getenv(
     "AGENTIX_CROSS_PARAMS_URL",
-    "https://yourdomain.com/Agentix/getCrossParameters.php",
+    "https://aireadyworkforce.pro/Agentix/getCrossParameters.php",
 )
 
 def load_params_from_php(url: str = CROSS_PARAMS_URL):
@@ -803,7 +803,7 @@ def _preview_badges_effects(admin_key: str):
 import base64, pathlib, time as _time, uuid as _uuid2, os as _os, json as _json2, requests as _req2
 try:
     from score_image import score_grid_2x4, load_params_from_php
-    PARAMS = load_params_from_php("https://your-domain/Agentix/getCrossParameters.php?model=GPT-4.1-mini") #make it generic
+    PARAMS = load_params_from_php("https://aireadyworkforce.pro/Agentix/getCrossParameters.php?model=GPT-4.1-mini") #make it generic
 except Exception:
     score_single_card = None
     score_grid_2x4 = None
@@ -1272,6 +1272,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
