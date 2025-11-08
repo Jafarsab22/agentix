@@ -24,46 +24,70 @@ CROSS_PARAMS_URL = os.getenv(
     "https://aireadyworkforce.pro/Agentix/getCrossParameters.php",
 )
 
+# --- replacement parser (single source of truth) ---
 def load_params_from_php(url: str = CROSS_PARAMS_URL):
-    """
-    Fetch cross-product parameters from PHP and return dict:
-    {
-        "Row 1": {
-            "beta": ...,
-            "M": ...,
-            "C": ...,
-            "R": ...,
-            "price_weight": ...   # may be None
-        },
-        ...
-    }
-    Expected PHP JSON rows to have fields:
-      badge, beta, m_val, c_val, r_val, price_weight
-    """
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     data = r.json()
-    out = {}
-    for row in data:
-        badge = row.get("badge")
-        if not badge:
-            continue
-        out[badge] = {
-            "beta": float(row.get("beta") or 0.0),
-            "M": float(row.get("m_val") or 0.0),
-            "C": float(row.get("c_val") or 0.0),
-            "R": float(row.get("r_val") or 0.0),
-        }
-        # price_weight is only meaningful for ln(price), but we can store it anyway
-        if "price_weight" in row and row["price_weight"] is not None:
-            out[badge]["price_weight"] = float(row["price_weight"])
-    return out
-#load the parameters
+
+    if isinstance(data, dict) and isinstance(data.get("params"), dict):
+        out = {}
+        for badge, vals in data["params"].items():
+            if not badge:
+                continue
+            out[str(badge)] = {
+                "beta": float(vals.get("beta", 0.0)),
+                "M": float(vals.get("M", 0.0)),
+                "C": float(vals.get("C", 0.0)),
+                "R": float(vals.get("R", 0.0)),
+            }
+            if "price_weight" in vals and vals["price_weight"] is not None:
+                out[str(badge)]["price_weight"] = float(vals["price_weight"])
+        return out
+
+    if isinstance(data, list):
+        out = {}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            badge = row.get("badge")
+            if not badge:
+                continue
+            out[str(badge)] = {
+                "beta": float(row.get("beta") or 0.0),
+                "M": float(row.get("m_val") or 0.0),
+                "C": float(row.get("c_val") or 0.0),
+                "R": float(row.get("r_val") or 0.0),
+            }
+            if "price_weight" in row and row["price_weight"] is not None:
+                out[str(badge)]["price_weight"] = float(row["price_weight"])
+        return out
+
+    raise ValueError("Unexpected JSON shape from cross-parameters endpoint")
+
+# load the parameters (do this once)
 try:
     SCORE_PARAMS = load_params_from_php()
 except Exception as e:
     print("⚠️ could not load cross parameters:", e)
     SCORE_PARAMS = None
+
+# cues and normalisation
+_CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
+
+# Keep detector choices aligned with what we actually have params for
+if SCORE_PARAMS and isinstance(SCORE_PARAMS, dict):
+    CUE_CHOICES_SCORER = [k for k in SCORE_PARAMS.keys() if k not in _CUE_EXCLUDE]
+else:
+    CUE_CHOICES_SCORER = ["All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"]
+
+# import only the scorer(s) you use from score_image – do NOT import load_params_from_php from there
+from score_image import score_grid_2x4
+try:
+    from score_image import score_single_card
+except Exception:
+    score_single_card = None
+
 
 # Optional storefront helpers
 try:
@@ -1272,6 +1296,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
