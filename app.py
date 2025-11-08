@@ -946,7 +946,7 @@ def _build_detection_prompt() -> str:
     vocab = ", ".join(CUE_CHOICES_SCORER)
     # Clear definitions, POS/NEG anchors, and pattern hints. Keep it concise but explicit.
     return (
-        "You are an e-commerce UI analyst. Detect all the cues that you find for each product from the list below: "
+        "You are an e-commerce UI analyst. Detect all the cues that you find for each product in a grid of 2x4 cells/images from the list below while zooming into fine print: "
         f"{vocab}.\n"
         "Definitions:\n"
         "• All-in framing: the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT and shipping”, “price includes tax”). "
@@ -959,7 +959,7 @@ def _build_detection_prompt() -> str:
         "• voucher: coupon/promo/voucher (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
         "• bundle: multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”).\n"
         "• ratings: star or numeric ratings and/or review counts (e.g., “4.3/5”, “★★★★★”, “(2,145 reviews)”).\n"
-        "Rules: return a STRICT JSON object using only the allowed labels. If a cue is absent, omit it. "
+        "Rules: return a STRICT JSON object using the above cues. If a cue is absent, omit it. "
         "Do NOT invent new labels. Prefer precision over recall; if uncertain, omit.\n"
         "Output formats:\n"
         "Single image → {\"cues\": [<labels>]}\n"
@@ -1383,6 +1383,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
