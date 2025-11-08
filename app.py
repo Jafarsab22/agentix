@@ -755,7 +755,8 @@ def _preview_badges_effects(admin_key: str):
 # === Scoring helpers (auto-detect only; manual tools removed) =================
 import base64, pathlib, time as _time, uuid as _uuid2, os as _os, json as _json2, requests as _req2
 try:
-    from score_image import score_single_card, score_grid_2x4, LEARNED_PARAMS
+    from score_image import score_grid_2x4, load_params_from_php
+    PARAMS = load_params_from_php("https://your-domain/Agentix/getCrossParameters.php?model=GPT-4.1-mini") #make it generic
 except Exception:
     score_single_card = None
     score_grid_2x4 = None
@@ -889,42 +890,81 @@ def _auto_single_from_image(filepath: str) -> tuple:
 @_catch_and_report
 def _auto_grid_from_image(filepath: str) -> tuple:
     if not filepath:
-        return gr.update(value=None), "No image.","",""
+        return gr.update(value=None), "No image.", "", ""
     if score_grid_2x4 is None:
-        return gr.update(value=None), "Scoring utility not available.","",""
+        return gr.update(value=None), "Scoring utility not available.", "", ""
+
+    # 1) turn file into data URL and run vision
     data_url = _file_to_data_url(filepath)
-    grid_sets = _detect_with_agent_or_fallback(data_url, "grid")
-    grid_sets = [set(c for c in cell if c in CUE_CHOICES_SCORER) for cell in (grid_sets[:8] + [set()]*8)[:8]]
-    res = score_grid_2x4(grid_sets)
+    # this returns a list of up to 8 cells, each cell = list/set of cue names
+    detected_grid = _detect_with_agent_or_fallback(data_url, "grid")
+
+    # 2) normalise + trim to 8, filter to cues we care about
+    norm_cells = []
+    for cell in (detected_grid[:8] + [set()] * 8)[:8]:
+        # ensure set
+        if not isinstance(cell, (list, set, tuple)):
+            cell = []
+        clean = set(c for c in cell if c in CUE_CHOICES_SCORER)
+        norm_cells.append(clean)
+
+    # 3) build cards for the scorer (no price yet → None)
+    # score_image.score_grid_2x4 expects:
+    #   [{"cues": {...}, "price": None}, ...] len=8
+    cards = [{"cues": cell, "price": None} for cell in norm_cells]
+
+    # 4) call the new scorer with params from DB
+    # make sure SCORE_PARAMS exists globally (load once at startup)
+    res = score_grid_2x4(cards, SCORE_PARAMS)
+
     rows = res.get("cards", [])
-    b_lines = ["#### Identified badges per card (row-major)", "", "| Card | Row | Col | Badges |", "|---:|---:|---:|---|"]
-    for i, cell in enumerate(grid_sets, 1):
+
+    # 5) markdown: detected badges per card
+    b_lines = [
+        "#### Identified badges per card (row-major)",
+        "",
+        "| Card | Row | Col | Badges |",
+        "|---:|---:|---:|---|",
+    ]
+    for i, cell in enumerate(norm_cells, 1):
         r = 1 if i <= 4 else 2
         c = ((i - 1) % 4) + 1
-        b_lines.append(f"| {i} | {r} | {c} | {', '.join(sorted(cell)) if cell else '—'} |")
+        b_lines.append(
+            f"| {i} | {r} | {c} | {', '.join(sorted(cell)) if cell else '—'} |"
+        )
     badges_md = "\n".join(b_lines)
+
+    # 6) markdown: scores (Option A = β·x, Option B = M·C·R)
     s_lines = [
-        "#### Grid 2×4 scores", "",
-        "| Card | Row | Col | raw | final | ∑ s_i | ∑ w_i |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "#### Grid 2×4 scores",
+        "",
+        "| Card | Row | Col | option A (β·x) | option B (scores) | Price |",
+        "|---:|---:|---:|---:|---:|---|",
     ]
     for i, r in enumerate(rows, 1):
         s_lines.append(
             f"| {i} | {r.get('row')} | {r.get('col')} | "
-            f"{_fmt_num(r.get('raw'))} | {_fmt_num(r.get('final'))} | "
-            f"{_fmt_num(r.get('sum_s'))} | {_fmt_num(r.get('sum_w'))} |"
+            f"{_fmt_num(r.get('option_a'))} | {_fmt_num(r.get('option_b'))} | "
+            f"{r.get('price') if r.get('price') is not None else '—'} |"
         )
+
+    # aggregates from the scorer
     s_lines += [
-        "", "##### Aggregates", "",
-        "| Metric | Value |", "|---|---:|",
-        f"| raw_mean | {_fmt_num(res.get('raw_mean'))} |",
-        f"| final_mean | {_fmt_num(res.get('final_mean'))} |",
-        f"| raw_best | {_fmt_num(res.get('raw_best'))} |",
-        f"| final_best | {_fmt_num(res.get('final_best'))} |",
-        f"| price_weight | {_fmt_num(res.get('price_weight'))} |",
+        "",
+        "##### Aggregates",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| mean_option_a | {_fmt_num(res.get('mean_option_a'))} |",
+        f"| mean_option_b | {_fmt_num(res.get('mean_option_b'))} |",
+        f"| best_option_a | {_fmt_num(res.get('best_option_a'))} |",
+        f"| best_option_b | {_fmt_num(res.get('best_option_b'))} |",
     ]
+
     score_md = "\n".join(s_lines)
+
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
+
 
 @_catch_and_report
 def _handle_image_upload(file) -> tuple:
@@ -1190,6 +1230,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
