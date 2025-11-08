@@ -840,6 +840,52 @@ except Exception:
 
 UPLOADS_DIR = pathlib.Path("uploads"); UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Pull weights from PHP and inject into score_image.LEARNED_PARAMS ---
+CROSS_PARAMS_URL = os.getenv(
+    "AGENTIX_CROSS_PARAMS_URL",
+    "https://aireadyworkforce.pro/Agentix/getCrossParameters.php",
+)
+
+def _fetch_params_from_php(url: str = CROSS_PARAMS_URL) -> dict:
+    """
+    Returns dict keyed by cue, with at least beta, M, C, R, s, and optional price_weight.
+    Accepts the { ok, model, params: {...} } shape you see in the browser.
+    """
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict) or not isinstance(data.get("params"), dict):
+        raise ValueError("Unexpected JSON shape from cross-parameters endpoint")
+    out = {}
+    for badge, vals in data["params"].items():
+        if not badge or not isinstance(vals, dict):
+            continue
+        out[str(badge)] = {
+            "beta": float(vals.get("beta", 0.0)),
+            "M": float(vals.get("M", 0.0)),
+            "C": float(vals.get("C", 0.0)),
+            "R": float(vals.get("R", 0.0)),
+            "s": float(vals.get("s", 0.0)),   # present in your PHP
+        }
+        if vals.get("price_weight") is not None:
+            out[str(badge)]["price_weight"] = float(vals["price_weight"])
+    return out
+
+# IMPORTANT: overwrite the module-level dict the scorers use
+try:
+    import score_image as _si
+    php_params = _fetch_params_from_php()
+    if isinstance(_si.LEARNED_PARAMS, dict):
+        _si.LEARNED_PARAMS.clear()
+        _si.LEARNED_PARAMS.update(php_params)
+    else:
+        _si.LEARNED_PARAMS = dict(php_params)
+    # keep local alias in sync if you imported it above
+    LEARNED_PARAMS = _si.LEARNED_PARAMS
+    logging.info("Loaded %d cues from PHP into score_image.LEARNED_PARAMS", len(_si.LEARNED_PARAMS))
+except Exception as e:
+    logging.exception("Could not load cross parameters from PHP: %s", e)
+
 _CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
 CUE_CHOICES_SCORER = [k for k in LEARNED_PARAMS.keys() if k not in _CUE_EXCLUDE] or [
     "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer"
@@ -985,7 +1031,8 @@ def _auto_grid_from_image(filepath: str) -> tuple:
     cards = [{"cues": cell, "price": None} for cell in norm_cells]
 
     # 4) score (this must be a real function defined earlier in app.py)
-    res = score_grid_2x4(cards, SCORE_PARAMS)
+    res = score_grid_2x4(grid_sets)
+
 
     # 5) pretty printing – detected cues
     b_lines = [
