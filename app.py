@@ -959,7 +959,6 @@ def _build_detection_prompt() -> str:
         "• voucher: coupon/promo/voucher (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
         "• bundle: multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”).\n"
         "• ratings: star or numeric ratings and/or review counts (e.g., “4.3/5”, “★★★★★”, “(2,145 reviews)”).\n"
-        "Zoom into fine print; read phrases like 'Only 3 left', 'Low stock', or 'In stock soon' even if small.\n"
         "Rules: return a STRICT JSON object using only the allowed labels. If a cue is absent, omit it. "
         "Do NOT invent new labels. Prefer precision over recall; if uncertain, omit.\n"
         "Output formats:\n"
@@ -1384,6 +1383,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
