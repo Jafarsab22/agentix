@@ -325,6 +325,13 @@ def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set
     boxes = _compute_grid_boxes(im)
     prompt = _build_detection_prompt(allowed_labels)
 
+    # --- DEBUGGING: save actual cell crops for inspection ---
+    debug_dir = os.path.join("results", "crops")
+    os.makedirs(debug_dir, exist_ok=True)
+    for i, (x0, y0, x1, y1) in enumerate(boxes):
+        crop_path = os.path.join(debug_dir, f"crop_{i+1}_r{1 if i < 4 else 2}_c{(i % 4) + 1}.png")
+        im.crop((x0, y0, x1, y1)).save(crop_path)
+
     out: list[set] = []
     for (x0, y0, x1, y1) in boxes:
         if time.time() >= deadline:
@@ -351,6 +358,7 @@ def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set
     while len(out) < 8:
         out.append(set())
     return out
+
 
 # ---------------------- scoring ----------------------
 
