@@ -146,14 +146,16 @@ def _img_to_data_url(img: Image.Image) -> str:
 
 def _openai_call(image_data_url: str, prompt: str) -> dict:
     """
-    Robust call with retries and configurable timeouts.
+    Robust call with bounded latency.
+
     Env vars:
       OPENAI_API_KEY (required)
       OPENAI_MODEL (default: gpt-4.1-mini)
       OPENAI_BASE_URL (default: https://api.openai.com/v1)
-      OPENAI_CONNECT_TIMEOUT (default: 30)  # seconds
-      OPENAI_MAX_RETRIES (default: 3)
-      OPENAI_BACKOFF_BASE (default: 1.5)
+      OPENAI_CONNECT_TIMEOUT (default: 6)       # seconds
+      OPENAI_READ_TIMEOUT (default: 30)         # seconds
+      OPENAI_MAX_RETRIES (default: 1)           # attempts in addition to the first
+      OPENAI_BACKOFF_BASE (default: 1.2)
     """
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -162,9 +164,10 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     url = f"{base_url}/chat/completions"
 
-    connect_timeout = float(os.getenv("OPENAI_CONNECT_TIMEOUT", "30"))
-    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
-    backoff_base = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
+    connect_timeout = float(os.getenv("OPENAI_CONNECT_TIMEOUT", "6"))
+    read_timeout = float(os.getenv("OPENAI_READ_TIMEOUT", "30"))
+    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+    backoff_base = float(os.getenv("OPENAI_BACKOFF_BASE", "1.2"))
 
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
     payload = {
@@ -179,34 +182,37 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
         "temperature": 0
     }
 
+    attempts = 1 + max(0, max_retries)
     last_err = None
-    for attempt in range(1, max_retries + 1):
+    for i in range(attempts):
         try:
-            r = requests.post(url, headers=headers, json=payload,
-                              timeout=(connect_timeout, 240))
+            r = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=(connect_timeout, read_timeout),
+            )
             if r.status_code >= 400:
-                # transient 5xx → retry; otherwise break
-                if 500 <= r.status_code < 600 and attempt < max_retries:
-                    time.sleep(backoff_base ** attempt)
+                if 500 <= r.status_code < 600 and i < attempts - 1:
+                    time.sleep(backoff_base ** (i + 1))
                     continue
                 raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
             txt = r.json()["choices"][0]["message"]["content"]
             try:
                 return json.loads(txt)
             except Exception:
-                i, j = txt.find("{"), txt.rfind("}")
-                return json.loads(txt[i:j+1]) if i >= 0 and j > i else {}
+                start, end = txt.find("{"), txt.rfind("}")
+                return json.loads(txt[start:end+1]) if start >= 0 and end > start else {}
         except requests.exceptions.RequestException as e:
             last_err = e
-            if attempt < max_retries:
-                time.sleep(backoff_base ** attempt)
+            if i < attempts - 1:
+                time.sleep(backoff_base ** (i + 1))
                 continue
-            # give a safe empty object so upstream can continue gracefully
             return {}
-    # Fallback in the unlikely case loop ends oddly
     if last_err:
         print(f"[vision] final failure after retries: {last_err}", flush=True)
     return {}
+
 
 # ---------------------- detection APIs ----------------------
 
@@ -224,22 +230,34 @@ def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[s
     return out
 
 def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[Set[str]]:
-    """Return 8 sets of labels, row-major, by cropping each cell and calling the detector.
-       If a cell times out, it yields an empty set and processing continues."""
+    """
+    Crop the 2×4 grid and detect per cell. Enforces a total time budget.
+    If a cell times out or the overall budget is exceeded, it yields an empty set
+    and continues so the app never blocks indefinitely.
+
+    Env vars:
+      OPENAI_GRID_DEADLINE_SEC (default: 60)  # total budget for the whole grid
+    """
     im = Image.open(filepath).convert("RGB")
     W, H = im.size
     rows, cols = 2, 4
     out: list[Set[str]] = []
     prompt = _build_detection_prompt(allowed_labels)
 
+    deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "60"))
+
     for r in range(rows):
         for c in range(cols):
-            x0 = int(c * W/cols); x1 = int((c+1) * W/cols)
-            y0 = int(r * H/rows); y1 = int((r+1) * H/rows)
+            if time.time() >= deadline:
+                out.append(set())
+                continue
+
+            x0 = int(c * W / cols); x1 = int((c + 1) * W / cols)
+            y0 = int(r * H / rows); y1 = int((r + 1) * H / rows)
             crop = im.crop((x0, y0, x1, y1))
             data_url = _img_to_data_url(crop)
 
-            obj = _openai_call(data_url, prompt)  # safe: {} on failure
+            obj = _openai_call(data_url, prompt)  # returns {} on failure
             labels = []
             if isinstance(obj.get("cues"), list):
                 labels = obj["cues"]
@@ -254,7 +272,7 @@ def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[Set
                 if canon in allowed_labels:
                     clean.add(canon)
             out.append(clean)
-    # Always return 8 cells
+
     while len(out) < 8:
         out.append(set())
     return out
