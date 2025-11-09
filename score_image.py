@@ -1,27 +1,25 @@
 """
-score_image.py — cell‑aware detector + scoring
-------------------------------------------------
-Detect cues on e‑commerce cards (single or 2×4 grid) and score them.
-Public API (unchanged):
+score_image.py
+---------------
+Pure detection + scoring helpers.
+
+Detect cues on e-commerce cards (single or 2×4 grid) and score them.
+The app should import these functions and pass PHP-loaded parameters.
+
+Public API:
 - build_allowed_cues(params, expected, exclude) -> list[str]
 - detect_single_from_image(filepath, allowed_labels) -> list[str]
-- detect_grid_from_image(filepath, allowed_labels) -> list[set[str]]   # 8 cells row‑major
-- score_single_card(cues_set, params, *, price=None, extra_cues=()) -> dict
-- score_grid_2x4(cards, params) -> dict
-
-Notes
-- No dependency on app.py. Keep your app as is; it already imports these symbols.
-- Per‑cell detection now runs on TWO focused crops in each grid cell:
-  (1) the full cell; (2) a bottom text band (where strike‑through, voucher, scarcity tend to appear).
-  Results are unioned with label normalisation and filtered to allowed labels.
-- Robustness: each crop is upscaled for tiny text; timeouts are bounded; any failure yields an empty set for that cell.
-- Optional debugging: set DEBUG_CROPS=1 to emit per‑cell PNG crops into results/crops/.
+- detect_grid_from_image(filepath, allowed_labels) -> list[set[str]]   # 8 cells row-major
+- score_single_card(cues_set, params) -> dict with 'raw','final','sum_s','sum_w','price_weight'
+- score_grid_2x4(cards, params) -> dict with per-card + aggregates
 """
 
 from __future__ import annotations
-import io, base64, json, math, os, time, pathlib
-from typing import Dict, Any, Iterable, Sequence, Set, Optional, List
-from PIL import Image
+import io, base64, json, math, os, time
+from typing import Dict, Any, Iterable, Sequence, Set, Optional, List, Tuple
+
+import numpy as np
+from PIL import Image, ImageFilter
 import requests
 
 # ---------------------- vocab helpers ----------------------
@@ -138,19 +136,17 @@ def _build_detection_prompt(allowed: list[str]) -> str:
         "Format: {\"cues\":[...]}.\n"
     )
 
-# minimal, robust data-URL builder with optional upscaling
-
-def _img_to_data_url(img: Image.Image, *, min_w=640, min_h=420) -> str:
+def _img_to_data_url(img: Image.Image) -> str:
+    # Upscale small crops for better tiny-text detection (RRP, “Only 3 left”).
     w, h = img.size
-    scale = max(1.0, max(min_w / max(1, w), min_h / max(1, h)))
-    if scale > 1.0:
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    target_min = 720  # aim for ~720px on the shorter side
+    scale = max(1.0, target_min / max(1, min(w, h)))
+    img2 = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+    img2.save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
-# OpenAI call with bounded time + retries; returns {} on failure
+# ---- bounded-latency OpenAI call (no retries unless configured) --------------
 
 def _openai_call(image_data_url: str, prompt: str) -> dict:
     key = os.getenv("OPENAI_API_KEY")
@@ -162,28 +158,30 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
 
     connect_timeout = float(os.getenv("OPENAI_CONNECT_TIMEOUT", "6"))
     read_timeout = float(os.getenv("OPENAI_READ_TIMEOUT", "30"))
-    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
-    backoff = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
+    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "0"))
+    backoff_base = float(os.getenv("OPENAI_BACKOFF_BASE", "1.2"))
 
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_data_url}}]},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": image_data_url}}
+            ]},
         ],
-        "max_tokens": 500,
+        "max_tokens": 600,
         "temperature": 0
     }
 
-    attempt = 0
-    while True:
-        attempt += 1
+    attempts = 1 + max(0, max_retries)
+    for i in range(attempts):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=(connect_timeout, read_timeout))
+            r = requests.post(url, headers=headers, json=payload,
+                              timeout=(connect_timeout, read_timeout))
             if r.status_code >= 400:
-                if 500 <= r.status_code < 600 and attempt <= max_retries:
-                    time.sleep(backoff ** attempt)
+                if 500 <= r.status_code < 600 and i < attempts - 1:
+                    time.sleep(backoff_base ** (i + 1))
                     continue
                 return {}
             txt = r.json()["choices"][0]["message"]["content"]
@@ -193,16 +191,17 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
                 a, b = txt.find("{"), txt.rfind("}")
                 return json.loads(txt[a:b+1]) if a >= 0 and b > a else {}
         except requests.exceptions.RequestException:
-            if attempt <= max_retries:
-                time.sleep(backoff ** attempt)
+            if i < attempts - 1:
+                time.sleep(backoff_base ** (i + 1))
                 continue
             return {}
+    return {}
 
 # ---------------------- detection APIs ----------------------
 
 def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[str]:
     im = Image.open(filepath).convert("RGB")
-    data_url = _img_to_data_url(im, min_w=800, min_h=520)
+    data_url = _img_to_data_url(im)
     prompt = _build_detection_prompt(allowed_labels)
     obj = _openai_call(data_url, prompt)
     raw = [x for x in (obj.get("cues") or []) if isinstance(x, str)]
@@ -213,72 +212,141 @@ def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[s
             out.append(canon)
     return out
 
+# ---- gutter-based 2×4 cropping (prevents neighbour bleed) --------------------
 
-def _save_debug_crop(img: Image.Image, *, tag: str, r: int, c: int, k: str):
-    if os.getenv("DEBUG_CROPS", "0") != "1":
-        return
-    d = pathlib.Path("results") / "crops"
-    d.mkdir(parents=True, exist_ok=True)
-    p = d / f"cell{r}{c}_{k}.png"
+def _to_gray_np(im: Image.Image) -> np.ndarray:
+    g = im.convert("L")
+    arr = np.asarray(g, dtype=np.float32) / 255.0
+    return arr
+
+def _smooth1d(x: np.ndarray, k: int) -> np.ndarray:
+    if k <= 1:
+        return x
+    k = int(k)
+    k = max(1, k | 1)  # odd
+    kernel = np.ones(k, dtype=np.float32) / k
+    return np.convolve(x, kernel, mode="same")
+
+def _find_gutter_positions(arr: np.ndarray, n_cuts: int, expected_fracs: list[float]) -> list[int]:
+    # "Ink" = darker→higher. Gutters are low-ink troughs.
+    ink_cols = np.mean(1.0 - arr, axis=0)
+    ink_rows = np.mean(1.0 - arr, axis=1)
+    # Choose projection depending on whether we search vertical or horizontal later.
+    # This function will be called with either arr or arr.T so we always read along axis=0.
+    proj = np.mean(1.0 - arr, axis=0)
+    # Smooth to suppress product photos/ratings noise.
+    smooth = _smooth1d(proj, max(9, arr.shape[0] // 80))
+    # Normalise
+    smin, smax = float(smooth.min()), float(smooth.max())
+    if smax - smin < 1e-6:
+        smooth = np.zeros_like(smooth)
+    else:
+        smooth = (smooth - smin) / (smax - smin)
+
+    N = len(smooth)
+    positions: list[int] = []
+    window = max(6, N // 100)
+
+    for frac in expected_fracs:
+        guess = int(round(frac * N))
+        lo = max(0, guess - 3 * window)
+        hi = min(N, guess + 3 * window)
+        seg = smooth[lo:hi]
+        if len(seg) == 0:
+            positions.append(guess)
+            continue
+        j = int(np.argmin(seg))
+        pos = lo + j
+        # Deconflict with previously chosen cuts
+        for _ in range(3):
+            if all(abs(pos - q) >= window for q in positions):
+                break
+            # move to next local minimum in the segment
+            seg2 = seg.copy()
+            seg2[max(0, j - window):min(len(seg2), j + window + 1)] = 1.0
+            j = int(np.argmin(seg2))
+            pos = lo + j
+        positions.append(pos)
+
+    positions.sort()
+    return positions[:n_cuts]
+
+def _compute_grid_boxes(im: Image.Image) -> list[Tuple[int, int, int, int]]:
+    """
+    Returns 8 bounding boxes (x0,y0,x1,y1) for the 2×4 grid, using whitespace gutters.
+    Falls back to equal splits if gutters can't be located.
+    """
+    W, H = im.size
+    gray = _to_gray_np(im)
+
+    # Expected cut ratios for Amazon-like 2×4: roughly quarters horizontally, half vertically
+    v_fracs = [1/4, 2/4, 3/4]
+    h_fracs = [1/2]
+
     try:
-        img.save(p)
+        # Vertical gutters: search on the original orientation
+        vcuts = _find_gutter_positions(gray, 3, v_fracs)
+        # Horizontal gutters: search on the transposed (to reuse same logic)
+        hcuts = _find_gutter_positions(gray.T, 1, h_fracs)
     except Exception:
-        pass
+        vcuts, hcuts = [], []
 
+    # Validate monotonicity and bounds; otherwise fall back
+    ok = (len(vcuts) == 3 and len(hcuts) == 1 and
+          10 < vcuts[0] < vcuts[1] < vcuts[2] < W - 10 and
+          10 < hcuts[0] < H - 10)
+    if not ok:
+        # Equal splits
+        vcuts = [W * 1 // 4, W * 2 // 4, W * 3 // 4]
+        hcuts = [H // 2]
 
-def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> List[Set[str]]:
-    """Per‑cell detection on a 2×4 grid.
-    Strategy per cell: analyse (A) full cell; (B) a bottom text band (≈ last 35% height).
-    Union labels from A and B after normalisation and filtering. Returns 8 sets row‑major.
-    Overall deadline can be tuned via OPENAI_GRID_DEADLINE_SEC (default 70s).
+    xs = [0] + [int(x) for x in vcuts] + [W]
+    ys = [0] + [int(y) for y in hcuts] + [H]
+
+    boxes: list[Tuple[int, int, int, int]] = []
+    for r in range(2):
+        for c in range(4):
+            x0, x1 = xs[c], xs[c+1]
+            y0, y1 = ys[r], ys[r+1]
+            # shrink inward to avoid neighbour bleed
+            mw = int(0.04 * (x1 - x0))
+            mh = int(0.04 * (y1 - y0))
+            boxes.append((x0 + mw, y0 + mh, x1 - mw, y1 - mh))
+    return boxes
+
+def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set]:
+    """
+    Detect 8 cards in a 2×4 grid by locating inter-card gutters and
+    analysing each crop independently. Returns list[set] length 8
+    in row-major order.
     """
     deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "70"))
     im = Image.open(filepath).convert("RGB")
-    W, H = im.size
-    rows, cols = 2, 4
-    out: List[Set[str]] = []
+    boxes = _compute_grid_boxes(im)
     prompt = _build_detection_prompt(allowed_labels)
 
-    for rr in range(rows):
-        for cc in range(cols):
-            if time.time() >= deadline:
-                out.append(set()); continue
+    out: list[set] = []
+    for (x0, y0, x1, y1) in boxes:
+        if time.time() >= deadline:
+            out.append(set()); continue
+        crop = im.crop((x0, y0, x1, y1))
+        # de-noise subtle gutters, keep text crisp
+        crop = crop.filter(ImageFilter.MedianFilter(size=3))
+        obj = _openai_call(_img_to_data_url(crop), prompt)
+        labels = []
+        if isinstance(obj.get("cues"), list):
+            labels = obj["cues"]
+        elif isinstance(obj.get("grid"), list) and obj["grid"]:
+            labels = obj["grid"][0]
 
-            x0 = int(cc * W / cols); x1 = int((cc + 1) * W / cols)
-            y0 = int(rr * H / rows); y1 = int((rr + 1) * H / rows)
-            cell = im.crop((x0, y0, x1, y1))
-
-            # small padding to include outer shadows/tooltips
-            pad_x = max(6, (x1 - x0) // 60)
-            pad_y = max(6, (y1 - y0) // 60)
-            x0p = max(0, x0 - pad_x); y0p = max(0, y0 - pad_y)
-            x1p = min(W, x1 + pad_x); y1p = min(H, y1 + pad_y)
-            cell = im.crop((x0p, y0p, x1p, y1p))
-
-            # (A) full cell
-            a_url = _img_to_data_url(cell, min_w=720, min_h=480)
-            _save_debug_crop(cell, tag="full", r=rr+1, c=cc+1, k="A")
-            obj_a = _openai_call(a_url, prompt)
-            labels_a = obj_a.get("cues") if isinstance(obj_a.get("cues"), list) else []
-
-            # (B) bottom text band (~lower 35%) — often where prices/badges live
-            cw, ch = cell.size
-            band_h = int(ch * 0.35)
-            text_band = cell.crop((0, ch - band_h, cw, ch))
-            _save_debug_crop(text_band, tag="band", r=rr+1, c=cc+1, k="B")
-            b_url = _img_to_data_url(text_band, min_w=800, min_h=360)
-            obj_b = _openai_call(b_url, prompt)
-            labels_b = obj_b.get("cues") if isinstance(obj_b.get("cues"), list) else []
-
-            clean: Set[str] = set()
-            for src in (labels_a or []) + (labels_b or []):
-                if not isinstance(src, str):
-                    continue
-                canon = _norm_label(src)
-                if canon in allowed_labels:
-                    clean.add(canon)
-
-            out.append(clean)
+        clean = set()
+        for x in labels or []:
+            if not isinstance(x, str): 
+                continue
+            canon = _norm_label(x)
+            if canon in allowed_labels:
+                clean.add(canon)
+        out.append(clean)
 
     while len(out) < 8:
         out.append(set())
@@ -288,7 +356,6 @@ def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> List[Set
 
 def _sign(x: float) -> int:
     return 1 if x > 0 else (-1 if x < 0 else 0)
-
 
 def _ln_or_none(price: Optional[float]) -> Optional[float]:
     if price is None:
@@ -301,12 +368,12 @@ def _ln_or_none(price: Optional[float]) -> Optional[float]:
         return None
     return math.log(price)
 
-
 def score_single_card(card_cues: Iterable[str],
                       params: Dict[str, Dict[str, float]],
                       *,
                       price: Optional[float] = None,
                       extra_cues: Iterable[str] = ()) -> Dict[str, float]:
+    """Readiness-like summary for a single card, plus a simple 'raw'."""
     cues = set(card_cues) | set(extra_cues)
     ln_price = _ln_or_none(price)
     if ln_price is not None:
@@ -330,7 +397,10 @@ def score_single_card(card_cues: Iterable[str],
         sum_w += w_i
         raw += beta
 
-    readiness = 0.0 if sum_w <= 1e-12 else max(-1.0, min(1.0, sum_s / sum_w))
+    if sum_w <= 1e-12:
+        readiness = 0.0
+    else:
+        readiness = max(-1.0, min(1.0, sum_s / sum_w))
 
     if ln_price is not None:
         pp = params.get("ln(price)")
@@ -345,7 +415,6 @@ def score_single_card(card_cues: Iterable[str],
         "sum_w": sum_w,
         "price_weight": (params.get("ln(price)", {}).get("price_weight", None) or 0.0)
     }
-
 
 def score_card_option_a(card_cues: Iterable[str],
                         params: Dict[str, Dict[str, float]],
@@ -366,7 +435,6 @@ def score_card_option_a(card_cues: Iterable[str],
         if p and p.get("beta") is not None:
             U += float(p["beta"]) * ln_price
     return U
-
 
 def score_card_option_b(card_cues: Iterable[str],
                         params: Dict[str, Dict[str, float]],
@@ -393,14 +461,16 @@ def score_card_option_b(card_cues: Iterable[str],
             s_i = _sign(beta) * M * C * R
         sum_s += s_i
         sum_w += w_i
-    readiness = 0.0 if sum_w <= 1e-12 else max(-1.0, min(1.0, sum_s / sum_w))
+    if sum_w <= 1e-12:
+        readiness = 0.0
+    else:
+        readiness = max(-1.0, min(1.0, sum_s / sum_w))
     if ln_price is not None:
         p_price = params.get("ln(price)")
         if p_price and p_price.get("price_weight") is not None:
             pw = max(0.0, min(1.0, float(p_price["price_weight"])))
             readiness *= pw
     return readiness
-
 
 def score_grid_2x4(cards: Sequence[dict],
                    params: Dict[str, Dict[str, float]]) -> dict:
