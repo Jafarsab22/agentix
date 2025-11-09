@@ -803,129 +803,34 @@ def _preview_badges_effects(admin_key: str):
     html = df[view_cols].to_html(index=False, border=1, justify="center")
     return html
 
-# === Scoring helpers (auto-detect only; manual tools removed) =================
+# === Detection + Scoring (moved to score_image.py) ============================
 import base64, time as _time, uuid as _uuid2, os as _os, json as _json2, requests as _req2
-
-# import scorers (do NOT import load_params_from_php from score_image to avoid shadowing)
-try:
-    from score_image import score_grid_2x4
-except Exception:
-    score_grid_2x4 = None
+from pathlib import Path as _Path
 
 try:
-    from score_image import score_single_card
+    # import scorers & detectors
+    from score_image import (
+        build_allowed_cues,
+        detect_single_from_image,
+        detect_grid_from_image,
+        score_single_card,
+        score_grid_2x4,
+    )
 except Exception:
+    detect_single_from_image = None
+    detect_grid_from_image = None
     score_single_card = None
-
-try:
-    from agent_runner import detect_levers as _agent_detect_levers  # optional
-except Exception:
-    _agent_detect_levers = None
+    score_grid_2x4 = None
 
 UPLOADS_DIR = pathlib.Path("uploads"); UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Detection vocabulary & prompt (drop-in replacement) ----------------------
-
+# Allowed cue vocabulary for detectors (params ∪ expected extras)
 _CUE_EXCLUDE = {"ln(price)", "Row 1", "Column 1", "Column 2", "Column 3"}
-
-# Canonical cue names we want the model to use (must match your params where possible)
 _EXPECTED_CUES = [
-    "All-in framing",
-    "Assurance",
-    "Scarcity tag",
-    "Strike-through",
-    "Timer",
-    "social",
-    "voucher",
-    "bundle",
-    
+    "All-in framing", "Assurance", "Scarcity tag", "Strike-through", "Timer",
+    "social", "voucher", "bundle", "ratings",
 ]
-
-# Build the allowed set from PHP params ∪ expected defaults, then remove exclusions
-if SCORE_PARAMS and isinstance(SCORE_PARAMS, dict):
-    _param_cues = [k for k in SCORE_PARAMS.keys() if k not in _CUE_EXCLUDE]
-else:
-    _param_cues = []
-_allowed_cues = []
-_seen = set()
-for name in (_param_cues + _EXPECTED_CUES):
-    if name not in _CUE_EXCLUDE and name not in _seen:
-        _allowed_cues.append(name)
-        _seen.add(name)
-CUE_CHOICES_SCORER = _allowed_cues
-
-# Synonym/variant normalisation to the canonical keys above
-_NORMALISE = {
-    # all-in
-    "all-in framing": "All-in framing",
-    "all in framing": "All-in framing",
-    "all-in v. partitioned pricing": "All-in framing",
-    "all-in price": "All-in framing",
-    "price includes tax": "All-in framing",
-    "inc vat": "All-in framing",
-    "including vat": "All-in framing",
-    "including shipping": "All-in framing",
-
-    # assurance
-    "assurance": "Assurance",
-    "returns": "Assurance",
-    "free returns": "Assurance",
-    "warranty": "Assurance",
-    "guarantee": "Assurance",
-    "money-back": "Assurance",
-
-    # scarcity
-    "scarcity": "Scarcity tag",
-    "scarcity tag": "Scarcity tag",
-    "low stock": "Scarcity tag",
-    "only x left": "Scarcity tag",
-    "limited stock": "Scarcity tag",
-    "selling fast": "Scarcity tag",
-
-    # strike-through
-    "strike-through": "Strike-through",
-    "strikethrough": "Strike-through",
-    "sale price": "Strike-through",
-    "was now": "Strike-through",
-    "was £": "Strike-through",
-    "discounted from": "Strike-through",
-
-    # timer
-    "timer": "Timer",
-    "countdown": "Timer",
-    "ends in": "Timer",
-    "limited time": "Timer",
-    "deal ends": "Timer",
-    "hours left": "Timer",
-
-    # social proof
-    "social": "social",
-    "social proof": "social",
-    "x bought": "social",
-    "x sold": "social",
-    "people viewing": "social",
-    "bestseller": "social",
-
-    # voucher / coupon
-    "voucher": "voucher",
-    "coupon": "voucher",
-    "promo code": "voucher",
-    "use code": "voucher",
-    "apply voucher": "voucher",
-    "clip coupon": "voucher",
-
-    # bundle
-    "bundle": "bundle",
-    "bundle & save": "bundle",
-    "2 for": "bundle",
-    "buy 1 get 1": "bundle",
-    "multi-buy": "bundle",
-
-   
-}
-def _norm_label(x: str) -> str:
-    k = (x or "").strip().lower()
-    return _NORMALISE.get(k, (x or "").strip())
+CUE_CHOICES_SCORER = build_allowed_cues(SCORE_PARAMS or {}, _EXPECTED_CUES, _CUE_EXCLUDE)
 
 def _fmt_num(x, nd=3):
     try:
@@ -942,119 +847,15 @@ def _file_to_data_url(path_like: str) -> str:
     elif ext == ".webp": mime = "image/webp"
     return f"data:{mime};base64,{b64}"
 
-def _build_detection_prompt() -> str:
-    vocab = ", ".join(CUE_CHOICES_SCORER)
-    return (
-        "You are an e-commerce UI analyst. Detect ONLY these cues (use exactly these labels): "
-        f"{vocab}.\n"
-        "Definitions and evidence requirements:\n"
-        "All-in framing = the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT”, “price includes tax/shipping”). "
-        "“Price excludes VAT” is NOT all-in. Do not infer from generic ‘Deal’ or delivery text.\n"
-        "Assurance = explicit returns/warranty/guarantee statements (e.g., “30-day returns”, “2-year warranty”, “money-back guarantee”). "
-        "FREE / fast delivery, Prime, and dispatch dates are NOT assurance.\n"
-        "Scarcity tag = explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”, “Limited stock”). "
-        "“In stock” or delivery dates are NOT scarcity.\n"
-        "Strike-through = a price visibly crossed-out OR a textual previous-price marker (evidence must include one of: a crossed-out number; "
-        "‘was £’, ‘RRP’, ‘List price’, ‘Previous price’, ‘Save £’ next to the price). ‘Deal’, ‘Prime’, or coloured badges alone are NOT strike-through.\n"
-        "Timer = a countdown or deadline (e.g., “Ends in 02:14:10”, “Sale ends today”, “X hours left”).\n"
-        "social = social proof (stars, 1–5 ★, review counts, “bought”, “viewing now”, “Bestseller”).\n"
-        "voucher = coupon/promo (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
-        "bundle = multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”). “Pack of 10” alone is NOT a bundle price deal.\n"
-        "ratings = star graphics or numeric ratings like “4.3/5”, optionally with review counts.\n"
-        "Rules: Return a STRICT JSON object using only the allowed labels. If a cue lacks the evidence above, omit it. Prefer precision over recall. "
-        "Zoom into fine print and read small text; do not guess.\n"
-        "Output formats: Single image → {\"cues\":[<labels>]}; Grid 2×4 (row-major 8 cells) → {\"grid\":[[<labels>],..., [<labels>]]}.\n"
-    )
-
-def _fallback_openai_detect(image_b64: str, mode: str = "single"):
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
-
-    sys = _build_detection_prompt()
-    user_text = "Mode: single" if mode == "single" else "Mode: grid_2x4"
-
-    data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": [
-                {"type": "text", "text": user_text},
-                {"type": "image_url", "image_url": {"url": image_b64}}
-            ]},
-        ],
-        "max_tokens": 600,
-        "temperature": 0
-    }
-
-    r = requests.post(url, headers=headers, json=data, timeout=(15, 240))
-    if r.status_code >= 400:
-        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
-    txt = r.json()["choices"][0]["message"]["content"]
-
-    # Best-effort JSON recovery
-    try:
-        obj = json.loads(txt)
-    except Exception:
-        i, j = txt.find("{"), txt.rfind("}")
-        obj = json.loads(txt[i:j+1]) if i >= 0 and j > i else {}
-
-    # Post-process to ensure only allowed canonical labels are returned
-    if mode == "single":
-        raw = [x for x in (obj.get("cues") or []) if isinstance(x, str)]
-        cues = []
-        for x in raw:
-            canon = _norm_label(x)
-            if canon in CUE_CHOICES_SCORER and canon not in cues:
-                cues.append(canon)
-        return cues
-
-    # grid
-    out = []
-    for cell in (obj.get("grid") or [])[:8]:
-        clean = set()
-        if isinstance(cell, list):
-            for x in cell:
-                if not isinstance(x, str):
-                    continue
-                canon = _norm_label(x)
-                if canon in CUE_CHOICES_SCORER:
-                    clean.add(canon)
-        out.append(clean)
-    while len(out) < 8:
-        out.append(set())
-    return out
-
-def _detect_with_agent_or_fallback(image_b64: str, mode: str):
-    if _agent_detect_levers is not None:
-        res = _agent_detect_levers(image_b64, mode)
-        if mode == "single":
-            cues = [x for x in (res.get("cues") or []) if isinstance(x, str)]
-            return [_norm_label(x) for x in cues]
-        grid = res.get("grid") or []
-        out = []
-        for cell in grid[:8]:
-            if isinstance(cell, (list, set, tuple)):
-                out.append(set(_norm_label(x) for x in cell))
-            else:
-                out.append(set())
-        while len(out) < 8: out.append(set())
-        return out
-    return _fallback_openai_detect(image_b64, mode)
-
 @_catch_and_report
 def _auto_single_from_image(filepath: str) -> tuple:
     if not filepath:
         return gr.update(value=None), "No image.", "",""
-    if score_single_card is None:
+    if detect_single_from_image is None or score_single_card is None:
         return gr.update(value=None), "Scoring utility not available.", "",""
-    data_url = _file_to_data_url(filepath)
-    cues = _detect_with_agent_or_fallback(data_url, "single")
+    cues = detect_single_from_image(filepath, CUE_CHOICES_SCORER)
     cues = [c for c in cues if c in CUE_CHOICES_SCORER]
-    res = score_single_card(set(cues))
+    res = score_single_card(set(cues), SCORE_PARAMS or {})
     badges_md = "#### Identified badges\n" + (", ".join(cues) if cues else "—")
     score_md = (
         "#### Single card score\n\n| Metric | Value |\n|---|---:|\n"
@@ -1070,26 +871,17 @@ def _auto_single_from_image(filepath: str) -> tuple:
 def _auto_grid_from_image(filepath: str) -> tuple:
     if not filepath:
         return gr.update(value=None), "No image.", "", ""
-    if SCORE_PARAMS is None or not isinstance(SCORE_PARAMS, dict):
-        return gr.update(value=None), "Scoring utility not available (no params).", "", ""
-    if score_grid_2x4 is None:
+    if detect_grid_from_image is None or score_grid_2x4 is None:
         return gr.update(value=None), "Scoring utility not available.", "", ""
+    detected_grid = detect_grid_from_image(filepath, CUE_CHOICES_SCORER)
+    # keep only cues we recognise
+    norm_cells = [set(c for c in cell if c in CUE_CHOICES_SCORER) for cell in detected_grid]
+    # intersect with scorable cues (so extra unseen labels don't break scoring)
+    scorable = set((SCORE_PARAMS or {}).keys())
+    cards = [{"cues": {c for c in cell if c in scorable}, "price": None} for cell in norm_cells]
 
-    data_url = _file_to_data_url(filepath)
-    detected_grid = _detect_with_agent_or_fallback(data_url, "grid_2x4")
-
-    norm_cells = []
-    for cell in (detected_grid[:8] + [set()] * 8)[:8]:
-        if not isinstance(cell, (list, set, tuple)):
-            cell = []
-        clean = set(c for c in cell if c in CUE_CHOICES_SCORER)
-        norm_cells.append(clean)
-
-    cards = [{"cues": cell, "price": None} for cell in norm_cells]
-
-    # Try scorer with params; if its signature doesn't accept params, call without.
     try:
-        res = score_grid_2x4(cards, SCORE_PARAMS)
+        res = score_grid_2x4(cards, SCORE_PARAMS or {})
     except TypeError:
         res = score_grid_2x4(cards)
 
@@ -1383,11 +1175,3 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
-
-
-
-
-
-
-
-
