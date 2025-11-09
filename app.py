@@ -23,6 +23,9 @@ CROSS_PARAMS_URL = os.getenv(
     "AGENTIX_CROSS_PARAMS_URL",
     "https://aireadyworkforce.pro/Agentix/getCrossParameters.php",
 )
+#for score_image.py
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"   # Gradio’s own telemetry
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"       # (optional) silence HF hub telemetry if any
 
 # --- replacement parser (single source of truth) ---
 def load_params_from_php(url: str = CROSS_PARAMS_URL):
@@ -1174,4 +1177,6 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True, analytics_enabled=False)
+
+
