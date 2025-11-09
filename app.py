@@ -876,23 +876,28 @@ def _auto_single_from_image(filepath: str) -> tuple:
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
 @_catch_and_report
+@_catch_and_report
 def _auto_grid_from_image(filepath: str) -> tuple:
     if not filepath:
         return gr.update(value=None), "No image.", "", ""
     if detect_grid_from_image is None or score_grid_2x4 is None:
         return gr.update(value=None), "Scoring utility not available.", "", ""
+
+    # Step 1: run detection
     detected_grid = detect_grid_from_image(filepath, CUE_CHOICES_SCORER)
-    # keep only cues we recognise
+
+    # Step 2: normalise cues and prepare for scoring
     norm_cells = [set(c for c in cell if c in CUE_CHOICES_SCORER) for cell in detected_grid]
-    # intersect with scorable cues (so extra unseen labels don't break scoring)
     scorable = set((SCORE_PARAMS or {}).keys())
     cards = [{"cues": {c for c in cell if c in scorable}, "price": None} for cell in norm_cells]
 
+    # Step 3: compute scores
     try:
         res = score_grid_2x4(cards, SCORE_PARAMS or {})
     except TypeError:
         res = score_grid_2x4(cards)
 
+    # Step 4: build badges table
     b_lines = [
         "#### Identified badges per card (row-major)",
         "",
@@ -907,6 +912,7 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         )
     badges_md = "\n".join(b_lines)
 
+    # Step 5: build scores table
     s_lines = [
         "#### Grid 2×4 scores",
         "",
@@ -932,15 +938,36 @@ def _auto_grid_from_image(filepath: str) -> tuple:
     ]
     score_md = "\n".join(s_lines)
 
-    return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
+    # Step 6: debugging visuals – show the crops inline
+    import base64, io, glob
+    debug_imgs = sorted(glob.glob("results/crops/crop_*.png"))
+    debug_md = ""
+    if debug_imgs:
+        debug_md += "\n\n#### Cropped cells\n\n"
+        for path in debug_imgs:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            debug_md += f'<div style="display:inline-block;margin:4px;"><img src="data:image/png;base64,{b64}" width="180"><br>{os.path.basename(path)}</div>'
+    else:
+        debug_md = "\n\n*(No crops saved — check detect_grid_from_image.)*\n"
 
-# debugging / showing the 8 cells in the matrix
-import glob
-debug_imgs = sorted(glob.glob("results/crops/crop_*.png"))
-if debug_imgs:
-    for path in debug_imgs:
-        with open(path, "rb") as f:
-            gr.Image(value=f.read(), label=os.path.basename(path))
+    # Step 7: logic debugging — record what was actually detected
+    debug_log_path = "results/debug_log.txt"
+    try:
+        with open(debug_log_path, "w", encoding="utf-8") as log:
+            log.write("=== GRID DEBUG LOG ===\n")
+            log.write(f"Image path: {filepath}\n\n")
+            for idx, cell in enumerate(detected_grid, 1):
+                log.write(f"[CARD {idx}] detected raw cues: {cell}\n")
+            log.write("\nCUE_CHOICES_SCORER: " + ", ".join(CUE_CHOICES_SCORER))
+            if SCORE_PARAMS:
+                log.write("\nLoaded SCORE_PARAMS keys: " + ", ".join(SCORE_PARAMS.keys()))
+    except Exception as e:
+        print("Could not write debug log:", e)
+
+    # Step 8: return combined markdown output
+    full_output = badges_md + "\n\n" + score_md + debug_md
+    return gr.update(value=filepath), full_output, "", "✅ Detected and scored."
 
 @_catch_and_report
 def _handle_image_upload(file) -> tuple:
@@ -1191,6 +1218,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
