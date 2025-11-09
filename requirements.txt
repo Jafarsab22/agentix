@@ -15,4 +15,4 @@ requests
 pillow
 selenium
 webdriver-manager
-
+opencv-python-headless
