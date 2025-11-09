@@ -271,47 +271,93 @@ def _find_gutter_positions(arr: np.ndarray, n_cuts: int, expected_fracs: list[fl
     positions.sort()
     return positions[:n_cuts]
 
-def _compute_grid_boxes(im: Image.Image) -> list[Tuple[int, int, int, int]]:
+def _compute_grid_boxes(im: Image.Image) -> list[tuple[int, int, int, int]]:
     """
-    Returns 8 bounding boxes (x0,y0,x1,y1) for the 2×4 grid, using whitespace gutters.
-    Falls back to equal splits if gutters can't be located.
+    Detect approximate 2×4 grid boxes in an Amazon-like screenshot by analysing
+    whitespace gutters between cards. Returns a list of 8 (x0, y0, x1, y1)
+    tuples in row-major order. Produces debug overlay for visual validation.
     """
-    W, H = im.size
-    gray = _to_gray_np(im)
+    import numpy as np, cv2, os
+    os.makedirs("results", exist_ok=True)
 
-    # Expected cut ratios for Amazon-like 2×4: roughly quarters horizontally, half vertically
-    v_fracs = [1/4, 2/4, 3/4]
-    h_fracs = [1/2]
+    # Convert to grayscale
+    arr = np.array(im.convert("L"))
+    h, w = arr.shape
 
-    try:
-        # Vertical gutters: search on the original orientation
-        vcuts = _find_gutter_positions(gray, 3, v_fracs)
-        # Horizontal gutters: search on the transposed (to reuse same logic)
-        hcuts = _find_gutter_positions(gray.T, 1, h_fracs)
-    except Exception:
-        vcuts, hcuts = [], []
+    # Gaussian blur → softens edges
+    blur = cv2.GaussianBlur(arr, (3, 3), 0)
 
-    # Validate monotonicity and bounds; otherwise fall back
-    ok = (len(vcuts) == 3 and len(hcuts) == 1 and
-          10 < vcuts[0] < vcuts[1] < vcuts[2] < W - 10 and
-          10 < hcuts[0] < H - 10)
-    if not ok:
-        # Equal splits
-        vcuts = [W * 1 // 4, W * 2 // 4, W * 3 // 4]
-        hcuts = [H // 2]
+    # Normalize and invert (white → low value)
+    norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX)
+    inv = 255 - norm
 
-    xs = [0] + [int(x) for x in vcuts] + [W]
-    ys = [0] + [int(y) for y in hcuts] + [H]
+    # Horizontal & vertical projections (mean brightness)
+    v_proj = np.mean(norm, axis=0)
+    h_proj = np.mean(norm, axis=1)
 
-    boxes: list[Tuple[int, int, int, int]] = []
+    # Detect vertical gaps (bright → white columns)
+    v_thresh = np.percentile(v_proj, 95)
+    h_thresh = np.percentile(h_proj, 95)
+
+    v_gap_idx = np.where(v_proj > v_thresh)[0]
+    h_gap_idx = np.where(h_proj > h_thresh)[0]
+
+    def _group_gaps(idxs, min_run=10):
+        groups, cur = [], []
+        for i in idxs:
+            if not cur or i - cur[-1] <= 2:
+                cur.append(i)
+            else:
+                if len(cur) >= min_run:
+                    groups.append((cur[0], cur[-1]))
+                cur = [i]
+        if len(cur) >= min_run:
+            groups.append((cur[0], cur[-1]))
+        return groups
+
+    v_gaps = _group_gaps(v_gap_idx)
+    h_gaps = _group_gaps(h_gap_idx)
+
+    # Convert gaps → segment edges (include image borders)
+    x_edges = [0] + [int(np.mean(g)) for g in v_gaps] + [w]
+    y_edges = [0] + [int(np.mean(g)) for g in h_gaps] + [h]
+
+    # Expect ~5 x-edges and ~3 y-edges (2×4 grid)
+    if len(x_edges) < 5:
+        step = w // 4
+        x_edges = [i * step for i in range(5)]
+    if len(y_edges) < 3:
+        step = h // 2
+        y_edges = [i * step for i in range(3)]
+
+    boxes = []
     for r in range(2):
         for c in range(4):
-            x0, x1 = xs[c], xs[c+1]
-            y0, y1 = ys[r], ys[r+1]
-            # shrink inward to avoid neighbour bleed
-            mw = int(0.04 * (x1 - x0))
-            mh = int(0.04 * (y1 - y0))
-            boxes.append((x0 + mw, y0 + mh, x1 - mw, y1 - mh))
+            x0, x1 = x_edges[c], x_edges[c + 1]
+            y0, y1 = y_edges[r], y_edges[r + 1]
+            pad = 3  # small margin to avoid overlap
+            boxes.append((
+                max(0, x0 + pad),
+                max(0, y0 + pad),
+                min(w, x1 - pad),
+                min(h, y1 - pad)
+            ))
+
+    # Create debug overlay
+    dbg = np.array(im.copy())
+    for i, (x0, y0, x1, y1) in enumerate(boxes, 1):
+        cv2.rectangle(dbg, (x0, y0), (x1, y1), (0, 255, 0), 3)
+        cv2.putText(
+            dbg, str(i),
+            (x0 + 10, y0 + 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2, (255, 0, 0), 3, cv2.LINE_AA
+        )
+
+    debug_path = os.path.join("results", "grid_debug.png")
+    cv2.imwrite(debug_path, cv2.cvtColor(dbg, cv2.COLOR_RGB2BGR))
+    print(f"[DEBUG] grid overlay saved → {debug_path}")
+
     return boxes
 
 def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set]:
