@@ -28,16 +28,22 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"   # Gradio’s own telemetry
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"       # (optional) silence HF hub telemetry if any
 
 # --- replacement parser (single source of truth) ---
-def load_params_from_php(url: str = CROSS_PARAMS_URL):
+# --- replacement parser (single source of truth) ---
+def load_params_from_php(url: str = CROSS_PARAMS_URL) -> dict:
     """
     Returns dict keyed by cue/badge with numeric values.
     Accepts either:
       A) {"ok": true, "model": "...", "params": { "<badge>": {"beta":..., "M":..., "C":..., "R":..., "s":..., "price_weight":...}, ...}}
       B) [ {"badge":"...", "beta":..., "m_val":..., "c_val":..., "r_val":..., "price_weight": ...}, ... ]
+    On any network or parse error, returns {} instead of raising (so the UI still comes up).
     """
-    r = requests.get(url, timeout=12)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logging.warning("Cross-parameters endpoint unreachable; continuing with empty params.")
+        return {}
 
     # A: object with "params"
     if isinstance(data, dict) and isinstance(data.get("params"), dict):
@@ -51,6 +57,8 @@ def load_params_from_php(url: str = CROSS_PARAMS_URL):
                 "C": float(vals.get("C", 0.0)),
                 "R": float(vals.get("R", 0.0)),
             }
+            if vals.get("s") is not None:
+                out[str(badge)]["s"] = float(vals["s"])
             if vals.get("price_weight") is not None:
                 out[str(badge)]["price_weight"] = float(vals["price_weight"])
         return out
@@ -74,15 +82,13 @@ def load_params_from_php(url: str = CROSS_PARAMS_URL):
                 out[str(badge)]["price_weight"] = float(row["price_weight"])
         return out
 
-    raise ValueError("Unexpected JSON shape from cross-parameters endpoint")
+    logging.warning("Cross-parameters endpoint returned an unexpected JSON shape; continuing with empty params.")
+    return {}
 
-# load the parameters (do this once)
-try:
-    SCORE_PARAMS = load_params_from_php()
-    logging.info("Loaded %d cue parameters from PHP.", len(SCORE_PARAMS or {}))
-except Exception as e:
-    logging.exception("Could not load cross parameters from PHP")
-    SCORE_PARAMS = None
+# load the parameters (do this once, but never crash the app)
+SCORE_PARAMS = load_params_from_php()
+logging.info("Loaded %d cue parameters from PHP (0 means offline/empty).", len(SCORE_PARAMS))
+
 
 # Optional storefront helpers
 try:
@@ -1178,6 +1184,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
