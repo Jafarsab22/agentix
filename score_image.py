@@ -136,37 +136,34 @@ def _build_detection_prompt(allowed: list[str]) -> str:
     )
 
 def _img_to_data_url(img: Image.Image) -> str:
-    # upscale small crops for better OCR on tiny “RRP/Only 1 left”
-    w, h = img.size
-    scale = max(1.0, 512 / max(1, min(w, h)))
-    img2 = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
     buf = io.BytesIO()
-    img2.save(buf, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+    # PNG preserves thin glyphs/strike-through lines better than JPEG.
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
+# score_image.py — drop-in replacement
+import os, time, json, requests
 
 def _openai_call(image_data_url: str, prompt: str) -> dict:
     """
-    Robust call with bounded latency.
-
-    Env vars:
-      OPENAI_API_KEY (required)
-      OPENAI_MODEL (default: gpt-4.1-mini)
-      OPENAI_BASE_URL (default: https://api.openai.com/v1)
-      OPENAI_CONNECT_TIMEOUT (default: 6)       # seconds
-      OPENAI_READ_TIMEOUT (default: 30)         # seconds
-      OPENAI_MAX_RETRIES (default: 1)           # attempts in addition to the first
-      OPENAI_BACKOFF_BASE (default: 1.2)
+    Bounded-latency vision call.
+    Env (optional):
+      OPENAI_API_KEY (required), OPENAI_MODEL, OPENAI_BASE_URL
+      OPENAI_CONNECT_TIMEOUT (default 6), OPENAI_READ_TIMEOUT (default 30)
+      OPENAI_MAX_RETRIES (default 0), OPENAI_BACKOFF_BASE (default 1.2)
     """
     key = os.getenv("OPENAI_API_KEY")
     if not key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
+        return {}  # fail fast if no key
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     url = f"{base_url}/chat/completions"
 
     connect_timeout = float(os.getenv("OPENAI_CONNECT_TIMEOUT", "6"))
     read_timeout = float(os.getenv("OPENAI_READ_TIMEOUT", "30"))
-    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "0"))
     backoff_base = float(os.getenv("OPENAI_BACKOFF_BASE", "1.2"))
 
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
@@ -187,31 +184,28 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
     for i in range(attempts):
         try:
             r = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=(connect_timeout, read_timeout),
+                url, headers=headers, json=payload,
+                timeout=(connect_timeout, read_timeout)
             )
             if r.status_code >= 400:
                 if 500 <= r.status_code < 600 and i < attempts - 1:
                     time.sleep(backoff_base ** (i + 1))
                     continue
-                raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
+                return {}
             txt = r.json()["choices"][0]["message"]["content"]
             try:
                 return json.loads(txt)
             except Exception:
-                start, end = txt.find("{"), txt.rfind("}")
-                return json.loads(txt[start:end+1]) if start >= 0 and end > start else {}
+                a, b = txt.find("{"), txt.rfind("}")
+                return json.loads(txt[a:b+1]) if a >= 0 and b > a else {}
         except requests.exceptions.RequestException as e:
             last_err = e
             if i < attempts - 1:
                 time.sleep(backoff_base ** (i + 1))
                 continue
             return {}
-    if last_err:
-        print(f"[vision] final failure after retries: {last_err}", flush=True)
     return {}
+
 
 
 # ---------------------- detection APIs ----------------------
@@ -229,45 +223,46 @@ def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[s
             out.append(canon)
     return out
 
-def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[Set[str]]:
+def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set]:
     """
-    Crop the 2×4 grid and detect per cell. Enforces a total time budget.
-    If a cell times out or the overall budget is exceeded, it yields an empty set
-    and continues so the app never blocks indefinitely.
-
-    Env vars:
-      OPENAI_GRID_DEADLINE_SEC (default: 60)  # total budget for the whole grid
+    2×4 crop with a strict total deadline (OPENAI_GRID_DEADLINE_SEC, default 60).
+    Crops are upscaled (LANCZOS) to improve small-text/strike-through detection.
+    Returns list[set] length 8. On any failure, yields empty set for that cell.
     """
+    import time
+    deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "60"))
     im = Image.open(filepath).convert("RGB")
     W, H = im.size
     rows, cols = 2, 4
-    out: list[Set[str]] = []
+    out = []
     prompt = _build_detection_prompt(allowed_labels)
-
-    deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "60"))
 
     for r in range(rows):
         for c in range(cols):
             if time.time() >= deadline:
-                out.append(set())
-                continue
-
+                out.append(set()); continue
             x0 = int(c * W / cols); x1 = int((c + 1) * W / cols)
             y0 = int(r * H / rows); y1 = int((r + 1) * H / rows)
             crop = im.crop((x0, y0, x1, y1))
-            data_url = _img_to_data_url(crop)
 
-            obj = _openai_call(data_url, prompt)  # returns {} on failure
+            # upscale small crops to aid OCR-like reading
+            cw, ch = crop.size
+            scale = 1.0
+            if cw < 600: scale = max(scale, 600 / cw)
+            if ch < 400: scale = max(scale, 400 / ch)
+            if scale > 1.0:
+                crop = crop.resize((int(cw * scale), int(ch * scale)), Image.LANCZOS)
+
+            obj = _openai_call(_img_to_data_url(crop), prompt)  # {} on timeout/failure
             labels = []
             if isinstance(obj.get("cues"), list):
                 labels = obj["cues"]
             elif isinstance(obj.get("grid"), list) and obj["grid"]:
                 labels = obj["grid"][0]
 
-            clean: Set[str] = set()
-            for x in labels:
-                if not isinstance(x, str):
-                    continue
+            clean = set()
+            for x in labels or []:
+                if not isinstance(x, str): continue
                 canon = _norm_label(x)
                 if canon in allowed_labels:
                     clean.add(canon)
