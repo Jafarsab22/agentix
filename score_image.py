@@ -123,7 +123,7 @@ def _build_detection_prompt(allowed: list[str]) -> str:
         "All-in framing = the shown price explicitly includes taxes/shipping/fees e.g., ‘£399 inc. VAT’, ‘price includes tax/shipping’. "
         "‘Price excludes VAT’ is NOT all-in. Do not infer from generic ‘Deal’ or delivery text.\n"
         "Assurance = explicit returns/warranty/guarantee statements e.g., ‘30-day returns’, ‘2-year warranty’, ‘money-back guarantee’. "
-        "FREE / fast delivery, Prime, and dispatch dates are NOT assurance.\n"
+        "FREE delivery, Prime, and dispatch dates are NOT assurance.\n"
         "Scarcity tag = explicit low stock or limited availability e.g., ‘Only 3 left’, ‘Low stock’, ‘Selling fast’, ‘Limited stock’. "
         "‘In stock’ or delivery dates are NOT scarcity.\n"
         "Strike-through = a price visibly crossed-out OR a textual previous-price marker e.g., crossed-out digits, ‘was’, ‘RRP’, ‘List price’, ‘Previous price’.\n"
@@ -170,7 +170,7 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
                 {"type": "image_url", "image_url": {"url": image_data_url}}
             ]},
         ],
-        "max_tokens": 600,
+        "max_tokens": 800,
         "temperature": 0
     }
 
@@ -412,37 +412,68 @@ def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set
     """
     Detect 8 cards in a 2×4 grid by locating gutters (via _compute_grid_boxes),
     then applying the *same* single-card detector to each crop.
+    Also saves the 8 crops to results/crops for debugging/preview in the UI.
     Returns list[set] of canonical labels, length 8, row-major.
     """
     import time
+    import pathlib
+    import glob
+
+    # Hard deadline so we never hang the UI
     deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "70"))
 
-    # open and compute crop boxes
+    # Open image and compute 8 cell boxes
     im = Image.open(filepath).convert("RGB")
-    boxes = _compute_grid_boxes(im)
+    boxes = _compute_grid_boxes(im)  # must return 8 (x0,y0,x1,y1) boxes
+
+    # Prepare debug crops dir
+    crops_dir = pathlib.Path("results") / "crops"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean previous run’s crops so the UI shows only current ones
+    try:
+        for p in crops_dir.glob("crop_*.png"):
+            p.unlink(missing_ok=True)  # Python 3.8+: wrap in try/except if needed
+    except Exception:
+        pass
 
     out: list[set] = []
-    for (x0, y0, x1, y1) in boxes:
+    for idx, (x0, y0, x1, y1) in enumerate(boxes, start=1):
         if time.time() >= deadline:
             out.append(set())
             continue
 
+        # Crop
         crop = im.crop((x0, y0, x1, y1))
+
+        # Save debug crop (crop_{i}_r{row}_c{col}.png) for display in app.py
+        try:
+            r = 1 if idx <= 4 else 2
+            c = ((idx - 1) % 4) + 1
+            fname = crops_dir / f"crop_{idx}_r{r}_c{c}.png"
+            crop.save(fname, format="PNG")
+        except Exception:
+            # non-fatal – keep going
+            pass
+
+        # Run the *same* single-card detector the single-image UI uses
         try:
             labels = _detect_from_pil(crop, allowed_labels)
         except Exception:
             labels = []
 
+        # Canonicalise + filter to allowed labels
         clean = set()
         for x in labels:
             canon = _norm_label(x)
             if canon in allowed_labels:
                 clean.add(canon)
-
         out.append(clean)
 
+    # Pad to 8 in case of early deadline
     while len(out) < 8:
         out.append(set())
+
     return out
 
 # ---------------------- scoring ----------------------
