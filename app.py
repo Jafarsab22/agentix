@@ -608,7 +608,6 @@ def search_database(product_name: str):
 
 # ---------- Async UI wrappers delegating to agent_runner ----------
 @_catch_and_report
-@_catch_and_report
 def submit_job_ui(product_name: str, brand_name: str, model_name: str, badges: list[str], price, currency: str, n_iterations):
     err = _validate_inputs(product_name, price, currency, n_iterations)
     if err:
@@ -935,6 +934,14 @@ def _auto_grid_from_image(filepath: str) -> tuple:
 
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
+# debugging / showing the 8 cells in the matrix
+import glob
+debug_imgs = sorted(glob.glob("results/crops/crop_*.png"))
+if debug_imgs:
+    for path in debug_imgs:
+        with open(path, "rb") as f:
+            gr.Image(value=f.read(), label=os.path.basename(path))
+
 @_catch_and_report
 def _handle_image_upload(file) -> tuple:
     if file is None:
@@ -1184,6 +1191,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
