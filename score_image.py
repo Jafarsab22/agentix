@@ -198,6 +198,45 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
     return {}
 
 # ---------------------- detection APIs ----------------------
+# --- add at top of score_image.py imports if not present ---
+from PIL import Image, ImageFilter
+import os
+
+# ... keep your existing helpers (_norm_label, _img_to_data_url, _build_detection_prompt, _openai_call) ...
+
+
+def _detect_from_pil(img: Image.Image, allowed_labels: list[str]) -> list[str]:
+    """
+    Run the same single-card detection pipeline on a PIL image.
+    Includes optional unsharp mask and min-size upscaling to help tiny text.
+    Returns canonical labels (deduped) filtered to 'allowed_labels'.
+    """
+    # optional sharpening (can be disabled via env)
+    use_sharpen = os.getenv("AGENTIX_SHARPEN", "1") not in ("0", "false", "False")
+    if use_sharpen:
+        try:
+            img = img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=140))
+        except Exception:
+            pass
+
+    # upscale when the smallest side is below a threshold (helps “was £…”, tiny text)
+    w, h = img.size
+    min_target = int(os.getenv("AGENTIX_MIN_SIDE", "820"))  # default ~820px
+    if min(w, h) < min_target:
+        scale = min_target / float(min(w, h))
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    data_url = _img_to_data_url(img)
+    prompt = _build_detection_prompt(allowed_labels)
+    obj = _openai_call(data_url, prompt)  # returns {} on failure/timeout
+
+    raw = [x for x in (obj.get("cues") or []) if isinstance(x, str)]
+    out: list[str] = []
+    for x in raw:
+        canon = _norm_label(x)
+        if canon in allowed_labels and canon not in out:
+            out.append(canon)
+    return out
 
 def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[str]:
     im = Image.open(filepath).convert("RGB")
@@ -360,51 +399,51 @@ def _compute_grid_boxes(im: Image.Image) -> list[tuple[int, int, int, int]]:
 
     return boxes
 
+def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[str]:
+    """
+    Public API (unchanged signature): detect cues on a single image file path.
+    Internally delegates to the PIL-based helper for consistency with grid.
+    """
+    im = Image.open(filepath).convert("RGB")
+    return _detect_from_pil(im, allowed_labels)
+
+
 def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set]:
     """
-    Detect 8 cards in a 2×4 grid by locating inter-card gutters and
-    analysing each crop independently. Returns list[set] length 8
-    in row-major order.
+    Detect 8 cards in a 2×4 grid by locating gutters (via _compute_grid_boxes),
+    then applying the *same* single-card detector to each crop.
+    Returns list[set] of canonical labels, length 8, row-major.
     """
+    import time
     deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "70"))
+
+    # open and compute crop boxes
     im = Image.open(filepath).convert("RGB")
     boxes = _compute_grid_boxes(im)
-    prompt = _build_detection_prompt(allowed_labels)
-
-    # --- DEBUGGING: save actual cell crops for inspection ---
-    debug_dir = os.path.join("results", "crops")
-    os.makedirs(debug_dir, exist_ok=True)
-    for i, (x0, y0, x1, y1) in enumerate(boxes):
-        crop_path = os.path.join(debug_dir, f"crop_{i+1}_r{1 if i < 4 else 2}_c{(i % 4) + 1}.png")
-        im.crop((x0, y0, x1, y1)).save(crop_path)
 
     out: list[set] = []
     for (x0, y0, x1, y1) in boxes:
         if time.time() >= deadline:
-            out.append(set()); continue
+            out.append(set())
+            continue
+
         crop = im.crop((x0, y0, x1, y1))
-        # de-noise subtle gutters, keep text crisp
-        crop = crop.filter(ImageFilter.MedianFilter(size=3))
-        obj = _openai_call(_img_to_data_url(crop), prompt)
-        labels = []
-        if isinstance(obj.get("cues"), list):
-            labels = obj["cues"]
-        elif isinstance(obj.get("grid"), list) and obj["grid"]:
-            labels = obj["grid"][0]
+        try:
+            labels = _detect_from_pil(crop, allowed_labels)
+        except Exception:
+            labels = []
 
         clean = set()
-        for x in labels or []:
-            if not isinstance(x, str): 
-                continue
+        for x in labels:
             canon = _norm_label(x)
             if canon in allowed_labels:
                 clean.add(canon)
+
         out.append(clean)
 
     while len(out) < 8:
         out.append(set())
     return out
-
 
 # ---------------------- scoring ----------------------
 
