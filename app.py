@@ -944,26 +944,26 @@ def _file_to_data_url(path_like: str) -> str:
 
 def _build_detection_prompt() -> str:
     vocab = ", ".join(CUE_CHOICES_SCORER)
-    # Clear definitions, POS/NEG anchors, and pattern hints. Keep it concise but explicit.
     return (
-        "You are an e-commerce UI analyst. Detect all the cues that you find for each product in a grid of 2x4 cells/images from the list below while zooming into fine print: "
+        "You are an e-commerce UI analyst. Detect ONLY these cues (use exactly these labels): "
         f"{vocab}.\n"
-        "Definitions:\n"
-        "• All-in framing: the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT and shipping”, “price includes tax”). "
-        "Do NOT tag strike-throughs as all-in. “Price excludes VAT” is NOT all-in.\n"
-        "• Assurance: returns/warranty/guarantee statements (e.g., “30-day returns”, “2-year warranty”, “money-back guarantee”).\n"
-        "• Scarcity tag: explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”).\n"
-        "• Strike-through: when a price is crossed-out and a lower price is being introduced e.g., “£299 was £349”, RRP, crossed-out number.\n"
-        "• Timer: a countdown or deadline for the offer (e.g., “Ends in 02:14:10”, “Sale ends today”, “Limited time deal”).\n"
-        "• social: social proof that other users have bought this item (e.g., “1,234 bought this”, “x people viewing now”, “Bestseller”).\n"
-        "• voucher: coupon/promo/voucher (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
-        "• bundle: multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”).\n"
-        "• ratings: star or numeric ratings and/or review counts (e.g., “4.3/5”, “★★★★★”, “(2,145 reviews)”).\n"
-        "Rules: return a STRICT JSON object using the above cues. If a cue is absent, omit it. "
-        "Do NOT invent new labels. Prefer precision over recall; if uncertain, omit.\n"
-        "Output formats:\n"
-        "Single image → {\"cues\": [<labels>]}\n"
-        "Grid 2×4 (row-major 8 cells) → {\"grid\": [[<labels>], ..., [<labels>]]}\n"
+        "Definitions and evidence requirements:\n"
+        "All-in framing = the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT”, “price includes tax/shipping”). "
+        "“Price excludes VAT” is NOT all-in. Do not infer from generic ‘Deal’ or delivery text.\n"
+        "Assurance = explicit returns/warranty/guarantee statements (e.g., “30-day returns”, “2-year warranty”, “money-back guarantee”). "
+        "FREE / fast delivery, Prime, and dispatch dates are NOT assurance.\n"
+        "Scarcity tag = explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”, “Limited stock”). "
+        "“In stock” or delivery dates are NOT scarcity.\n"
+        "Strike-through = a price visibly crossed-out OR a textual previous-price marker (evidence must include one of: a crossed-out number; "
+        "‘was £’, ‘RRP’, ‘List price’, ‘Previous price’, ‘Save £’ next to the price). ‘Deal’, ‘Prime’, or coloured badges alone are NOT strike-through.\n"
+        "Timer = a countdown or deadline (e.g., “Ends in 02:14:10”, “Sale ends today”, “X hours left”).\n"
+        "social = social proof (stars, 1–5 ★, review counts, “bought”, “viewing now”, “Bestseller”).\n"
+        "voucher = coupon/promo (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
+        "bundle = multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”). “Pack of 10” alone is NOT a bundle price deal.\n"
+        "ratings = star graphics or numeric ratings like “4.3/5”, optionally with review counts.\n"
+        "Rules: Return a STRICT JSON object using only the allowed labels. If a cue lacks the evidence above, omit it. Prefer precision over recall. "
+        "Zoom into fine print and read small text; do not guess.\n"
+        "Output formats: Single image → {\"cues\":[<labels>]}; Grid 2×4 (row-major 8 cells) → {\"grid\":[[<labels>],..., [<labels>]]}.\n"
     )
 
 def _fallback_openai_detect(image_b64: str, mode: str = "single"):
@@ -1383,6 +1383,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
