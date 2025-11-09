@@ -1,21 +1,25 @@
 """
-score_image.py
----------------
-Pure detection + scoring helpers.
-
-Detect cues on e-commerce cards (single or 2×4 grid) and score them.
-The app should import these functions and pass PHP-loaded parameters.
-
-Public API:
+score_image.py — cell‑aware detector + scoring
+------------------------------------------------
+Detect cues on e‑commerce cards (single or 2×4 grid) and score them.
+Public API (unchanged):
 - build_allowed_cues(params, expected, exclude) -> list[str]
 - detect_single_from_image(filepath, allowed_labels) -> list[str]
-- detect_grid_from_image(filepath, allowed_labels) -> list[set[str]]   # 8 cells row-major
-- score_single_card(cues_set, params) -> dict with 'raw','final','sum_s','sum_w','price_weight'
-- score_grid_2x4(cards, params) -> dict with per-card + aggregates
+- detect_grid_from_image(filepath, allowed_labels) -> list[set[str]]   # 8 cells row‑major
+- score_single_card(cues_set, params, *, price=None, extra_cues=()) -> dict
+- score_grid_2x4(cards, params) -> dict
+
+Notes
+- No dependency on app.py. Keep your app as is; it already imports these symbols.
+- Per‑cell detection now runs on TWO focused crops in each grid cell:
+  (1) the full cell; (2) a bottom text band (where strike‑through, voucher, scarcity tend to appear).
+  Results are unioned with label normalisation and filtered to allowed labels.
+- Robustness: each crop is upscaled for tiny text; timeouts are bounded; any failure yields an empty set for that cell.
+- Optional debugging: set DEBUG_CROPS=1 to emit per‑cell PNG crops into results/crops/.
 """
 
 from __future__ import annotations
-import io, base64, json, math, os, time
+import io, base64, json, math, os, time, pathlib
 from typing import Dict, Any, Iterable, Sequence, Set, Optional, List
 from PIL import Image
 import requests
@@ -118,78 +122,68 @@ def _build_detection_prompt(allowed: list[str]) -> str:
         "You are an e-commerce UI analyst. Detect these cues: "
         f"{vocab}.\n"
         "Definitions and evidence requirements:\n"
-        "All-in framing = the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT”, “price includes tax/shipping”). "
-        "“Price excludes VAT” is NOT all-in. Do not infer from generic ‘Deal’ or delivery text.\n"
-        "Assurance = explicit returns/warranty/guarantee statements (e.g., “30-day returns”, “2-year warranty”, “money-back guarantee”). "
+        "All-in framing = the shown price explicitly includes taxes/shipping/fees (e.g., ‘£399 inc. VAT’, ‘price includes tax/shipping’). "
+        "‘Price excludes VAT’ is NOT all-in. Do not infer from generic ‘Deal’ or delivery text.\n"
+        "Assurance = explicit returns/warranty/guarantee statements (e.g., ‘30-day returns’, ‘2-year warranty’, ‘money-back guarantee’). "
         "FREE / fast delivery, Prime, and dispatch dates are NOT assurance.\n"
-        "Scarcity tag = explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”, “Limited stock”). "
-        "“In stock” or delivery dates are NOT scarcity.\n"
-        "Strike-through = a price visibly crossed-out OR a textual previous-price marker (evidence must include one of: a crossed-out number; "
-        "‘was’, ‘RRP’, ‘List price’, ‘Previous price’).\n"
-        "Timer = a countdown or deadline for the deal (e.g., “Ends in 02:14:10”, “limited time”, “Sale ends today”, “X hours left”).\n"
-        "social = social proof (“2k bought in last month”, “viewing now”, “Bestseller”).\n"
-        "voucher = coupon/promo (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
-        "bundle = multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”). “Pack of 10” alone is NOT a bundle price deal.\n"
-        "ratings = star graphics or numeric ratings like “4.3/5”.\n"
-        "Rules: Return STRICT JSON using only the allowed labels; omit any cue without the evidence above. Zoom into fine print.\n"
-        "Formats: Single → {\"cues\":[...]}; Grid 2×4 → {\"grid\":[[...],...]} (8 arrays row-major).\n"
+        "Scarcity tag = explicit low stock or limited availability (e.g., ‘Only 3 left’, ‘Low stock’, ‘Selling fast’, ‘Limited stock’). "
+        "‘In stock’ or delivery dates are NOT scarcity.\n"
+        "Strike-through = a price visibly crossed-out OR a textual previous-price marker (crossed-out digits, ‘was’, ‘RRP’, ‘List price’, ‘Previous price’).\n"
+        "Timer = a countdown or deadline (‘Ends in 02:14:10’, ‘limited time’, ‘Sale ends today’, ‘X hours left’).\n"
+        "social = social proof (‘bought in last month’, ‘viewing now’, ‘Bestseller’).\n"
+        "voucher = coupon/promo (‘Use code SAVE10’, ‘Apply voucher’, ‘Clip coupon’).\n"
+        "bundle = multi-item offer (‘2 for £50’, ‘Buy 1 get 1 50% off’, ‘Bundle & save’). ‘Pack of 10’ alone is NOT a bundle price deal.\n"
+        "ratings = stars or numeric ratings like ‘4.3/5’.\n"
+        "Rules: Return STRICT JSON using only the allowed labels; omit any cue without the evidence above. Focus ONLY on the provided crop (one product card).\n"
+        "Format: {\"cues\":[...]}.\n"
     )
 
-def _img_to_data_url(img: Image.Image) -> str:
+# minimal, robust data-URL builder with optional upscaling
+
+def _img_to_data_url(img: Image.Image, *, min_w=640, min_h=420) -> str:
+    w, h = img.size
+    scale = max(1.0, max(min_w / max(1, w), min_h / max(1, h)))
+    if scale > 1.0:
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     buf = io.BytesIO()
-    # PNG preserves thin glyphs/strike-through lines better than JPEG.
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
-
-# score_image.py — drop-in replacement
-import os, time, json, requests
+# OpenAI call with bounded time + retries; returns {} on failure
 
 def _openai_call(image_data_url: str, prompt: str) -> dict:
-    """
-    Bounded-latency vision call.
-    Env (optional):
-      OPENAI_API_KEY (required), OPENAI_MODEL, OPENAI_BASE_URL
-      OPENAI_CONNECT_TIMEOUT (default 6), OPENAI_READ_TIMEOUT (default 30)
-      OPENAI_MAX_RETRIES (default 0), OPENAI_BACKOFF_BASE (default 1.2)
-    """
     key = os.getenv("OPENAI_API_KEY")
     if not key:
-        return {}  # fail fast if no key
+        return {}
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     url = f"{base_url}/chat/completions"
 
     connect_timeout = float(os.getenv("OPENAI_CONNECT_TIMEOUT", "6"))
     read_timeout = float(os.getenv("OPENAI_READ_TIMEOUT", "30"))
-    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "0"))
-    backoff_base = float(os.getenv("OPENAI_BACKOFF_BASE", "1.2"))
+    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+    backoff = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
 
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": image_data_url}}
-            ]},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_data_url}}]},
         ],
-        "max_tokens": 600,
+        "max_tokens": 500,
         "temperature": 0
     }
 
-    attempts = 1 + max(0, max_retries)
-    last_err = None
-    for i in range(attempts):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            r = requests.post(
-                url, headers=headers, json=payload,
-                timeout=(connect_timeout, read_timeout)
-            )
+            r = requests.post(url, headers=headers, json=payload, timeout=(connect_timeout, read_timeout))
             if r.status_code >= 400:
-                if 500 <= r.status_code < 600 and i < attempts - 1:
-                    time.sleep(backoff_base ** (i + 1))
+                if 500 <= r.status_code < 600 and attempt <= max_retries:
+                    time.sleep(backoff ** attempt)
                     continue
                 return {}
             txt = r.json()["choices"][0]["message"]["content"]
@@ -198,23 +192,19 @@ def _openai_call(image_data_url: str, prompt: str) -> dict:
             except Exception:
                 a, b = txt.find("{"), txt.rfind("}")
                 return json.loads(txt[a:b+1]) if a >= 0 and b > a else {}
-        except requests.exceptions.RequestException as e:
-            last_err = e
-            if i < attempts - 1:
-                time.sleep(backoff_base ** (i + 1))
+        except requests.exceptions.RequestException:
+            if attempt <= max_retries:
+                time.sleep(backoff ** attempt)
                 continue
             return {}
-    return {}
-
-
 
 # ---------------------- detection APIs ----------------------
 
 def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[str]:
     im = Image.open(filepath).convert("RGB")
-    data_url = _img_to_data_url(im)
+    data_url = _img_to_data_url(im, min_w=800, min_h=520)
     prompt = _build_detection_prompt(allowed_labels)
-    obj = _openai_call(data_url, prompt)  # returns {} on persistent failure
+    obj = _openai_call(data_url, prompt)
     raw = [x for x in (obj.get("cues") or []) if isinstance(x, str)]
     out: list[str] = []
     for x in raw:
@@ -223,49 +213,71 @@ def detect_single_from_image(filepath: str, allowed_labels: list[str]) -> list[s
             out.append(canon)
     return out
 
-def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set]:
+
+def _save_debug_crop(img: Image.Image, *, tag: str, r: int, c: int, k: str):
+    if os.getenv("DEBUG_CROPS", "0") != "1":
+        return
+    d = pathlib.Path("results") / "crops"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"cell{r}{c}_{k}.png"
+    try:
+        img.save(p)
+    except Exception:
+        pass
+
+
+def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> List[Set[str]]:
+    """Per‑cell detection on a 2×4 grid.
+    Strategy per cell: analyse (A) full cell; (B) a bottom text band (≈ last 35% height).
+    Union labels from A and B after normalisation and filtering. Returns 8 sets row‑major.
+    Overall deadline can be tuned via OPENAI_GRID_DEADLINE_SEC (default 70s).
     """
-    2×4 crop with a strict total deadline (OPENAI_GRID_DEADLINE_SEC, default 60).
-    Crops are upscaled (LANCZOS) to improve small-text/strike-through detection.
-    Returns list[set] length 8. On any failure, yields empty set for that cell.
-    """
-    import time
-    deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "60"))
+    deadline = time.time() + float(os.getenv("OPENAI_GRID_DEADLINE_SEC", "70"))
     im = Image.open(filepath).convert("RGB")
     W, H = im.size
     rows, cols = 2, 4
-    out = []
+    out: List[Set[str]] = []
     prompt = _build_detection_prompt(allowed_labels)
 
-    for r in range(rows):
-        for c in range(cols):
+    for rr in range(rows):
+        for cc in range(cols):
             if time.time() >= deadline:
                 out.append(set()); continue
-            x0 = int(c * W / cols); x1 = int((c + 1) * W / cols)
-            y0 = int(r * H / rows); y1 = int((r + 1) * H / rows)
-            crop = im.crop((x0, y0, x1, y1))
 
-            # upscale small crops to aid OCR-like reading
-            cw, ch = crop.size
-            scale = 1.0
-            if cw < 600: scale = max(scale, 600 / cw)
-            if ch < 400: scale = max(scale, 400 / ch)
-            if scale > 1.0:
-                crop = crop.resize((int(cw * scale), int(ch * scale)), Image.LANCZOS)
+            x0 = int(cc * W / cols); x1 = int((cc + 1) * W / cols)
+            y0 = int(rr * H / rows); y1 = int((rr + 1) * H / rows)
+            cell = im.crop((x0, y0, x1, y1))
 
-            obj = _openai_call(_img_to_data_url(crop), prompt)  # {} on timeout/failure
-            labels = []
-            if isinstance(obj.get("cues"), list):
-                labels = obj["cues"]
-            elif isinstance(obj.get("grid"), list) and obj["grid"]:
-                labels = obj["grid"][0]
+            # small padding to include outer shadows/tooltips
+            pad_x = max(6, (x1 - x0) // 60)
+            pad_y = max(6, (y1 - y0) // 60)
+            x0p = max(0, x0 - pad_x); y0p = max(0, y0 - pad_y)
+            x1p = min(W, x1 + pad_x); y1p = min(H, y1 + pad_y)
+            cell = im.crop((x0p, y0p, x1p, y1p))
 
-            clean = set()
-            for x in labels or []:
-                if not isinstance(x, str): continue
-                canon = _norm_label(x)
+            # (A) full cell
+            a_url = _img_to_data_url(cell, min_w=720, min_h=480)
+            _save_debug_crop(cell, tag="full", r=rr+1, c=cc+1, k="A")
+            obj_a = _openai_call(a_url, prompt)
+            labels_a = obj_a.get("cues") if isinstance(obj_a.get("cues"), list) else []
+
+            # (B) bottom text band (~lower 35%) — often where prices/badges live
+            cw, ch = cell.size
+            band_h = int(ch * 0.35)
+            text_band = cell.crop((0, ch - band_h, cw, ch))
+            _save_debug_crop(text_band, tag="band", r=rr+1, c=cc+1, k="B")
+            b_url = _img_to_data_url(text_band, min_w=800, min_h=360)
+            obj_b = _openai_call(b_url, prompt)
+            labels_b = obj_b.get("cues") if isinstance(obj_b.get("cues"), list) else []
+
+            clean: Set[str] = set()
+            for src in (labels_a or []) + (labels_b or []):
+                if not isinstance(src, str):
+                    continue
+                canon = _norm_label(src)
                 if canon in allowed_labels:
                     clean.add(canon)
+
             out.append(clean)
 
     while len(out) < 8:
@@ -276,6 +288,7 @@ def detect_grid_from_image(filepath: str, allowed_labels: list[str]) -> list[set
 
 def _sign(x: float) -> int:
     return 1 if x > 0 else (-1 if x < 0 else 0)
+
 
 def _ln_or_none(price: Optional[float]) -> Optional[float]:
     if price is None:
@@ -288,12 +301,12 @@ def _ln_or_none(price: Optional[float]) -> Optional[float]:
         return None
     return math.log(price)
 
+
 def score_single_card(card_cues: Iterable[str],
                       params: Dict[str, Dict[str, float]],
                       *,
                       price: Optional[float] = None,
                       extra_cues: Iterable[str] = ()) -> Dict[str, float]:
-    """Readiness-like summary for a single card, plus a simple 'raw'."""
     cues = set(card_cues) | set(extra_cues)
     ln_price = _ln_or_none(price)
     if ln_price is not None:
@@ -317,10 +330,7 @@ def score_single_card(card_cues: Iterable[str],
         sum_w += w_i
         raw += beta
 
-    if sum_w <= 1e-12:
-        readiness = 0.0
-    else:
-        readiness = max(-1.0, min(1.0, sum_s / sum_w))
+    readiness = 0.0 if sum_w <= 1e-12 else max(-1.0, min(1.0, sum_s / sum_w))
 
     if ln_price is not None:
         pp = params.get("ln(price)")
@@ -335,6 +345,7 @@ def score_single_card(card_cues: Iterable[str],
         "sum_w": sum_w,
         "price_weight": (params.get("ln(price)", {}).get("price_weight", None) or 0.0)
     }
+
 
 def score_card_option_a(card_cues: Iterable[str],
                         params: Dict[str, Dict[str, float]],
@@ -355,6 +366,7 @@ def score_card_option_a(card_cues: Iterable[str],
         if p and p.get("beta") is not None:
             U += float(p["beta"]) * ln_price
     return U
+
 
 def score_card_option_b(card_cues: Iterable[str],
                         params: Dict[str, Dict[str, float]],
@@ -381,16 +393,14 @@ def score_card_option_b(card_cues: Iterable[str],
             s_i = _sign(beta) * M * C * R
         sum_s += s_i
         sum_w += w_i
-    if sum_w <= 1e-12:
-        readiness = 0.0
-    else:
-        readiness = max(-1.0, min(1.0, sum_s / sum_w))
+    readiness = 0.0 if sum_w <= 1e-12 else max(-1.0, min(1.0, sum_s / sum_w))
     if ln_price is not None:
         p_price = params.get("ln(price)")
         if p_price and p_price.get("price_weight") is not None:
             pw = max(0.0, min(1.0, float(p_price["price_weight"])))
             readiness *= pw
     return readiness
+
 
 def score_grid_2x4(cards: Sequence[dict],
                    params: Dict[str, Dict[str, float]]) -> dict:
