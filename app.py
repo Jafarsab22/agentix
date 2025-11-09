@@ -953,7 +953,7 @@ def _build_detection_prompt() -> str:
         "Do NOT tag strike-throughs as all-in. “Price excludes VAT” is NOT all-in.\n"
         "• Assurance: returns/warranty/guarantee statements (e.g., “30-day returns”, “2-year warranty”, “money-back guarantee”).\n"
         "• Scarcity tag: explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”).\n"
-        "• Strike-through: a markdown showing previous and current price or a crossed-out price or “was” higher price (e.g., “£299 was £349”, RRP, crossed-out number).\n"
+        "• Strike-through: when a price is crossed-out and a lower price is being introduced e.g., “£299 was £349”, RRP, crossed-out number.\n"
         "• Timer: a countdown or deadline for the offer (e.g., “Ends in 02:14:10”, “Sale ends today”, “Limited time deal”).\n"
         "• social: social proof that other users have bought this item (e.g., “1,234 bought this”, “x people viewing now”, “Bestseller”).\n"
         "• voucher: coupon/promo/voucher (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
@@ -1383,6 +1383,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
