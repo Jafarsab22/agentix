@@ -115,7 +115,7 @@ def _norm_label(x: str) -> str:
 def _build_detection_prompt(allowed: list[str]) -> str:
     vocab = ", ".join(allowed)
     return (
-        "You are an e-commerce UI analyst. Detect ONLY these cues (use exactly these labels): "
+        "You are an e-commerce UI analyst. Detect these cues: "
         f"{vocab}.\n"
         "Definitions and evidence requirements:\n"
         "All-in framing = the shown price explicitly includes taxes/shipping/fees (e.g., “£399 inc. VAT”, “price includes tax/shipping”). "
@@ -125,9 +125,9 @@ def _build_detection_prompt(allowed: list[str]) -> str:
         "Scarcity tag = explicit low stock or limited availability (e.g., “Only 3 left”, “Low stock”, “Selling fast”, “Limited stock”). "
         "“In stock” or delivery dates are NOT scarcity.\n"
         "Strike-through = a price visibly crossed-out OR a textual previous-price marker (evidence must include one of: a crossed-out number; "
-        "‘was £’, ‘RRP’, ‘List price’, ‘Previous price’, ‘Save £’ next to the price). ‘Deal’, ‘Prime’, or coloured badges alone are NOT strike-through.\n"
-        "Timer = a countdown or deadline (e.g., “Ends in 02:14:10”, “Sale ends today”, “X hours left”).\n"
-        "social = social proof (stars, 1–5 ★, review counts, “bought”, “viewing now”, “Bestseller”).\n"
+        "‘was’, ‘RRP’, ‘List price’, ‘Previous price’).\n"
+        "Timer = a countdown or deadline for the deal (e.g., “Ends in 02:14:10”, “limited time”, “Sale ends today”, “X hours left”).\n"
+        "social = social proof (“2k bought in last month”, “viewing now”, “Bestseller”).\n"
         "voucher = coupon/promo (e.g., “Use code SAVE10”, “Apply voucher”, “Clip coupon”).\n"
         "bundle = multi-item offer (e.g., “2 for £50”, “Buy 1 get 1 50% off”, “Bundle & save”). “Pack of 10” alone is NOT a bundle price deal.\n"
         "ratings = star graphics or numeric ratings like “4.3/5”.\n"
