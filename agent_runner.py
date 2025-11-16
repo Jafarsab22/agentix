@@ -992,7 +992,7 @@ def submit_job_async(payload: Dict) -> Dict:
                 info = persist_results_if_qualify(
                     res,
                     payload,
-                    base_url="https://aireadyworkforce.pro/Agentix",
+                    base_url="https://agentyx.tech",
                     app_version="app-1",
                     est_model="logit-1",
                     alpha=0.05,
@@ -1058,6 +1058,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
