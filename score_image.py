@@ -12,7 +12,40 @@ Public API:
 - detect_grid_from_image(filepath, allowed_labels) -> list[set[str]]   # 8 cells row-major
 - score_single_card(cues_set, params) -> dict with 'raw','final','sum_s','sum_w','price_weight'
 - score_grid_2x4(cards, params) -> dict with per-card + aggregates
+
+Scoring modes
+
+Option A — Linear utility (β·x)
+- What it is: Standard conditional-logit style utility. For each present cue j,
+  add β_j * x_j to the card’s utility (x_j is usually 0/1, or ln(price) if present).
+- Card score: U = Σ_j β_j x_j. The card with the largest U is predicted to be chosen.
+- Why use it: Most faithful to the pooled regression; tends to be the most predictive
+  in our validations because it mirrors how the model was estimated.
+- Price term: ln(price) enters exactly like any other regressor via its β_price.
+
+Option B — Evidence-weighted readiness (M·C·R)
+- What it is: Converts each cue into a bounded, direction-aware contribution,
+  then normalises by the cue evidence weight to make scores comparable across cards.
+- Cue contribution: s_i = sign(β_i) * M_i * C_i * R_i
+  where
+    M_i = magnitude proxy (from |AME_pp| via tanh(|AME|/k)),
+    C_i = confidence (exp(−γ · [ln(CI_high) − ln(CI_low)])),
+    R_i = reliability (e.g., evid_score × (1 − q_bh), clamped to [0,1]).
+- Card score (readiness): readiness_raw = (Σ_i s_i) / (Σ_i C_i * R_i), clipped to [−1, +1].
+  If the card has a price cue, multiply by price_weight (e.g., min(1, |β_price|/β_ref)).
+- Why use it: More conservative and comparable across cards when cue quality varies;
+  it down-weights noisy or weakly evidenced cues by design, so it’s usually less
+  predictive than Option A but more robust as a quality-weighted “readiness” index.
+
+Notes
+- Position effects (Row/Column) are added automatically for 2×4 grids; they are ignored
+  for single-card scoring unless explicitly supplied.
+- Price handling can be contextual:
+  • Option A: ln(price) is a standard regressor (β_price · ln(price)).
+  • Option B: ln(price) contributes via its own s_i term, and a global price_weight
+    can be applied to the card/page score if desired.
 """
+
 
 from __future__ import annotations
 import io, base64, json, math, os, time
