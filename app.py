@@ -18,49 +18,60 @@ RESULTS_DIR = pathlib.Path("results"); RESULTS_DIR.mkdir(parents=True, exist_ok=
 JOBS_DIR = pathlib.Path("jobs"); JOBS_DIR.mkdir(parents=True, exist_ok=True)
 EFFECTS_DIR = RESULTS_DIR / "effects"; EFFECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# URL of your PHP endpoint that prints JSON from agentix_cross_parameters
+
+# URL of your PHP endpoints
+BUILD_CROSS_PARAMS_URL = os.getenv(
+    "AGENTIX_BUILD_CROSS_PARAMS_URL",
+    "https://agentyx.tech/buildAgentixCrossParameters.php",
+)
 CROSS_PARAMS_URL = os.getenv(
     "AGENTIX_CROSS_PARAMS_URL",
     "https://agentyx.tech/getCrossParameters.php",
 )
-#for score_image.py
+DEFAULT_MODEL = os.getenv("AGENTIX_MODEL_NAME", "GPT-4.1-mini")
+# Optional shared secret if your PHP checks a key
+AGENTIX_API_KEY = os.getenv("AGENTIX_API_KEY", "").strip()
+# Rebuild on startup? (set 0 to skip rebuild and only fetch)
+AGENTIX_BUILD_ON_START = os.getenv("AGENTIX_BUILD_ON_START", "1") == "1"
+
+# for score_image.py
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"   # Gradio’s own telemetry
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"       # (optional) silence HF hub telemetry if any
 
-# --- replacement parser (single source of truth) ---
-# --- replacement parser (single source of truth) ---
-def load_params_from_php(url: str = CROSS_PARAMS_URL) -> dict:
-    """
-    Returns dict keyed by cue/badge with numeric values.
-    Accepts either:
-      A) {"ok": true, "model": "...", "params": { "<badge>": {"beta":..., "M":..., "C":..., "R":..., "s":..., "price_weight":...}, ...}}
-      B) [ {"badge":"...", "beta":..., "m_val":..., "c_val":..., "r_val":..., "price_weight": ...}, ... ]
-    On any network or parse error, returns {} instead of raising (so the UI still comes up).
-    """
+# --- single source of truth: load cross parameters (optionally rebuilding first) ---
+def _http_get_json(url: str, params: dict, timeout=(12, 240)):
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    # Builder may return plain text; getter returns JSON
     try:
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
+        return r.json()
     except Exception:
-        logging.warning("Cross-parameters endpoint unreachable; continuing with empty params.")
-        return {}
+        return {"ok": True, "raw": r.text}
 
-    # A: object with "params"
+def _parse_params_payload(data) -> dict:
+    """
+    Normalises either:
+      A) {"ok":true, "params": {badge:{beta,M,C,R,s?,price_weight?}, ...}}
+      B) [ {"badge":..., "beta":..., "m_val":..., "c_val":..., "r_val":..., "price_weight":...}, ... ]
+    Returns {} on unknown shape.
+    """
+    # A: object with "params" dict
     if isinstance(data, dict) and isinstance(data.get("params"), dict):
         out = {}
         for badge, vals in data["params"].items():
             if not badge or not isinstance(vals, dict):
                 continue
-            out[str(badge)] = {
+            d = {
                 "beta": float(vals.get("beta", 0.0)),
-                "M": float(vals.get("M", 0.0)),
-                "C": float(vals.get("C", 0.0)),
-                "R": float(vals.get("R", 0.0)),
+                "M":    float(vals.get("M",    0.0)),
+                "C":    float(vals.get("C",    0.0)),
+                "R":    float(vals.get("R",    0.0)),
             }
             if vals.get("s") is not None:
-                out[str(badge)]["s"] = float(vals["s"])
+                d["s"] = float(vals["s"])
             if vals.get("price_weight") is not None:
-                out[str(badge)]["price_weight"] = float(vals["price_weight"])
+                d["price_weight"] = float(vals["price_weight"])
+            out[str(badge)] = d
         return out
 
     # B: legacy list rows
@@ -72,22 +83,66 @@ def load_params_from_php(url: str = CROSS_PARAMS_URL) -> dict:
             badge = row.get("badge")
             if not badge:
                 continue
-            out[str(badge)] = {
-                "beta": float(row.get("beta") or 0.0),
-                "M": float(row.get("m_val") or 0.0),
-                "C": float(row.get("c_val") or 0.0),
-                "R": float(row.get("r_val") or 0.0),
+            d = {
+                "beta": float(row.get("beta")   or 0.0),
+                "M":    float(row.get("m_val")  or 0.0),
+                "C":    float(row.get("c_val")  or 0.0),
+                "R":    float(row.get("r_val")  or 0.0),
             }
             if row.get("price_weight") is not None:
-                out[str(badge)]["price_weight"] = float(row["price_weight"])
+                d["price_weight"] = float(row["price_weight"])
+            out[str(badge)] = d
         return out
 
-    logging.warning("Cross-parameters endpoint returned an unexpected JSON shape; continuing with empty params.")
+    logging.warning("Cross-parameters endpoint returned an unexpected JSON shape.")
     return {}
 
-# load the parameters (do this once, but never crash the app)
+def load_params_from_php(
+    url: str = CROSS_PARAMS_URL,
+    build_url: str = BUILD_CROSS_PARAMS_URL,
+    model: str = DEFAULT_MODEL,
+    build_first: bool = AGENTIX_BUILD_ON_START,
+    tries: int = 5,
+    wait_sec: float = 1.2,
+) -> dict:
+    """
+    Rebuilds pooled cross parameters (if build_first=True), then fetches them.
+    Returns dict keyed by badge with numeric values. Never raises; returns {} on failure.
+    """
+    # 1) Rebuild (optional)
+    if build_first:
+        try:
+            params = {"model": model}
+            if AGENTIX_API_KEY:
+                params["key"] = AGENTIX_API_KEY
+            _ = _http_get_json(build_url, params=params)
+        except Exception as e:
+            logging.warning("Cross-params rebuild failed (%s). Will try to fetch anyway.", e)
+
+    # 2) Fetch (with a short retry loop to cover commit lag)
+    fetch_params = {"model": model}
+    if AGENTIX_API_KEY:
+        fetch_params["key"] = AGENTIX_API_KEY
+
+    last_err = None
+    for _ in range(max(1, tries)):
+        try:
+            data = _http_get_json(url, params=fetch_params)
+            parsed = _parse_params_payload(data)
+            if parsed:
+                return parsed
+            last_err = f"Empty/invalid payload (keys: {list(data.keys()) if isinstance(data, dict) else type(data)})"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(wait_sec)
+
+    logging.warning("Failed to load cross parameters: %s", last_err or "unknown error")
+    return {}
+
+# Load the parameters once (non-fatal on failure)
 SCORE_PARAMS = load_params_from_php()
-logging.info("Loaded %d cue parameters from PHP (0 means offline/empty).", len(SCORE_PARAMS))
+logging.info("Loaded %d cross-parameters (model=%s).", len(SCORE_PARAMS), DEFAULT_MODEL)
+
 
 
 # Optional storefront helpers
@@ -1218,6 +1273,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
