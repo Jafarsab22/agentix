@@ -44,6 +44,8 @@ Notes
   • Option A: ln(price) is a standard regressor (β_price · ln(price)).
   • Option B: ln(price) contributes via its own s_i term, and a global price_weight
     can be applied to the card/page score if desired.
+- In app.py we call a small loader (load_params_from_php) once at startup and keep the result in a global SCORE_PARAMS. 
+Every scoring call (single or grid) passes SCORE_PARAMS into score_image.py functions.
 """
 
 
