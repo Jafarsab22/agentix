@@ -21,7 +21,7 @@ EFFECTS_DIR = RESULTS_DIR / "effects"; EFFECTS_DIR.mkdir(parents=True, exist_ok=
 # URL of your PHP endpoint that prints JSON from agentix_cross_parameters
 CROSS_PARAMS_URL = os.getenv(
     "AGENTIX_CROSS_PARAMS_URL",
-    "https://aireadyworkforce.pro/Agentix/getCrossParameters.php",
+    "https://agentyx.tech/getCrossParameters.php",
 )
 #for score_image.py
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "false"   # Gradio’s own telemetry
@@ -487,7 +487,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
                         pass
                 if send_list:
                     try:
-                        url = "https://aireadyworkforce.pro/Agentix/sendAgentixFiles.php"
+                        url = "https://agentyx.tech/sendAgentixFiles.php"
                         _ = requests.post(url, json={"run_id": run_id_local, "files": send_list}, timeout=45)
                     except Exception:
                         pass
@@ -497,7 +497,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
                     _ = persist_results_if_qualify(
                         _results,
                         _payload,
-                        base_url="https://aireadyworkforce.pro/Agentix",
+                        base_url="https://agentyx.tech",
                         app_version="app-1",
                         est_model="logit-1",
                         alpha=0.05,
@@ -517,7 +517,7 @@ def run_now(product_name: str, brand_name: str, model_name: str, badges: list[st
         persist_info = persist_results_if_qualify(
             results,
             payload,
-            base_url="https://aireadyworkforce.pro/Agentix",
+            base_url="https://agentyx.tech",
             app_version="app-1",
             est_model="logit-1",
             alpha=0.05,
@@ -535,7 +535,7 @@ def search_database(product_name: str):
     if not product:
         return "<p>Enter a product name to search.</p>", "{}"
 
-    base_url = "https://aireadyworkforce.pro/Agentix/searchAgentix.php"
+    base_url = "https://agentyx.tech/searchAgentix.php"
 
     try:
         r = requests.get(base_url, params={"product": product, "limit": 50}, timeout=12)
@@ -1218,6 +1218,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
