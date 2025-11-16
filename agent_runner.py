@@ -756,7 +756,7 @@ def run_job_sync(payload: Dict) -> Dict:
 
     _SIM_SEMAPHORE.acquire()
     try:
-        ui_label = str(payload.get("model") or "OpenAI GPT-4.1-mini")
+        ui_label = str(payload.get("model") or "GPT-4.1-mini")
         vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
         if not os.getenv(env_key, ""):
             raise RuntimeError(f"{env_key} not set for model '{ui_label}'. Set the API key in the Space settings.")
@@ -1058,6 +1058,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
