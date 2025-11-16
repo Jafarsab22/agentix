@@ -195,7 +195,7 @@ def _upload_artifacts(base_url: str, job_id: str, files: List[str]) -> Dict[str,
 def persist_results_if_qualify(
     results: Dict[str, Any],
     payload: Dict[str, Any],
-    base_url: str = "https://aireadyworkforce.pro/Agentix",
+    base_url: str = "https://agentyx.tech",
     app_version: str = "Agentix v1.6",
     est_model: str = "clogit_lnprice",
     alpha: float = 0.05,
