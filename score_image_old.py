@@ -1,7 +1,7 @@
 """
-score_image.py
+score_image_old.py
 ---------------
-Pure detection + scoring helpers.
+Pure detection + scoring helpers; based on location parameters;
 
 Detect cues on e-commerce cards (single or 2×4 grid) and score them.
 The app should import these functions and pass PHP-loaded parameters.
