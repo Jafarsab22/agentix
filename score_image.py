@@ -657,42 +657,41 @@ def score_card_option_b(card_cues: Iterable[str],
 
     return readiness
 
-
 def score_grid_2x4(cards: Sequence[dict],
                    params: Dict[str, Dict[str, float]]) -> dict:
     """
     Score an 8-card (2×4) grid.
 
     For each card we compute four scores:
-      - option_a_pos      : Option A, WITH Row/Column cues
-      - option_b_pos      : Option B, WITH Row/Column cues
-      - option_a_badges   : Option A, WITHOUT Row/Column cues
-      - option_b_badges   : Option B, WITHOUT Row/Column cues
+      - option_a / option_b       : WITH Row/Column cues (backwards compatible)
+      - option_a_badges / option_b_badges : WITHOUT Row/Column cues
 
-    This lets us compare the contribution of positional effects vs. badge-only
-    scoring on the same grid.
+    This lets us compare positional effects vs. badge-only scoring on
+    the same grid while keeping the original API intact.
     """
     if len(cards) != 8:
         raise ValueError("score_grid_2x4 expects exactly 8 cards (2×4)")
 
     out_cards: List[dict] = []
 
+    # with position (old behaviour)
     sum_a_pos = 0.0
     sum_b_pos = 0.0
-    sum_a_badges = 0.0
-    sum_b_badges = 0.0
-
     best_a_pos = float("-inf")
     best_b_pos = float("-inf")
+
+    # badge-only (no Row/Column)
+    sum_a_badges = 0.0
+    sum_b_badges = 0.0
     best_a_badges = float("-inf")
     best_b_badges = float("-inf")
 
     for idx, card in enumerate(cards):
-        # Row/column indexing in the experimental 2×4 layout
+        # Row/column in 2×4 layout
         r = 1 if idx < 4 else 2
         c = (idx % 4) + 1
 
-        # Positional cues (only used in *_pos scores)
+        # positional cues (for *_pos / legacy scores)
         extra_pos: List[str] = [f"Row {r}"]
         if c == 1:
             extra_pos.append("Column 1")
@@ -700,16 +699,16 @@ def score_grid_2x4(cards: Sequence[dict],
             extra_pos.append("Column 2")
         elif c == 3:
             extra_pos.append("Column 3")
-        # Column 4: baseline, no extra cue.
+        # Column 4 is baseline: no extra cue
 
         cues = set(card.get("cues") or [])
         price = card.get("price")
 
-        # With position
+        # with position (legacy behaviour)
         s_a_pos = score_card_option_a(cues, params, price=price, extra_cues=extra_pos)
         s_b_pos = score_card_option_b(cues, params, price=price, extra_cues=extra_pos)
 
-        # Badge-only (no Row/Column)
+        # badge-only (no Row/Column cues)
         s_a_badges = score_card_option_a(cues, params, price=price, extra_cues=())
         s_b_badges = score_card_option_b(cues, params, price=price, extra_cues=())
 
@@ -718,32 +717,47 @@ def score_grid_2x4(cards: Sequence[dict],
             "col": c,
             "cues": sorted(cues),
             "price": price,
+
+            # original keys – with Row/Column (so app.py keeps working)
+            "option_a": s_a_pos,
+            "option_b": s_b_pos,
+
+            # explicit labels for both variants
             "option_a_pos": s_a_pos,
             "option_b_pos": s_b_pos,
             "option_a_badges": s_a_badges,
             "option_b_badges": s_b_badges,
         })
 
+        # accumulate aggregates
         sum_a_pos += s_a_pos
         sum_b_pos += s_b_pos
-        sum_a_badges += s_a_badges
-        sum_b_badges += s_b_badges
-
         best_a_pos = max(best_a_pos, s_a_pos)
         best_b_pos = max(best_b_pos, s_b_pos)
+
+        sum_a_badges += s_a_badges
+        sum_b_badges += s_b_badges
         best_a_badges = max(best_a_badges, s_a_badges)
         best_b_badges = max(best_b_badges, s_b_badges)
 
     return {
         "cards": out_cards,
-        # Averages WITH position
+
+        # legacy aggregates (with position) – for existing UI
+        "mean_option_a": sum_a_pos / 8.0,
+        "mean_option_b": sum_b_pos / 8.0,
+        "best_option_a": best_a_pos,
+        "best_option_b": best_b_pos,
+
+        # explicit labels for both variants
         "mean_option_a_pos": sum_a_pos / 8.0,
         "mean_option_b_pos": sum_b_pos / 8.0,
         "best_option_a_pos": best_a_pos,
         "best_option_b_pos": best_b_pos,
-        # Averages WITHOUT position (badge-only)
+
         "mean_option_a_badges": sum_a_badges / 8.0,
         "mean_option_b_badges": sum_b_badges / 8.0,
         "best_option_a_badges": best_a_badges,
         "best_option_b_badges": best_b_badges,
     }
+
