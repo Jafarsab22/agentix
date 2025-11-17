@@ -967,17 +967,21 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         )
     badges_md = "\n".join(b_lines)
 
+  
     # Step 5: build scores table
     s_lines = [
         "#### Grid 2×4 scores",
         "",
-        "| Card | Row | Col | option A (β·x) | option B (scores) |",
-        "|---:|---:|---:|---:|---:|",
+        "| Card | Row | Col | option A (β·x, pos) | option B (scores, pos) | option A (β·x, badges only) | option B (scores, badges only) |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for i, card_res in enumerate(res.get("cards", []), 1):
         s_lines.append(
             f"| {i} | {card_res.get('row')} | {card_res.get('col')} | "
-            f"{_fmt_num(card_res.get('option_a'))} | {_fmt_num(card_res.get('option_b'))} |"
+            f"{_fmt_num(card_res.get('option_a'))} | "
+            f"{_fmt_num(card_res.get('option_b'))} | "
+            f"{_fmt_num(card_res.get('option_a_badges'))} | "
+            f"{_fmt_num(card_res.get('option_b_badges'))} |"
         )
 
     s_lines += [
@@ -986,10 +990,16 @@ def _auto_grid_from_image(filepath: str) -> tuple:
         "",
         "| Metric | Value |",
         "|---|---:|",
+        # with position (legacy behaviour)
         f"| mean_option_a | {_fmt_num(res.get('mean_option_a'))} |",
         f"| mean_option_b | {_fmt_num(res.get('mean_option_b'))} |",
         f"| best_option_a | {_fmt_num(res.get('best_option_a'))} |",
         f"| best_option_b | {_fmt_num(res.get('best_option_b'))} |",
+        # badge-only (no Row/Column)
+        f"| mean_option_a_badges | {_fmt_num(res.get('mean_option_a_badges'))} |",
+        f"| mean_option_b_badges | {_fmt_num(res.get('mean_option_b_badges'))} |",
+        f"| best_option_a_badges | {_fmt_num(res.get('best_option_a_badges'))} |",
+        f"| best_option_b_badges | {_fmt_num(res.get('best_option_b_badges'))} |",
     ]
     score_md = "\n".join(s_lines)
 
@@ -1273,6 +1283,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
