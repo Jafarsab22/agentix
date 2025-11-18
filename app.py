@@ -878,7 +878,10 @@ try:
         detect_grid_from_image,
         score_single_card,
         score_grid_2x4,
+        score_card_option_a,   # <-- add
+        score_card_option_b,   # <-- add
     )
+
 except Exception:
     detect_single_from_image = None
     detect_grid_from_image = None
@@ -911,26 +914,47 @@ def _file_to_data_url(path_like: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 @_catch_and_report
+@_catch_and_report
 def _auto_single_from_image(filepath: str) -> tuple:
     if not filepath:
-        return gr.update(value=None), "No image.", "",""
-    if detect_single_from_image is None or score_single_card is None:
-        return gr.update(value=None), "Scoring utility not available.", "",""
+        return gr.update(value=None), "No image.", "", ""
+    if detect_single_from_image is None or score_card_option_a is None or score_card_option_b is None:
+        return gr.update(value=None), "Scoring utility not available.", "", ""
+
+    # 1) detect badges
     cues = detect_single_from_image(filepath, CUE_CHOICES_SCORER)
     cues = [c for c in cues if c in CUE_CHOICES_SCORER]
-    res = score_single_card(set(cues), SCORE_PARAMS or {})
+    cues_set = set(cues)
+
+    # 2) choose a hypothetical position for the positional variant
+    #    Here: treat the single card as if it were Row 1, Column 1 in a grid.
+    extra_pos = ["Row 1", "Column 1"]
+    price = None  # no price from image
+
+    # 3) compute scores
+    params = SCORE_PARAMS or {}
+    # with position
+    s_a_pos = score_card_option_a(cues_set, params, price=price, extra_cues=extra_pos)
+    s_b_pos = score_card_option_b(cues_set, params, price=price, extra_cues=extra_pos)
+    # badges only (no Row/Column cues)
+    s_a_badges = score_card_option_a(cues_set, params, price=price, extra_cues=())
+    s_b_badges = score_card_option_b(cues_set, params, price=price, extra_cues=())
+
+    # 4) markdown outputs
     badges_md = "#### Identified badges\n" + (", ".join(cues) if cues else "—")
+
     score_md = (
-        "#### Single card score\n\n| Metric | Value |\n|---|---:|\n"
-        f"| raw | {_fmt_num(res.get('raw'))} |\n"
-        f"| price_weight | {_fmt_num(res.get('price_weight'))} |\n"
-        f"| final | {_fmt_num(res.get('final'))} |\n"
-        f"| ∑ s_i | {_fmt_num(res.get('sum_s'))} |\n"
-        f"| ∑ w_i | {_fmt_num(res.get('sum_w'))} |\n"
+        "#### Single card scores\n\n"
+        "| option A (β·x, pos) | option B (scores, pos) | "
+        "option A (β·x, badges only) | option B (scores, badges only) |\n"
+        "|---:|---:|---:|---:|\n"
+        f"| {_fmt_num(s_a_pos)} | {_fmt_num(s_b_pos)} | "
+        f"{_fmt_num(s_a_badges)} | {_fmt_num(s_b_badges)} |\n"
     )
+
     return gr.update(value=filepath), badges_md, score_md, "✅ Detected and scored."
 
-@_catch_and_report
+
 @_catch_and_report
 def _auto_grid_from_image(filepath: str) -> tuple:
     if not filepath:
@@ -1283,6 +1307,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
