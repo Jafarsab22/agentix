@@ -333,7 +333,7 @@ def call_azure(image_b64, category, deployment_name=None):
     Expects these environment variables:
       AZURE_OPENAI_ENDPOINT    e.g. "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
       AZURE_OPENAI_API_KEY     the key from this Azure resource
-      AZURE_OPENAI_API_VERSION (optional, default '2024-12-01-preview')
+      AZURE_OPENAI_API_VERSION (optional, default '2025-01-01-preview')
       AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
     key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -345,7 +345,7 @@ def call_azure(image_b64, category, deployment_name=None):
         raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
 
     # Use the version you ALREADY know works from PHP
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
     deployment = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat")
 
     url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
@@ -1099,6 +1099,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
