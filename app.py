@@ -153,8 +153,7 @@ except Exception:
     save_storefront = None
 
 # -------- UI choices --------
-MODEL_CHOICES = ["GPT-4.1-mini"]  # extend later if needed
-MODEL_CHOICES = ["GPT-5-chat"]
+MODEL_CHOICES = ["GPT-4.1-mini", "GPT-5-chat"]
 BADGE_CHOICES = [
     "All-in v. partitioned pricing",
     "Assurance",
@@ -1308,6 +1307,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
