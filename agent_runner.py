@@ -379,7 +379,7 @@ def call_openai(image_b64, category, model_name=None):
         "temperature": 0
     }
 
-    r = _post_with_retries_openai(url, headers, data, timeout=(12, 240), max_attempts=6)
+    r = _post_with_retries_azure(url, headers, data, timeout=(12, 240), max_attempts=6)
     if r.status_code >= 400:
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
 
@@ -412,6 +412,124 @@ def call_openai(image_b64, category, model_name=None):
 
     return args
 
+# --- Robust POST with retries (Azure) ---
+def _post_with_retries_azure(
+    url,
+    headers,
+    payload,
+    timeout=(90, 1800),
+    max_attempts=20,
+    backoff_base=0.75,
+    backoff_cap=12.0
+):
+    import random
+    sess = requests.Session()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = sess.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
+                sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                sleep_s *= random.uniform(0.6, 1.4)
+                time.sleep(sleep_s)
+                continue
+            return r
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError
+        ):
+            sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+            sleep_s *= random.uniform(0.6, 1.4)
+            time.sleep(sleep_s)
+            if attempt == max_attempts:
+                raise
+    raise RuntimeError("Azure retry exhausted without success.")
+
+
+# ---------- Azure OpenAI ----------
+def call_azure(image_b64, category, deployment_name=None):
+    """
+    Call an Azure OpenAI chat deployment with image + tool call.
+    Expects these environment variables:
+      AZURE_OPENAI_ENDPOINT   e.g. "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
+      AZURE_OPENAI_API_KEY    the key from this Azure resource
+      AZURE_OPENAI_API_VERSION (optional, default '2024-12-01-preview')
+      AZURE_OPENAI_DEPLOYMENT (optional default deployment name)
+    """
+    key = os.getenv("AZURE_OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("AZURE_OPENAI_API_KEY is not set.")
+
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    if not endpoint:
+        raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
+
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+    deployment = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat")
+
+    # Azure deployments endpoint (vision-capable models support the same image_url format)
+    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    headers = {"api-key": key, "content-type": "application/json"}
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "choose",
+            "description": "Select one product from the 2×4 grid.",
+            "parameters": SCHEMA_JSON
+        }
+    }]
+
+    data = {
+        # For the deployments-style endpoint, model is optional; the deployment in the URL selects it.
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": f"Category: {category}. Use ONLY the 'choose' tool."},
+                {"type": "image_url", "image_url": {"url": image_b64}}
+            ]}
+        ],
+        "tools": tools,
+        "tool_choice": {"type": "function", "function": {"name": "choose"}},
+        "max_tokens": 64,
+        "temperature": 0
+    }
+
+    r = _post_with_retries_azure(url, headers, data, timeout=(12, 240), max_attempts=6)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Azure API error {r.status_code}: {r.text[:500]}")
+
+    msg = r.json()["choices"][0]["message"]
+    tcs = msg.get("tool_calls", [])
+    if not tcs:
+        raise RuntimeError("Azure returned no tool_calls.")
+    raw = tcs[0]["function"].get("arguments")
+
+    if isinstance(raw, str):
+        try:
+            args = json.loads(raw)
+        except Exception:
+            args = {}
+    elif isinstance(raw, dict):
+        args = {}
+        args.update(raw)
+    else:
+        args = {}
+
+    title = args.get("chosen_title")
+    args["chosen_title"] = title if isinstance(title, str) else ""
+    try:
+        args["row"] = int(args.get("row"))
+    except Exception:
+        args["row"] = None
+    try:
+        args["col"] = int(args.get("col"))
+    except Exception:
+        args["col"] = None
+
+    return args
+    
 # ---------- Anthropic ----------
 def _post_with_retries(url, headers, payload, timeout=1200, attempts=5, backoff=0.9):
     import random
@@ -515,7 +633,7 @@ def call_gemini(image_b64: str, category: str, model_name: str):
 def _choose_with_model(image_b64, category, ui_label):
     vendor, model, _ = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
     if vendor == "openai":
-        return "openai", call_openai(image_b64, category, model)
+        return "openai", call_azure(image_b64, category, model)
     if vendor == "anthropic":
         return "anthropic", call_anthropic(image_b64, category, model)
     return "gemini", call_gemini(image_b64, category, model)
@@ -1058,6 +1176,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
