@@ -1080,6 +1080,7 @@ def submit_job_async(payload: Dict) -> Dict:
                 js.results_json = json.dumps(res, ensure_ascii=False)
                 js.end_ts = time.time()
         except Exception as e:
+            print(f"[worker] job {jid} failed: {type(e).__name__}: {e}", flush=True)
             with _JLOCK:
                 js.status = "error"
                 js.error = f"{type(e).__name__}: {e}"
@@ -1132,6 +1133,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
