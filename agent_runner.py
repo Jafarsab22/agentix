@@ -132,7 +132,7 @@ def _write_progress(job_id: str, status: str, done: int | None = None, total: in
 # ---------------- models / schema ----------------
 MODEL_MAP = {
     # Both of these use Azure OpenAI and AZURE_OPENAI_API_KEY
-    "OpenAI GPT-4.1-mini":        ("azure",   "gpt-4.1-mini",             "AZURE_OPENAI_API_KEY"),
+    "GPT-4.1-mini":        ("azure",   "gpt-4.1-mini",             "AZURE_OPENAI_API_KEY"),
     "GPT-5-chat":                  ("azure",   "gpt-5-chat",               "AZURE_OPENAI_API_KEY"),
 
     # Still supported if you want them
@@ -1196,6 +1196,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
