@@ -323,15 +323,47 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
                          "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
 
+# ---------- Azure OpenAI: robust POST with retries ----------
+def _post_with_retries_azure(
+    url,
+    headers,
+    payload,
+    timeout=(90, 1800),
+    max_attempts=20,
+    backoff_base=0.75,
+    backoff_cap=12.0,
+):
+    import random
+    sess = requests.Session()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = sess.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
+                sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                sleep_s *= random.uniform(0.6, 1.4)
+                time.sleep(sleep_s)
+                continue
+            return r
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError):
+            sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+            sleep_s *= random.uniform(0.6, 1.4)
+            time.sleep(sleep_s)
+            if attempt == max_attempts:
+                raise
+    raise RuntimeError("Azure retry exhausted without success.")
+
 
 # ---------- Azure OpenAI ----------
 def call_azure(image_b64, category, deployment_name=None):
     """
     Call an Azure OpenAI chat deployment with image + tool call.
     Expects these environment variables:
-      AZURE_OPENAI_ENDPOINT    e.g. "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
+      AZURE_OPENAI_ENDPOINT    e.g. "https://<your-resource>.openai.azure.com"
       AZURE_OPENAI_API_KEY     the key from this Azure resource
-      AZURE_OPENAI_API_VERSION (optional, default '2024-12-01-preview')
+      AZURE_OPENAI_API_VERSION (optional, e.g. '2024-02-15-preview')
       AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
     key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -342,8 +374,7 @@ def call_azure(image_b64, category, deployment_name=None):
     if not endpoint:
         raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
 
-    # Use the version you already know works from PHP unless overridden
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
     deployment = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat")
 
     url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
@@ -354,55 +385,62 @@ def call_azure(image_b64, category, deployment_name=None):
         "function": {
             "name": "choose",
             "description": "Select one product from the 2×4 grid.",
-            "parameters": SCHEMA_JSON
-        }
+            "parameters": SCHEMA_JSON,
+        },
     }]
 
-    # image_b64 is "data:image/jpeg;base64,...."
     data = {
-        # Not strictly required for deployments, but fine and matches your PHP pattern
         "model": deployment,
         "messages": [
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": SYSTEM_PROMPT}
-                ]
+                    {"type": "text", "text": SYSTEM_PROMPT},
+                ],
             },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": f"Category: {category}. Use ONLY the 'choose' tool."
+                        "text": f"Category: {category}. Use ONLY the 'choose' tool.",
                     },
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": image_b64
-                        }
-                    }
-                ]
-            }
+                            "url": image_b64,
+                        },
+                    },
+                ],
+            },
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
         "max_tokens": 64,
-        "temperature": 0
+        "temperature": 0,
     }
 
-    # Debug: log the essentials once per call
     print(f"[azure] url={url}", flush=True)
     print(f"[azure] deployment={deployment} api_version={api_version}", flush=True)
 
     try:
-        r = _post_with_retries(url, headers, data, timeout=240, attempts=6, backoff=0.9)
+        # note: use the same keyword names as the helper definition
+        r = _post_with_retries_azure(
+            url,
+            headers,
+            data,
+            timeout=(12, 240),
+            max_attempts=6,
+            backoff_base=0.9,
+            backoff_cap=12.0,
+        )
     except Exception as e:
-        # Network level or retry failure
+        print(f"[azure] HTTP exception before status: {type(e).__name__}: {e}", flush=True)
         raise RuntimeError(f"Azure HTTP failure: {type(e).__name__}: {e}")
 
+    print(f"[azure] status={r.status_code}", flush=True)
+
     if r.status_code >= 400:
-        # Try to parse Azure-style JSON error
         err_code = None
         err_msg = None
         try:
@@ -417,14 +455,11 @@ def call_azure(image_b64, category, deployment_name=None):
             raise RuntimeError(
                 f"Azure API error {r.status_code} [{deployment}] {err_code}: {err_msg}"
             )
-        else:
-            # Fallback: raw text
-            body = r.text[:800] if hasattr(r, "text") else "<no body>"
-            raise RuntimeError(
-                f"Azure API error {r.status_code} [{deployment}]: {body}"
-            )
+        body = r.text[:800] if hasattr(r, "text") else "<no body>"
+        raise RuntimeError(
+            f"Azure API error {r.status_code} [{deployment}]: {body}"
+        )
 
-    # If we are here, r is 2xx; now parse the tool call
     try:
         resp = r.json()
     except Exception as e:
@@ -1140,6 +1175,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
