@@ -396,7 +396,7 @@ def call_azure(image_b64, category, deployment_name=None):
     print(f"[azure] deployment={deployment} api_version={api_version}", flush=True)
 
     try:
-        r = _post_with_retries_azure(url, headers, data, timeout=(12, 240), max_attempts=6)
+        r = _post_with_retries(url, headers, data, timeout=240, attempts=6, backoff=0.9)
     except Exception as e:
         # Network level or retry failure
         raise RuntimeError(f"Azure HTTP failure: {type(e).__name__}: {e}")
@@ -704,7 +704,11 @@ def _episode(
 
             try:
                 model_label, decision = _choose_with_model(image_b64, category, ui_label)
-            except Exception:
+            except Exception as e:
+                print(
+                    f"[episode] model call failed on attempt {attempt+1}: {type(e).__name__}: {e}",
+                    flush=True
+                )
                 if attempt == 0:
                     continue
                 model_label, decision = ("azure", {"row": None, "col": None, "chosen_title": ""})
@@ -712,10 +716,12 @@ def _episode(
             decision = reconcile(decision, gt)
             return set_id, model_label, gt, image_b64, decision
 
-        except (TimeoutException, ReadTimeoutError):
+        except (TimeoutException, ReadTimeoutError) as e:
+            print(f"[episode] webdriver timeout on attempt {attempt+1}: {type(e).__name__}: {e}", flush=True)
             if attempt == 0:
                 continue
             raise
+
 
 # ---------------- writers ----------------
 def _append_choice(df_choice: pd.DataFrame, path: pathlib.Path):
@@ -1134,6 +1140,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
