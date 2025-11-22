@@ -334,8 +334,7 @@ def call_azure(image_b64, category, deployment_name=None):
       AZURE_OPENAI_API_VERSION (optional, default '2024-12-01-preview')
       AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
-    #key = os.getenv("AZURE_OPENAI_API_KEY")
-    key = '3iPgAeFuhab4gaTKZxTpaczUUvWrTEUu487bIzS3BQNyWZAMjPOvJQQJ99BKACHYHv6XJ3w3AAAAACOGNKYB'
+    key = os.getenv("AZURE_OPENAI_API_KEY")
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set.")
 
@@ -827,14 +826,15 @@ def run_job_sync(payload: Dict) -> Dict:
 
     _SIM_SEMAPHORE.acquire()
     try:
-        # Make sure this default matches one of your MODEL_MAP keys
         ui_label = str(payload.get("model") or "GPT-5-chat")
-
-        # Default vendor/env to Azure, not OpenAI.com
         vendor, _, env_key = MODEL_MAP.get(ui_label, ("azure", ui_label, "AZURE_OPENAI_API_KEY"))
         print(f"[runner] ui_label={ui_label} vendor={vendor} env_key={env_key}", flush=True)
-        if not os.getenv(env_key, ""):
-            raise RuntimeError(f"{env_key} not set for model '{ui_label}'. Set the API key in the Space settings.")
+
+        if vendor != "azure":
+            if not os.getenv(env_key, ""):
+                raise RuntimeError(
+                    f"{env_key} not set for model '{ui_label}'. Set the API key in the Space settings."
+                )
 
         run_id_from_payload = str(payload.get("job_id") or payload.get("run_id") or RUN_ID)
         old_run_id = RUN_ID
@@ -1134,6 +1134,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
