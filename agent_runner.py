@@ -131,14 +131,13 @@ def _write_progress(job_id: str, status: str, done: int | None = None, total: in
 
 # ---------------- models / schema ----------------
 MODEL_MAP = {
-    # Azure OpenAI deployment
-    "GPT-5-chat":                  ("azure",    "gpt-5-chat",                "AZURE_OPENAI_API_KEY"),
-    # OpenAI.com
-    "OpenAI GPT-4.1-mini":         ("openai",   "gpt-4.1-mini",              "OPENAI_API_KEY"),
-    # Anthropic
-    "Anthropic Claude 3.5 Haiku":  ("anthropic","claude-3-5-haiku-latest",   "ANTHROPIC_API_KEY"),
-    # Gemini
-    "Google Gemini 1.5 Flash":     ("gemini",   "gemini-1.5-flash",          "GEMINI_API_KEY"),
+    # Both of these use Azure OpenAI and AZURE_OPENAI_API_KEY
+    "OpenAI GPT-4.1-mini":        ("azure",   "gpt-4.1-mini",             "AZURE_OPENAI_API_KEY"),
+    "GPT-5-chat":                  ("azure",   "gpt-5-chat",               "AZURE_OPENAI_API_KEY"),
+
+    # Still supported if you want them
+    "Anthropic Claude 3.5 Haiku": ("anthropic", "claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
+    "Google Gemini 1.5 Flash":    ("gemini",    "gemini-1.5-flash",        "GEMINI_API_KEY"),
 }
 
 
@@ -638,24 +637,25 @@ def call_gemini(image_b64: str, category: str, model_name: str):
     return args
 
 def _choose_with_model(image_b64, category, ui_label):
-    vendor, model_name, _ = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
+    vendor, model_name, _ = MODEL_MAP.get(ui_label, ("azure", ui_label, "AZURE_OPENAI_API_KEY"))
 
     if vendor == "azure":
-        # Azure: deployment name, AZURE_OPENAI_API_KEY used inside call_azure
+        # Azure OpenAI: use deployment name (model_name) + AZURE_OPENAI_* env vars
         decision = call_azure(image_b64, category, deployment_name=model_name)
     elif vendor == "openai":
-        # OpenAI.com: model_name like "gpt-4.1-mini", uses OPENAI_API_KEY
+        # Only used if you add an explicit OpenAI.com model later
         decision = call_openai(image_b64, category, model_name=model_name)
     elif vendor == "anthropic":
         decision = call_anthropic(image_b64, category, model_name)
     elif vendor == "gemini":
         decision = call_gemini(image_b64, category, model_name)
     else:
-        # Fallback: treat as OpenAI.com with given model_name
-        decision = call_openai(image_b64, category, model_name=model_name)
+        # Fallback: treat unknown labels as Azure with the given deployment name
+        decision = call_azure(image_b64, category, deployment_name=model_name)
 
-    # Important: log the UI label (e.g. "GPT-5-chat") instead of just "openai"/"azure"
+    # Very important: log the UI label (e.g. "GPT-5-chat") in df_choice["model"]
     return ui_label, decision
+
 
 
 # ---------------- URL builder (Option A) ----------------
@@ -1196,6 +1196,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
