@@ -640,21 +640,19 @@ def _choose_with_model(image_b64, category, ui_label):
     vendor, model_name, _ = MODEL_MAP.get(ui_label, ("azure", ui_label, "AZURE_OPENAI_API_KEY"))
 
     if vendor == "azure":
-        # Azure OpenAI: use deployment name (model_name) + AZURE_OPENAI_* env vars
         decision = call_azure(image_b64, category, deployment_name=model_name)
     elif vendor == "openai":
-        # Only used if you add an explicit OpenAI.com model later
         decision = call_openai(image_b64, category, model_name=model_name)
     elif vendor == "anthropic":
         decision = call_anthropic(image_b64, category, model_name)
     elif vendor == "gemini":
         decision = call_gemini(image_b64, category, model_name)
     else:
-        # Fallback: treat unknown labels as Azure with the given deployment name
         decision = call_azure(image_b64, category, deployment_name=model_name)
 
-    # Very important: log the UI label (e.g. "GPT-5-chat") in df_choice["model"]
+    # Log the UI label (e.g. 'gpt-5-chat') as the model in df_choice
     return ui_label, decision
+
 
 
 
@@ -894,8 +892,12 @@ def run_job_sync(payload: Dict) -> Dict:
 
     _SIM_SEMAPHORE.acquire()
     try:
-        ui_label = str(payload.get("model") or "GPT-4.1-mini")
-        vendor, _, env_key = MODEL_MAP.get(ui_label, ("openai", ui_label, "OPENAI_API_KEY"))
+        # Make sure this default matches one of your MODEL_MAP keys
+        ui_label = str(payload.get("model") or "GPT-5-chat")
+
+        # Default vendor/env to Azure, not OpenAI.com
+        vendor, _, env_key = MODEL_MAP.get(ui_label, ("azure", ui_label, "AZURE_OPENAI_API_KEY"))
+        print(f"[runner] ui_label={ui_label} vendor={vendor} env_key={env_key}", flush=True)
         if not os.getenv(env_key, ""):
             raise RuntimeError(f"{env_key} not set for model '{ui_label}'. Set the API key in the Space settings.")
 
@@ -1196,6 +1198,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
