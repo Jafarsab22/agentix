@@ -326,14 +326,15 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
 
 
 # ---------- Azure OpenAI ----------
+# ---------- Azure OpenAI ----------
 def call_azure(image_b64, category, deployment_name=None):
     """
     Call an Azure OpenAI chat deployment with image + tool call.
     Expects these environment variables:
-      AZURE_OPENAI_ENDPOINT   e.g. "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
-      AZURE_OPENAI_API_KEY    the key from this Azure resource
+      AZURE_OPENAI_ENDPOINT    e.g. "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
+      AZURE_OPENAI_API_KEY     the key from this Azure resource
       AZURE_OPENAI_API_VERSION (optional, default '2024-12-01-preview')
-      AZURE_OPENAI_DEPLOYMENT (optional default deployment name)
+      AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
     key = os.getenv("AZURE_OPENAI_API_KEY")
     if not key:
@@ -343,10 +344,10 @@ def call_azure(image_b64, category, deployment_name=None):
     if not endpoint:
         raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
 
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+    # Use the version you ALREADY know works from PHP
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
     deployment = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat")
 
-    # Azure deployments endpoint (vision-capable models support the same image_url format)
     url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
     headers = {"api-key": key, "content-type": "application/json"}
 
@@ -359,14 +360,33 @@ def call_azure(image_b64, category, deployment_name=None):
         }
     }]
 
+    # image_b64 is already like "data:image/jpeg;base64,...."
     data = {
-        # For the deployments-style endpoint, model is optional; the deployment in the URL selects it.
+        # Not strictly required for deployments/, but mirrors the PHP request
+        "model": deployment,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Category: {category}. Use ONLY the 'choose' tool."},
-                {"type": "image_url", "image_url": {"url": image_b64}}
-            ]}
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": SYSTEM_PROMPT}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Category: {category}. Use ONLY the 'choose' tool."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_b64
+                            # "detail": "high"  # optional, can be added if you like
+                        }
+                    }
+                ]
+            }
         ],
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "choose"}},
@@ -375,13 +395,23 @@ def call_azure(image_b64, category, deployment_name=None):
     }
 
     r = _post_with_retries_azure(url, headers, data, timeout=(12, 240), max_attempts=6)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Azure API error {r.status_code}: {r.text[:500]}")
 
-    msg = r.json()["choices"][0]["message"]
+    # Surface Azure's error body so you can see *why* it failed in logs
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text[:800]
+        except Exception:
+            body = "<no body>"
+        raise RuntimeError(f"Azure API error {r.status_code}: {body}")
+
+    resp = r.json()
+    msg = resp["choices"][0]["message"]
     tcs = msg.get("tool_calls", [])
     if not tcs:
-        raise RuntimeError("Azure returned no tool_calls.")
+        # Again, include the raw message to debug if tools fail
+        raise RuntimeError(f"Azure returned no tool_calls. Raw message: {json.dumps(msg, ensure_ascii=False)[:800]}")
+
     raw = tcs[0]["function"].get("arguments")
 
     if isinstance(raw, str):
@@ -390,8 +420,7 @@ def call_azure(image_b64, category, deployment_name=None):
         except Exception:
             args = {}
     elif isinstance(raw, dict):
-        args = {}
-        args.update(raw)
+        args = dict(raw)
     else:
         args = {}
 
@@ -407,6 +436,7 @@ def call_azure(image_b64, category, deployment_name=None):
         args["col"] = None
 
     return args
+
     
 # ---------- Anthropic ----------
 def _post_with_retries(url, headers, payload, timeout=1200, attempts=5, backoff=0.9):
@@ -1069,6 +1099,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
