@@ -366,18 +366,21 @@ def call_azure(image_b64, category, deployment_name=None):
       AZURE_OPENAI_API_VERSION (optional, e.g. '2024-02-15-preview')
       AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
-    key = os.getenv("AZURE_OPENAI_API_KEY")
+    #key = os.getenv("AZURE_OPENAI_API_KEY")
+    key = "3iPgAeFuhab4gaTKZxTpaczUUvWrTEUu487bIzS3BQNyWZAMjPOvJQQJ99BKACHYHv6XJ3w3AAAAACOGNKYB"
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set.")
 
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    #endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    endpoint = "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
     if not endpoint:
         raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
 
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-    deployment = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat")
+    api_version = "2024-12-01-preview"
+    deployment = deployment_name  
 
-    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    #url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    url = "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview"
     headers = {"api-key": key, "content-type": "application/json"}
 
     tools = [{
@@ -1175,6 +1178,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
