@@ -376,7 +376,7 @@ def call_azure(image_b64, category, deployment_name=None):
     if not endpoint:
         raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
 
-    api_version = "2024-12-01-preview"
+    api_version = "2025-01-01-preview"
     deployment = deployment_name  
 
     #url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
@@ -1178,6 +1178,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
