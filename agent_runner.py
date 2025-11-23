@@ -366,8 +366,8 @@ def call_azure(image_b64, category, deployment_name=None):
       AZURE_OPENAI_API_VERSION (optional, e.g. '2024-02-15-preview')
       AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
-    #key = os.getenv("AZURE_OPENAI_API_KEY")
-    key = "3iPgAeFuhab4gaTKZxTpaczUUvWrTEUu487bIzS3BQNyWZAMjPOvJQQJ99BKACHYHv6XJ3w3AAAAACOGNKYB"
+    key = os.getenv("AZURE_OPENAI_API_KEY")
+    #key = "3iPgAeFuhab4gaTKZxTpaczUUvWrTEUu487bIzS3BQNyWZAMjPOvJQQJ99BKACHYHv6XJ3w3AAAAACOGNKYB"
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set.")
 
@@ -1178,6 +1178,7 @@ def fetch_job(job_id: str) -> Dict:
         if js.status != "done":
             return {"ok": False, "error": "not_ready", "status": js.status}
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
+
 
 
 
