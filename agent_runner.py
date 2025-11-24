@@ -1335,10 +1335,14 @@ def fetch_job(job_id: str) -> Dict:
         js = _JOBS.get(job_id)
         if not js:
             return {"ok": False, "error": "unknown_job"}
-        if js.status != "done":
+        if js.status not in ("done", "cancelled"):
             return {"ok": False, "error": "not_ready", "status": js.status}
-        return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
-
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "status": js.status,
+            "results_json": js.results_json or "{}",
+        }
 
 def cancel_job(job_id: str) -> Dict:
     with _JLOCK:
@@ -1355,3 +1359,4 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
