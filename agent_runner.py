@@ -904,6 +904,9 @@ def run_job_sync(payload: Dict) -> Dict:
         _write_progress(RUN_ID, status="running", done=0, total=n, last_set=None, artifacts={})
 
         driver = _new_driver()
+        last_iter = 0
+        last_set_id = None
+        cancelled = False
         try:
             for i in range(1, n + 1):
                 set_id, model_label, gt, image_b64, decision = _episode(
@@ -918,14 +921,167 @@ def run_job_sync(payload: Dict) -> Dict:
                     currency=currency,
                     brand=brand,
                 )
+                last_iter = i
+                last_set_id = set_id
                 _write_outputs(category, model_label, set_id, gt, decision, payload)
                 _write_progress(RUN_ID, status="running", done=i, total=n, last_set=set_id, artifacts={})
+
+                # honour async cancellation requests (if running under submit_job_async)
+                try:
+                    with _JLOCK:
+                        js_local = _JOBS.get(RUN_ID)
+                    if js_local and getattr(js_local, "cancel_requested", False):
+                        print(f"[runner] cancel requested for {RUN_ID}, stopping early at iteration {i}/{n}", flush=True)
+                        cancelled = True
+                        _write_progress(RUN_ID, "cancelled", i, n, set_id, {}, None)
+                        with _JLOCK:
+                            js_local.status = "cancelled"
+                            js_local.end_ts = time.time()
+                        break
+                except NameError:
+                    # async wrapper not initialised; ignore when run_job_sync is used standalone
+                    pass
+                except Exception:
+                    # cancellation is best-effort; do not crash the run
+                    pass
+
                 time.sleep(0.03)
         finally:
             try:
                 driver.quit()
             except Exception:
                 pass
+
+        from uuid import uuid4
+
+        ts = datetime.utcnow().isoformat() + "Z"
+        job_id = RUN_ID
+
+        effects_path = RESULTS_DIR / "badges_effects.csv"
+        effects_path.parent.mkdir(parents=True, exist_ok=True)
+
+        badge_rows: List[dict] = []
+        artifacts: Dict[str, str] = {}
+
+        choice_path = RESULTS_DIR / "df_choice.csv"
+        print("DEBUG choice_path_exists=", choice_path.exists())
+        if choice_path.exists():
+            try:
+                _df_dbg = pd.read_csv(choice_path)
+                print("DEBUG rows=", len(_df_dbg))
+                print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
+                for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
+                    if _c in _df_dbg.columns:
+                        try:
+                            print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
+                        except Exception:
+                            print(f"DEBUG {_c}_unique= NA")
+            except Exception as e:
+                print("DEBUG could not read df_choice.csv:", repr(e))
+
+        print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
+
+        if choice_path.exists() and choice_path.stat().st_size > 0:
+            try:
+                badge_keys = _normalize_badge_filter(badges)
+                print("DEBUG badge_filter_internal=", badge_keys)
+
+                badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
+                if not isinstance(badge_table, pd.DataFrame):
+                    badge_table = pd.DataFrame(badge_table)
+
+                print("DEBUG badge_table_shape=", tuple(badge_table.shape))
+                print("DEBUG badge_table_cols=", list(badge_table.columns))
+
+                if "badge" in badge_table.columns and not badge_table.empty:
+                    pref_cols = [
+                        "badge", "beta", "p", "sign",
+                        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
+                    ]
+                    cols = [c for c in pref_cols if c in badge_table.columns]
+                    df_rich = badge_table[cols].copy()
+
+                    job_meta = {
+                        "job_id": job_id,
+                        "timestamp": ts,
+                        "product": category,
+                        "brand": brand,
+                        "model": ui_label,
+                        "price": price,
+                        "currency": currency,
+                        "n_iteration": n
+                    }
+                    for k in list(job_meta.keys())[::-1]:
+                        df_rich.insert(0, k, job_meta[k])
+
+                    df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
+                    badge_rows = badge_table.to_dict("records")
+
+                    artifacts["badges_effects"] = str(effects_path)
+                    artifacts["effects_csv"] = str(effects_path)
+                    artifacts["table_badges"] = str(effects_path)
+                else:
+                    print("DEBUG empty_or_missing_badge_table")
+
+                try:
+                    hm = logit_badges.generate_heatmaps(
+                        str(choice_path),
+                        out_dir=str(RESULTS_DIR),
+                        title_prefix=f"{category} · {ui_label}",
+                        file_tag=None
+                    )
+                    artifacts.update(hm)
+                except Exception as e:
+                    print("DEBUG generate_heatmaps skipped:", repr(e))
+
+            except Exception as e:
+                print("[logit] skipped due to error:", repr(e), flush=True)
+
+        artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
+        artifacts.setdefault("df_long",   str(RESULTS_DIR / "df_long.csv"))
+        artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
+
+        results: Dict = {
+            "job_id": job_id,
+            "ts": ts,
+            "model_requested": ui_label,
+            "vendor": vendor,
+            "n_iterations": n,
+            "inputs": {
+                "product": category,
+                "brand": brand,
+                "price": price,
+                "currency": currency,
+                "badges": badges,
+            },
+            "artifacts": artifacts,
+            "logit_table_rows": badge_rows,
+        }
+
+        # record how many iterations actually completed and whether we exited early
+        results["n_completed"] = last_iter
+        results["cancelled"] = bool(cancelled)
+
+        final_status = "cancelled" if cancelled else "done"
+        final_done = last_iter
+        final_last_set = last_set_id if last_set_id is not None else (f"S{final_done:04d}" if final_done else None)
+        _write_progress(RUN_ID, final_status, final_done, n, final_last_set, artifacts, None)
+
+        RUN_ID = old_run_id
+        return results
+
+    except Exception as e:
+        try:
+            _write_progress(RUN_ID, status="error", error=f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            _SIM_SEMAPHORE.release()
+        except Exception:
+            pass
+
 
         from uuid import uuid4
 
@@ -1082,7 +1238,8 @@ class _JobState:
     end_ts: float | None = None
     results_json: str | None = None
     error: str | None = None
-
+    cancel_requested: bool = False
+    
 _JOBS: Dict[str, _JobState] = {}
 _JLOCK = threading.Lock()
 _TTL_SEC = 6 * 60 * 60
@@ -1121,9 +1278,12 @@ def submit_job_async(payload: Dict) -> Dict:
                 res.setdefault("artifacts", {})["agentix_persist_error"] = f"{type(e).__name__}: {e}"
             # <<<< END ADDED BLOCK >>>>
             with _JLOCK:
-                js.status = "done"
+                current_status = js.status
                 js.results_json = json.dumps(res, ensure_ascii=False)
                 js.end_ts = time.time()
+                if current_status != "cancelled":
+                    js.status = "done"
+
         except Exception as e:
             print(f"[worker] job {jid} failed: {type(e).__name__}: {e}", flush=True)
             with _JLOCK:
@@ -1180,28 +1340,18 @@ def fetch_job(job_id: str) -> Dict:
         return {"ok": True, "job_id": job_id, "results_json": js.results_json or "{}"}
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def cancel_job(job_id: str) -> Dict:
+    with _JLOCK:
+        js = _JOBS.get(job_id)
+        if not js:
+            return {"ok": False, "error": "unknown_job"}
+        # if already finished, do not change status but report success
+        if js.status in ("done", "error", "cancelled"):
+            return {"ok": True, "job_id": job_id, "status": js.status}
+        js.cancel_requested = True
+        js.status = "cancelling"
+    try:
+        _write_progress(job_id, "cancelling")
+    except Exception:
+        pass
+    return {"ok": True, "job_id": job_id, "status": "cancelling"}
