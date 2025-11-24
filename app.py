@@ -9,6 +9,11 @@ from agent_runner import fetch_job as runner_fetch_job
 import traceback, logging
 from urllib.parse import quote
 
+try:
+    from agent_runner import cancel_job as runner_cancel_job
+except Exception:
+    runner_cancel_job = None
+    
 # NEW: delegate live A/B to the dedicated module
 from ABTesting import submit_live_ab, poll_live_ab, fetch_live_ab, cancel_live_ab
 
@@ -706,6 +711,24 @@ def poll_job_ui(job_id: str):
         return f"❌ Poll error: {type(e).__name__}: {e}"
 
 @_catch_and_report
+def cancel_job_ui(job_id: str):
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "Enter a Job ID first."
+    if runner_cancel_job is None:
+        return "Cancel is not supported on this deployment (no cancel_job in agent_runner)."
+
+    try:
+        r = runner_cancel_job(job_id)
+        if not isinstance(r, dict):
+            return f"🛑 Cancel requested for job {job_id}."
+        if r.get("ok"):
+            status = r.get("status", "cancel_requested")
+            return f"🛑 Cancel requested for job {job_id}: {status}"
+        return f"⚠️ Cancel failed for job {job_id}: {r.get('error','unknown error')}"
+    except Exception as e:
+        return f"❌ Cancel error: {type(e).__name__}: {e}"
+
 @_catch_and_report
 def fetch_job_ui(job_id: str):
     job_id = (job_id or "").strip()
@@ -1105,6 +1128,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
         job_id_box = gr.Textbox(label="Job ID", placeholder="Will appear after submit", interactive=False)
     with gr.Row():
         poll_btn = gr.Button("Poll status", variant="secondary")
+        stop_btn = gr.Button("Stop job", variant="stop")
         fetch_btn = gr.Button("Fetch results", variant="secondary")
     async_status = gr.Markdown()
 
@@ -1132,6 +1156,11 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
     )
     poll_btn.click(
         fn=poll_job_ui,
+        inputs=[job_id_box],
+        outputs=[async_status],
+    )
+    stop_btn.click(
+        fn=cancel_job_ui,
         inputs=[job_id_box],
         outputs=[async_status],
     )
@@ -1307,6 +1336,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
