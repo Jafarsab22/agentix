@@ -864,6 +864,8 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+
+
 # ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
     global RUN_ID
@@ -888,8 +890,8 @@ def run_job_sync(payload: Dict) -> Dict:
 
         n = int(payload.get("n_iterations", 100) or 100)
         category = str(payload.get("product") or "product")
-        brand    = str(payload.get("brand") or "")
-        badges   = [str(b) for b in (payload.get("badges") or [])]
+        brand = str(payload.get("brand") or "")
+        badges = [str(b) for b in (payload.get("badges") or [])]
         render_tpl = str(payload.get("render_url") or "")
         catalog_seed = int(payload.get("catalog_seed", 777))
 
@@ -931,7 +933,10 @@ def run_job_sync(payload: Dict) -> Dict:
                     with _JLOCK:
                         js_local = _JOBS.get(RUN_ID)
                     if js_local and getattr(js_local, "cancel_requested", False):
-                        print(f"[runner] cancel requested for {RUN_ID}, stopping early at iteration {i}/{n}", flush=True)
+                        print(
+                            f"[runner] cancel requested for {RUN_ID}, stopping early at iteration {i}/{n}",
+                            flush=True,
+                        )
                         cancelled = True
                         _write_progress(RUN_ID, "cancelled", i, n, set_id, {}, None)
                         with _JLOCK:
@@ -952,8 +957,6 @@ def run_job_sync(payload: Dict) -> Dict:
             except Exception:
                 pass
 
-        from uuid import uuid4
-
         ts = datetime.utcnow().isoformat() + "Z"
         job_id = RUN_ID
 
@@ -969,11 +972,26 @@ def run_job_sync(payload: Dict) -> Dict:
             try:
                 _df_dbg = pd.read_csv(choice_path)
                 print("DEBUG rows=", len(_df_dbg))
-                print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
-                for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
+                print(
+                    "DEBUG cases=",
+                    _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA",
+                )
+                for _c in [
+                    "frame",
+                    "assurance",
+                    "scarcity",
+                    "strike",
+                    "timer",
+                    "social_proof",
+                    "voucher",
+                    "bundle",
+                ]:
                     if _c in _df_dbg.columns:
                         try:
-                            print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
+                            print(
+                                f"DEBUG {_c}_unique=",
+                                int(_df_dbg[_c].nunique(dropna=False)),
+                            )
                         except Exception:
                             print(f"DEBUG {_c}_unique= NA")
             except Exception as e:
@@ -986,7 +1004,9 @@ def run_job_sync(payload: Dict) -> Dict:
                 badge_keys = _normalize_badge_filter(badges)
                 print("DEBUG badge_filter_internal=", badge_keys)
 
-                badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
+                badge_table = logit_badges.run_logit(
+                    str(choice_path), badge_filter=badge_keys if badge_keys else None
+                )
                 if not isinstance(badge_table, pd.DataFrame):
                     badge_table = pd.DataFrame(badge_table)
 
@@ -995,8 +1015,18 @@ def run_job_sync(payload: Dict) -> Dict:
 
                 if "badge" in badge_table.columns and not badge_table.empty:
                     pref_cols = [
-                        "badge", "beta", "p", "sign",
-                        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
+                        "badge",
+                        "beta",
+                        "p",
+                        "sign",
+                        "se",
+                        "q_bh",
+                        "odds_ratio",
+                        "ci_low",
+                        "ci_high",
+                        "ame_pp",
+                        "evid_score",
+                        "price_eq",
                     ]
                     cols = [c for c in pref_cols if c in badge_table.columns]
                     df_rich = badge_table[cols].copy()
@@ -1009,7 +1039,7 @@ def run_job_sync(payload: Dict) -> Dict:
                         "model": ui_label,
                         "price": price,
                         "currency": currency,
-                        "n_iteration": n
+                        "n_iteration": n,
                     }
                     for k in list(job_meta.keys())[::-1]:
                         df_rich.insert(0, k, job_meta[k])
@@ -1028,7 +1058,7 @@ def run_job_sync(payload: Dict) -> Dict:
                         str(choice_path),
                         out_dir=str(RESULTS_DIR),
                         title_prefix=f"{category} · {ui_label}",
-                        file_tag=None
+                        file_tag=None,
                     )
                     artifacts.update(hm)
                 except Exception as e:
@@ -1038,7 +1068,7 @@ def run_job_sync(payload: Dict) -> Dict:
                 print("[logit] skipped due to error:", repr(e), flush=True)
 
         artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
-        artifacts.setdefault("df_long",   str(RESULTS_DIR / "df_long.csv"))
+        artifacts.setdefault("df_long", str(RESULTS_DIR / "df_long.csv"))
         artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
 
         results: Dict = {
@@ -1064,132 +1094,11 @@ def run_job_sync(payload: Dict) -> Dict:
 
         final_status = "cancelled" if cancelled else "done"
         final_done = last_iter
-        final_last_set = last_set_id if last_set_id is not None else (f"S{final_done:04d}" if final_done else None)
+        final_last_set = (
+            last_set_id if last_set_id is not None else (f"S{final_done:04d}" if final_done else None)
+        )
         _write_progress(RUN_ID, final_status, final_done, n, final_last_set, artifacts, None)
 
-        RUN_ID = old_run_id
-        return results
-
-    except Exception as e:
-        try:
-            _write_progress(RUN_ID, status="error", error=f"{type(e).__name__}: {e}")
-        except Exception:
-            pass
-        raise
-    finally:
-        try:
-            _SIM_SEMAPHORE.release()
-        except Exception:
-            pass
-
-
-        from uuid import uuid4
-
-        ts = datetime.utcnow().isoformat() + "Z"
-        job_id = RUN_ID
-
-        effects_path = RESULTS_DIR / "badges_effects.csv"
-        effects_path.parent.mkdir(parents=True, exist_ok=True)
-
-        badge_rows: List[dict] = []
-        artifacts: Dict[str, str] = {}
-
-        choice_path = RESULTS_DIR / "df_choice.csv"
-        print("DEBUG choice_path_exists=", choice_path.exists())
-        if choice_path.exists():
-            try:
-                _df_dbg = pd.read_csv(choice_path)
-                print("DEBUG rows=", len(_df_dbg))
-                print("DEBUG cases=", _df_dbg["case_id"].nunique() if "case_id" in _df_dbg.columns else "NA")
-                for _c in ["frame", "assurance", "scarcity", "strike", "timer", "social_proof", "voucher", "bundle"]:
-                    if _c in _df_dbg.columns:
-                        try:
-                            print(f"DEBUG {_c}_unique=", int(_df_dbg[_c].nunique(dropna=False)))
-                        except Exception:
-                            print(f"DEBUG {_c}_unique= NA")
-            except Exception as e:
-                print("DEBUG could not read df_choice.csv:", repr(e))
-
-        print("DEBUG logit_module_path=", getattr(logit_badges, "__file__", "NA"))
-
-        if choice_path.exists() and choice_path.stat().st_size > 0:
-            try:
-                badge_keys = _normalize_badge_filter(badges)
-                print("DEBUG badge_filter_internal=", badge_keys)
-
-                badge_table = logit_badges.run_logit(str(choice_path), badge_filter=badge_keys if badge_keys else None)
-                if not isinstance(badge_table, pd.DataFrame):
-                    badge_table = pd.DataFrame(badge_table)
-
-                print("DEBUG badge_table_shape=", tuple(badge_table.shape))
-                print("DEBUG badge_table_cols=", list(badge_table.columns))
-
-                if "badge" in badge_table.columns and not badge_table.empty:
-                    pref_cols = [
-                        "badge", "beta", "p", "sign",
-                        "se", "q_bh", "odds_ratio", "ci_low", "ci_high", "ame_pp", "evid_score", "price_eq"
-                    ]
-                    cols = [c for c in pref_cols if c in badge_table.columns]
-                    df_rich = badge_table[cols].copy()
-
-                    job_meta = {
-                        "job_id": job_id,
-                        "timestamp": ts,
-                        "product": category,
-                        "brand": brand,
-                        "model": ui_label,
-                        "price": price,
-                        "currency": currency,
-                        "n_iteration": n
-                    }
-                    for k in list(job_meta.keys())[::-1]:
-                        df_rich.insert(0, k, job_meta[k])
-
-                    df_rich.to_csv(effects_path, index=False, encoding="utf-8-sig")
-                    badge_rows = badge_table.to_dict("records")
-
-                    artifacts["badges_effects"] = str(effects_path)
-                    artifacts["effects_csv"] = str(effects_path)
-                    artifacts["table_badges"] = str(effects_path)
-                else:
-                    print("DEBUG empty_or_missing_badge_table")
-
-                try:
-                    hm = logit_badges.generate_heatmaps(
-                        str(choice_path),
-                        out_dir=str(RESULTS_DIR),
-                        title_prefix=f"{category} · {ui_label}",
-                        file_tag=None
-                    )
-                    artifacts.update(hm)
-                except Exception as e:
-                    print("DEBUG generate_heatmaps skipped:", repr(e))
-
-            except Exception as e:
-                print("[logit] skipped due to error:", repr(e), flush=True)
-
-        artifacts.setdefault("df_choice", str(RESULTS_DIR / "df_choice.csv"))
-        artifacts.setdefault("df_long",   str(RESULTS_DIR / "df_long.csv"))
-        artifacts.setdefault("log_compare", str(RESULTS_DIR / "log_compare.jsonl"))
-
-        results: Dict = {
-            "job_id": job_id,
-            "ts": ts,
-            "model_requested": ui_label,
-            "vendor": vendor,
-            "n_iterations": n,
-            "inputs": {
-                "product": category,
-                "brand": brand,
-                "price": price,
-                "currency": currency,
-                "badges": badges,
-            },
-            "artifacts": artifacts,
-            "logit_table_rows": badge_rows,
-        }
-
-        _write_progress(RUN_ID, status="done", done=n, total=n, last_set=f"S{n:04d}", artifacts=artifacts, error=None)
         RUN_ID = old_run_id
         return results
 
@@ -1213,17 +1122,37 @@ if __name__ == "__main__":
             payload = json.loads(p.read_text(encoding="utf-8"))
             try:
                 res = run_job_sync(payload)
-                (RESULTS_DIR / f"{payload.get('job_id','job')}.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+                (RESULTS_DIR / f"{payload.get('job_id','job')}.json").write_text(
+                    json.dumps(res, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
                 payload["status"] = "completed"
-                p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                _write_progress(payload.get("job_id","job"), status="done", done=payload.get("n_iterations", 0), total=payload.get("n_iterations", 0), artifacts=res.get("artifacts", {}))
+                p.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                _write_progress(
+                    payload.get("job_id", "job"),
+                    status="done",
+                    done=payload.get("n_iterations", 0),
+                    total=payload.get("n_iterations", 0),
+                    artifacts=res.get("artifacts", {}),
+                )
             except Exception as e:
                 payload["status"] = f"error: {type(e).__name__}: {e}"
-                p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                _write_progress(payload.get("job_id","job"), status="error", error=f"{type(e).__name__}: {e}")
+                p.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                _write_progress(
+                    payload.get("job_id", "job"),
+                    status="error",
+                    error=f"{type(e).__name__}: {e}",
+                )
         print("Done.")
     else:
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
+
 
 
 # ======================= NEW: submit-and-poll async wrapper =======================
@@ -1359,4 +1288,5 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
