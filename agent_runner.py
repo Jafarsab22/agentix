@@ -368,7 +368,6 @@ def call_azure(image_b64, category, deployment_name=None):
       AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
     """
     key = os.getenv("AZURE_OPENAI_API_KEY")
-    #key = "3iPgAeFuhab4gaTKZxTpaczUUvWrTEUu487bIzS3BQNyWZAMjPOvJQQJ99BKACHYHv6XJ3w3AAAAACOGNKYB"
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set.")
 
@@ -563,8 +562,7 @@ def call_anthropic(image_b64: str, category: str, model_name: str):
 
 # ---------- Gemini ----------
 def call_gemini(image_b64: str, category: str, model_name: str):
-    #key = os.getenv("GEMINI_API_KEY")
-    key = "AIzaSyAs_Eazh_t2OEmVxV4kRcN1eFO_LPestME"
+    key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing.")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
@@ -1288,6 +1286,7 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
 
 
