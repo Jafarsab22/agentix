@@ -867,6 +867,7 @@ def _write_outputs(category: str, model_label: str, set_id: str, gt: dict, decis
 
 
 # ---------------- public API ----------------
+# ---------------- public API ----------------
 def run_job_sync(payload: Dict) -> Dict:
     global RUN_ID
 
@@ -1154,7 +1155,6 @@ if __name__ == "__main__":
         print("No jobs/ folder found. Import and call run_job_sync(payload).")
 
 
-
 # ======================= NEW: submit-and-poll async wrapper =======================
 from dataclasses import dataclass, field
 import uuid
@@ -1168,7 +1168,7 @@ class _JobState:
     results_json: str | None = None
     error: str | None = None
     cancel_requested: bool = False
-    
+
 _JOBS: Dict[str, _JobState] = {}
 _JLOCK = threading.Lock()
 _TTL_SEC = 6 * 60 * 60
@@ -1191,7 +1191,8 @@ def submit_job_async(payload: Dict) -> Dict:
     def _worker():
         try:
             res = run_job_sync(payload)
-            # >>>> ADD THIS BLOCK (upload files + DB/effects) <<<<
+
+            # persist results to Agentix (best-effort)
             try:
                 from save_to_agentix import persist_results_if_qualify
                 info = persist_results_if_qualify(
@@ -1205,14 +1206,13 @@ def submit_job_async(payload: Dict) -> Dict:
                 res.setdefault("artifacts", {})["agentix_persist"] = info
             except Exception as e:
                 res.setdefault("artifacts", {})["agentix_persist_error"] = f"{type(e).__name__}: {e}"
-            # <<<< END ADDED BLOCK >>>>
+
             with _JLOCK:
                 current_status = js.status
                 js.results_json = json.dumps(res, ensure_ascii=False)
                 js.end_ts = time.time()
                 if current_status != "cancelled":
                     js.status = "done"
-
         except Exception as e:
             print(f"[worker] job {jid} failed: {type(e).__name__}: {e}", flush=True)
             with _JLOCK:
@@ -1258,7 +1258,6 @@ def poll_job(job_id: str) -> Dict:
         resp["n_iterations"] = total
     return resp
 
-
 def fetch_job(job_id: str) -> Dict:
     with _JLOCK:
         js = _JOBS.get(job_id)
@@ -1278,7 +1277,6 @@ def cancel_job(job_id: str) -> Dict:
         js = _JOBS.get(job_id)
         if not js:
             return {"ok": False, "error": "unknown_job"}
-        # if already finished, do not change status but report success
         if js.status in ("done", "error", "cancelled"):
             return {"ok": True, "job_id": job_id, "status": js.status}
         js.cancel_requested = True
@@ -1288,5 +1286,4 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
-
 
