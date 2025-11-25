@@ -136,8 +136,9 @@ MODEL_MAP = {
     "GPT-5-chat":                  ("azure",   "gpt-5-chat",               "AZURE_OPENAI_API_KEY"),
 
     # Still supported if you want them
-    "Anthropic Claude 3.5 Haiku": ("anthropic", "claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
-    "Google Gemini 1.5 Flash":    ("gemini",    "gemini-1.5-flash",        "GEMINI_API_KEY"),
+    "Claude 3.5 Haiku": ("anthropic", "claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
+    "Gemini 2.5 Flash Lite":    ("gemini",    "gemini-2.5-flash-light",        "GEMINI_API_KEY"),
+    "Gemini 3 Pro": ("gemini",    "gemini-3-pro-preview",        "GEMINI_API_KEY"),
 }
 
 
@@ -562,7 +563,8 @@ def call_anthropic(image_b64: str, category: str, model_name: str):
 
 # ---------- Gemini ----------
 def call_gemini(image_b64: str, category: str, model_name: str):
-    key = os.getenv("GEMINI_API_KEY")
+    #key = os.getenv("GEMINI_API_KEY")
+    key = "AIzaSyAs_Eazh_t2OEmVxV4kRcN1eFO_LPestME"
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing.")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
@@ -1286,4 +1288,5 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
