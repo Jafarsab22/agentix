@@ -162,7 +162,7 @@ MODEL_CHOICES = [
     "GPT-4.1-mini",
     "GPT-5-chat",
     "Gemini 2.5 Flash Lite",
-    "Gemini 3 Pro",
+    "Gemini 2.5 Pro",
 ]
 
 BADGE_CHOICES = [
@@ -1342,6 +1342,7 @@ with gr.Blocks(title="Agentix - AI Agent Buying Behavior") as demo:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+
 
 
 
