@@ -682,6 +682,7 @@ def call_gemini(image_b64: str, category: str, model_name: str):
 
 def _choose_with_model(image_b64, category, ui_label):
     vendor, model_name, _ = MODEL_MAP.get(ui_label, ("azure", ui_label, "AZURE_OPENAI_API_KEY"))
+    print(f"[choose_with_model] ui_label={ui_label} vendor={vendor} model_name={model_name}", flush=True)
 
     if vendor == "azure":
         decision = call_azure(image_b64, category, deployment_name=model_name)
@@ -1357,6 +1358,7 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
 
 
