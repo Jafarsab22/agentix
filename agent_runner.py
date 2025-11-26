@@ -565,49 +565,120 @@ def call_gemini(image_b64: str, category: str, model_name: str):
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing.")
+
+    # SAFE DEBUG: never print full key
+    print(
+        f"[GEMINI] model={model_name} key_present={bool(key)} "
+        f"key_len={len(key)} key_prefix={key[:6]}***",
+        flush=True,
+    )
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
-    tools = [{"function_declarations": [{
-        "name": "choose", "description": "Select one grid item",
-        "parameters": {"type": "OBJECT", "properties": {
-            "chosen_title": {"type": "STRING"}, "row": {"type": "INTEGER"}, "col": {"type": "INTEGER"}},
-            "required": ["chosen_title", "row", "col"]}
-    }]}]
+
+    tools = [{
+        "function_declarations": [{
+            "name": "choose",
+            "description": "Select one grid item",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "chosen_title": {"type": "STRING"},
+                    "row": {"type": "INTEGER"},
+                    "col": {"type": "INTEGER"},
+                },
+                "required": ["chosen_title", "row", "col"],
+            },
+        }]
+    }]
+
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "tools": tools,
-        "tool_config": {"function_calling_config": {"mode": "ANY"}},
-        "contents": [{"role": "user", "parts": [
-            {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
-            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64.split(",")[1]}}
-        ]}]}
-    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=240)
+        "tool_config": {
+            "function_calling_config": {
+                "mode": "ANY",
+                "allowed_function_names": ["choose"],  # nudge Gemini to call the tool
+            }
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": f"Category: {category}. Use ONLY the tool 'choose'."},
+                {"inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": image_b64.split(",")[1],
+                }},
+            ],
+        }],
+    }
+
+    r = requests.post(
+        url,
+        headers={"Content-Type": "application/json"},
+        json=body,
+        timeout=240,
+    )
+    print(f"[GEMINI] HTTP status={r.status_code}", flush=True)
     r.raise_for_status()
+
     resp = r.json()
+    # Short snippet so you can see if a tool call is present
+    try:
+        print(
+            "[GEMINI] raw response snippet: "
+            + json.dumps(resp, ensure_ascii=False)[:600],
+            flush=True,
+        )
+    except Exception:
+        pass
+
     candidates = resp.get("candidates", [])
     if not candidates:
         raise RuntimeError("Gemini: no candidates.")
-    parts = candidates[0].get("content", {}).get("parts", [])
+
+    parts = candidates[0].get("content", {}).get("parts", []) or []
     args = {}
+
+    # Scan all parts for a functionCall named "choose"
     for p in parts:
         fc = p.get("functionCall")
         if fc and fc.get("name") == "choose":
-            raw = fc.get("args", {}) or {}
-            args = dict(raw)
+            raw = fc.get("args") or {}
+            # Some models return args as list of {key,value}
+            if isinstance(raw, dict):
+                args = dict(raw)
+            elif isinstance(raw, list):
+                args = {item.get("key"): item.get("value") for item in raw if isinstance(item, dict)}
             break
+
     if not args:
         raise RuntimeError("Gemini: no functionCall choose.")
 
+    print(f"[GEMINI] parsed args before normalisation: {args}", flush=True)
+
     title = args.get("chosen_title")
     args["chosen_title"] = title if isinstance(title, str) else ""
+
+    # Normalise to 0-based indices, in case Gemini replies 1..2 / 1..4
     try:
-        args["row"] = int(args.get("row"))
+        r_val = int(args.get("row"))
+        if r_val in (1, 2):
+            r_val -= 1
+        args["row"] = r_val
     except Exception:
         args["row"] = None
+
     try:
-        args["col"] = int(args.get("col"))
+        c_val = int(args.get("col"))
+        if c_val in (1, 2, 3, 4):
+            c_val -= 1
+        args["col"] = c_val
     except Exception:
         args["col"] = None
+
+    print(f"[GEMINI] normalised args: {args}", flush=True)
     return args
+
 
 def _choose_with_model(image_b64, category, ui_label):
     vendor, model_name, _ = MODEL_MAP.get(ui_label, ("azure", ui_label, "AZURE_OPENAI_API_KEY"))
@@ -1286,6 +1357,7 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
 
 
