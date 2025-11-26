@@ -619,6 +619,9 @@ def call_gemini(image_b64: str, category: str, model_name: str):
         timeout=240,
     )
     print(f"[GEMINI] HTTP status={r.status_code}", flush=True)
+    if not r.ok:
+    print(f"[GEMINI] status={r.status_code} body={r.text[:600]}", flush=True)
+    r.raise_for_status()
     r.raise_for_status()
 
     resp = r.json()
@@ -1358,6 +1361,7 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
 
 
