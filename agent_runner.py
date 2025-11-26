@@ -138,7 +138,7 @@ MODEL_MAP = {
     # Still supported if you want them
     "Claude 3.5 Haiku": ("anthropic", "claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
     "Gemini 2.5 Flash Lite":    ("gemini",    "gemini-2.5-flash-lite",        "GEMINI_API_KEY"),
-    "Gemini 3 Pro": ("gemini",    "gemini-3-pro-preview",        "GEMINI_API_KEY"),
+    "Gemini 2.5 Pro": ("gemini",    "gemini-2.5-pro",        "GEMINI_API_KEY"),
 }
 
 
@@ -1360,6 +1360,7 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
 
 
