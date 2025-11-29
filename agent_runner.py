@@ -325,241 +325,50 @@ def reconcile(decision: dict, groundtruth: dict) -> dict:
                          "social_proof": None, "voucher": None, "bundle": None, "price": None, "ln_price": None})
     return decision
 
-# ---------- Azure OpenAI: robust POST with retries ----------
-def _post_with_retries_azure(
+# ---------- Gemini: robust POST with retries ----------
+def _post_with_retries_gemini(
     url,
     headers,
     payload,
-    timeout=(90, 1800),
-    max_attempts=20,
-    backoff_base=0.75,
+    timeout=240,
+    max_attempts=6,
+    backoff_base=0.9,
     backoff_cap=12.0,
 ):
+    """
+    Robust POST with retries for Gemini HTTP calls.
+
+    Uses exponential backoff with jitter on transient HTTP errors and
+    common network exceptions, similar to _post_with_retries_azure.
+    """
     import random
     sess = requests.Session()
     for attempt in range(1, max_attempts + 1):
         try:
             r = sess.post(url, headers=headers, json=payload, timeout=timeout)
+
+            # Retry on common transient HTTP statuses
             if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
                 sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
                 sleep_s *= random.uniform(0.6, 1.4)
                 time.sleep(sleep_s)
                 continue
+
             return r
-        except (requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError):
+
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ):
             sleep_s = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
             sleep_s *= random.uniform(0.6, 1.4)
             time.sleep(sleep_s)
             if attempt == max_attempts:
                 raise
-    raise RuntimeError("Azure retry exhausted without success.")
 
-
-# ---------- Azure OpenAI ----------
-def call_azure(image_b64, category, deployment_name=None):
-    """
-    Call an Azure OpenAI chat deployment with image + tool call.
-    Expects these environment variables:
-      AZURE_OPENAI_ENDPOINT    e.g. "https://<your-resource>.openai.azure.com"
-      AZURE_OPENAI_API_KEY     the key from this Azure resource
-      AZURE_OPENAI_API_VERSION (optional, e.g. '2024-02-15-preview')
-      AZURE_OPENAI_DEPLOYMENT  (optional default deployment name)
-    """
-    key = os.getenv("AZURE_OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("AZURE_OPENAI_API_KEY is not set.")
-
-    #endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    endpoint = "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com"
-    if not endpoint:
-        raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set.")
-
-    api_version = "2025-01-01-preview"
-    deployment = deployment_name  
-
-    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
-    #url = "https://info-mia2xmp7-eastus2.cognitiveservices.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview"
-    headers = {"api-key": key, "content-type": "application/json"}
-
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "choose",
-            "description": "Select one product from the 2×4 grid.",
-            "parameters": SCHEMA_JSON,
-        },
-    }]
-
-    data = {
-        "model": deployment,
-        "messages": [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": SYSTEM_PROMPT},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Category: {category}. Use ONLY the 'choose' tool.",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_b64,
-                        },
-                    },
-                ],
-            },
-        ],
-        "tools": tools,
-        "tool_choice": {"type": "function", "function": {"name": "choose"}},
-        "max_tokens": 64,
-        "temperature": 0,
-    }
-
-    print(f"[azure] url={url}", flush=True)
-    print(f"[azure] deployment={deployment} api_version={api_version}", flush=True)
-
-    try:
-        # note: use the same keyword names as the helper definition
-        r = _post_with_retries_azure(
-            url,
-            headers,
-            data,
-            timeout=(12, 240),
-            max_attempts=6,
-            backoff_base=0.9,
-            backoff_cap=12.0,
-        )
-    except Exception as e:
-        print(f"[azure] HTTP exception before status: {type(e).__name__}: {e}", flush=True)
-        raise RuntimeError(f"Azure HTTP failure: {type(e).__name__}: {e}")
-
-    print(f"[azure] status={r.status_code}", flush=True)
-
-    if r.status_code >= 400:
-        err_code = None
-        err_msg = None
-        try:
-            err_json = r.json()
-            err_obj = err_json.get("error") or err_json
-            err_code = err_obj.get("code")
-            err_msg = err_obj.get("message")
-        except Exception:
-            err_json = None
-
-        if err_json is not None and err_msg:
-            raise RuntimeError(
-                f"Azure API error {r.status_code} [{deployment}] {err_code}: {err_msg}"
-            )
-        body = r.text[:800] if hasattr(r, "text") else "<no body>"
-        raise RuntimeError(
-            f"Azure API error {r.status_code} [{deployment}]: {body}"
-        )
-
-    try:
-        resp = r.json()
-    except Exception as e:
-        raise RuntimeError(f"Azure returned non-JSON response: {type(e).__name__}: {e}")
-
-    try:
-        msg = resp["choices"][0]["message"]
-    except Exception as e:
-        raise RuntimeError(
-            f"Azure JSON shape unexpected, missing choices[0].message: {type(e).__name__}: {e}. "
-            f"Raw JSON: {json.dumps(resp, ensure_ascii=False)[:800]}"
-        )
-
-    tcs = msg.get("tool_calls", [])
-    if not tcs:
-        raise RuntimeError(
-            f"Azure returned no tool_calls. Raw message: {json.dumps(msg, ensure_ascii=False)[:800]}"
-        )
-
-    raw = tcs[0]["function"].get("arguments")
-
-    if isinstance(raw, str):
-        try:
-            args = json.loads(raw)
-        except Exception:
-            args = {}
-    elif isinstance(raw, dict):
-        args = dict(raw)
-    else:
-        args = {}
-
-    title = args.get("chosen_title")
-    args["chosen_title"] = title if isinstance(title, str) else ""
-    try:
-        args["row"] = int(args.get("row"))
-    except Exception:
-        args["row"] = None
-    try:
-        args["col"] = int(args.get("col"))
-    except Exception:
-        args["col"] = None
-
-    return args
-
-
-    
-# ---------- Anthropic ----------
-def _post_with_retries(url, headers, payload, timeout=1200, attempts=5, backoff=0.9):
-    import random
-    for i in range(attempts):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code in (409, 425, 429, 500, 502, 503, 504, 529) or (500 <= r.status_code < 600):
-                time.sleep((backoff ** i) * (1.0 + random.random()))
-                continue
-            r.raise_for_status()
-            return r
-        except requests.exceptions.RequestException:
-            if i == attempts - 1:
-                raise
-            time.sleep((backoff ** i) * (1.0 + random.random()))
-
-def call_anthropic(image_b64: str, category: str, model_name: str):
-    key = os.getenv("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY missing.")
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    tools = [{"name": "choose", "description": "Select one grid item", "input_schema": SCHEMA_JSON}]
-    body = {
-        "model": model_name, "max_tokens": 128, "temperature": 0,
-        "system": SYSTEM_PROMPT, "tools": tools, "tool_choice": {"type": "tool", "name": "choose"},
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64.split(",")[1]}},
-                {"type": "text", "text": f"Category: {category}. Use ONLY the tool 'choose'."}
-            ]
-        }]}
-    r = _post_with_retries(url, headers, body, timeout=240)
-    blocks = r.json().get("content", [])
-    tool_blocks = [b for b in blocks if b.get("type") == "tool_use" and b.get("name") == "choose"]
-    if not tool_blocks:
-        raise RuntimeError("Anthropic: no tool_use choose.")
-    args = tool_blocks[0].get("input", {}) or {}
-    title = args.get("chosen_title")
-    args["chosen_title"] = title if isinstance(title, str) else ""
-    try:
-        args["row"] = int(args.get("row"))
-    except Exception:
-        args["row"] = None
-    try:
-        args["col"] = int(args.get("col"))
-    except Exception:
-        args["col"] = None
-    return args
+    raise RuntimeError("Gemini retry exhausted without success.")
 
 # ---------- Gemini ----------
 def call_gemini(image_b64: str, category: str, model_name: str):
@@ -598,7 +407,7 @@ def call_gemini(image_b64: str, category: str, model_name: str):
         "tool_config": {
             "function_calling_config": {
                 "mode": "ANY",
-                "allowed_function_names": ["choose"],  # nudge Gemini to call the tool
+                "allowed_function_names": ["choose"],
             }
         },
         "contents": [{
@@ -613,19 +422,25 @@ def call_gemini(image_b64: str, category: str, model_name: str):
         }],
     }
 
-    r = requests.post(
-        url,
-        headers={"Content-Type": "application/json"},
-        json=body,
-        timeout=240,
-    )
-    #print(f"[GEMINI] HTTP status={r.status_code}", flush=True)
+    try:
+        r = _post_with_retries_gemini(
+            url,
+            {"Content-Type": "application/json"},
+            body,
+            timeout=240,
+            max_attempts=6,
+            backoff_base=0.9,
+            backoff_cap=12.0,
+        )
+    except Exception as e:
+        print(f"[GEMINI] HTTP exception before status: {type(e).__name__}: {e}", flush=True)
+        raise RuntimeError(f"Gemini HTTP failure: {type(e).__name__}: {e}")
+
     if not r.ok:
         print(f"[GEMINI] status={r.status_code} body={r.text[:600]}", flush=True)
         r.raise_for_status()
 
     resp = r.json()
-    # Short snippet so you can see if a tool call is present
     try:
         print(
             "[GEMINI] raw response snippet: "
@@ -642,12 +457,10 @@ def call_gemini(image_b64: str, category: str, model_name: str):
     parts = candidates[0].get("content", {}).get("parts", []) or []
     args = {}
 
-    # Scan all parts for a functionCall named "choose"
     for p in parts:
         fc = p.get("functionCall")
         if fc and fc.get("name") == "choose":
             raw = fc.get("args") or {}
-            # Some models return args as list of {key,value}
             if isinstance(raw, dict):
                 args = dict(raw)
             elif isinstance(raw, list):
@@ -662,7 +475,6 @@ def call_gemini(image_b64: str, category: str, model_name: str):
     title = args.get("chosen_title")
     args["chosen_title"] = title if isinstance(title, str) else ""
 
-    # Normalise to 0-based indices, in case Gemini replies 1..2 / 1..4
     try:
         r_val = int(args.get("row"))
         if r_val in (1, 2):
@@ -1361,6 +1173,7 @@ def cancel_job(job_id: str) -> Dict:
     except Exception:
         pass
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
 
 
 
